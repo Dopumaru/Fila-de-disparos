@@ -1,7 +1,7 @@
-📦 Fila de Disparos — Redis + BullMQ + Telegram
+📦 Fila de Disparos — Redis + BullMQ + Telegram (EasyPanel)
 
 Este projeto implementa uma fila de disparos escalável usando Node.js, Redis e BullMQ, com envio de mensagens via Telegram Bot.
-Preparado para rodar localmente e em VPS (DigitalOcean).
+Preparado para rodar localmente e em VPS usando EasyPanel.
 
 🚀 Objetivo
 
@@ -23,145 +23,139 @@ BullMQ
 
 node-telegram-bot-api
 
-PM2 (produção)
+EasyPanel (produção)
 
-🖥️ RODANDO NA VPS (PASSO A PASSO)
-1️⃣ Acessar a VPS (DigitalOcean)
+🖥️ RODANDO NA VPS COM EASYPANEL (PASSO A PASSO)
+1️⃣ Criar o serviço Redis no EasyPanel
 
-O responsável vai fornecer:
+Acesse o EasyPanel
 
-IP da VPS
+Clique em Create → Service → Redis
 
-Usuário (geralmente root)
+Defina:
 
-Senha ou chave SSH
+Nome do serviço (ex: redis-fila)
 
-Exemplo:
-ssh root@IP_DA_VPS
+Porta padrão (6379)
 
-2️⃣ Atualizar o sistema
-apt update && apt upgrade -y
+Senha (opcional, mas recomendado)
 
-3️⃣ Instalar dependências básicas
-apt install git curl redis-server -y
+📌 Guarde:
 
-4️⃣ Instalar Node.js (LTS)
-curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-apt install nodejs -y
+REDIS_HOST → normalmente o nome do serviço
 
+REDIS_PORT → 6379
 
-Verificar:
+REDIS_PASSWORD → se configurada
 
-node -v
-npm -v
+2️⃣ Criar o App do Worker (consumidor da fila)
 
-5️⃣ Clonar o repositório
-git clone https://github.com/SEU_USUARIO/fila-disparos.git
-cd fila-disparos
+Create → App
 
-6️⃣ Criar o arquivo .env
+Escolha App from Git
 
-⚠️ Esse arquivo NÃO vem do Git por segurança
+Conecte seu GitHub e selecione o repositório
 
-nano .env
+Configure:
 
+Install command:
 
-Conteúdo:
-
-TELEGRAM_TOKEN=TOKEN_REAL_DO_BOT
-
-
-Salvar:
-
-CTRL + O
-
-Enter
-
-CTRL + X
-
-7️⃣ Instalar dependências do projeto
 npm install
 
 
-Isso recria automaticamente o node_modules.
+Build command: (vazio)
 
-8️⃣ Garantir que o Redis está rodando
-systemctl start redis-server
-systemctl enable redis-server
+Run command:
 
+npm run start:worker
 
-Testar:
+🔐 Variáveis de ambiente (ENV)
 
-redis-cli ping
+Adicionar no App:
 
-
-Resposta esperada:
-
-PONG
-
-9️⃣ Rodar o worker (teste rápido)
-node worker.js
+REDIS_HOST=redis-fila
+REDIS_PORT=6379
+REDIS_PASSWORD=senha_se_existir
+TELEGRAM_BOT_TOKEN=TOKEN_REAL_DO_BOT
 
 
-Se não der erro, está tudo certo.
+Salvar e Deploy.
 
-Interromper:
+📌 O worker deve ficar rodando 24/7 aguardando jobs.
 
-CTRL + C
+3️⃣ Criar o App do Producer (disparador)
 
-🔁 PRODUÇÃO (RODAR 24/7 COM PM2)
-🔹 Instalar PM2
-npm install -g pm2
+Criar outro App, apontando para o mesmo repositório.
 
-🔹 Subir o worker
-pm2 start worker.js --name fila-worker
+Run command:
 
-🔹 Salvar configuração
-pm2 save
-pm2 startup
+npm run start:producer
+
+🔐 Variáveis de ambiente (ENV)
+
+Adicionar:
+
+REDIS_HOST=redis-fila
+REDIS_PORT=6379
+REDIS_PASSWORD=senha_se_existir
+TELEGRAM_BOT_TOKEN=TOKEN_REAL_DO_BOT
+TELEGRAM_CHAT_ID=ID_DO_CHAT
 
 
-(O comando pm2 startup vai mostrar outro comando — copie e cole ele)
+Deploy.
 
-🔹 Ver status
-pm2 status
-pm2 logs fila-worker
+⚠️ Atenção:
+O producer adiciona jobs na fila. Cada deploy/execução gera novos disparos.
+
+🔄 Fluxo correto de execução
+
+Redis sempre ativo
+
+Worker sempre ligado
+
+Producer executado apenas quando necessário
 
 📤 DISPAROS (PRODUCER)
 
-⚠️ O producer deve ser executado com cuidado
-Cada execução adiciona jobs à fila.
+O producer.js pode ser adaptado para:
 
-Exemplo:
+leitura de banco de dados
 
-node producer.js
+leitura de CSV
 
+campanhas agendadas
 
-Recomendado:
+📌 Recomenda-se:
 
-rodar uma vez
+Executar o producer apenas quando necessário
 
-ou adaptar para leitura de banco / CSV
+Usar rate limit para evitar bloqueios
 
-🧠 BOAS PRÁTICAS
+🧠 Boas práticas
 
-Nunca subir .env no Git
+❌ Nunca subir .env no Git
 
-Nunca subir node_modules
+❌ Nunca subir node_modules
 
-Worker sempre ligado antes do producer
+✅ Worker sempre antes do producer
 
-Disparos grandes são lentos por segurança
+✅ Usar variáveis de ambiente
 
-Rate limit evita ban
+✅ Monitorar logs pelo EasyPanel
 
-🛑 EM CASO DE PROBLEMA
+🛑 Em caso de problema
+Ver logs
 
-Ver logs:
+Pelo Dashboard do App no EasyPanel
 
-pm2 logs fila-worker
+Reiniciar
 
+Botão Restart App
 
-Reiniciar worker:
+Erros comuns
 
-pm2 restart fila-worker
+REDIS_HOST incorreto
+
+Redis não iniciado
+
+Worker e Producer apontando para Redis diferente
