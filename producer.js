@@ -6,7 +6,7 @@ const queue = new Queue("disparos", { connection });
 (async () => {
   await queue.add("envio", {
     id: 1,
-    chatId: 1532301009, // <-- seu ID 
+    chatId: 1234234, // <-- seu ID 
     mensagem: "🚀 TESTE REAL — chegou?",
   });
 
