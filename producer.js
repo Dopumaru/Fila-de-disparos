@@ -5,8 +5,7 @@ const queue = new Queue('disparos', { connection });
 
 const IDS = [
   1264397026,
-  987654321,
-  123123123,
+  1532301009,
 ];
 
 (async () => {
