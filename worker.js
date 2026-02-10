@@ -3,7 +3,14 @@ const { Worker } = require("bullmq");
 const TelegramBot = require("node-telegram-bot-api");
 const connection = require("./redis");
 
-const bot = new TelegramBot(process.env.8552687174:AAHa4GYl9Av_gm4_7dHG6IMIusIS2YzZrME, { polling: false });
+const botToken = process.env.TELEGRAM_BOT_TOKEN;
+
+if (!botToken) {
+  console.error("❌ TELOEGAM_BOT_TOKEN não definido nas variáveis de ambiente!");
+  process.exit(1);
+}
+
+const bot = new TelegramBot(botToken, { polling: false });
 
 const worker = new Worker(
   "disparos",
@@ -16,7 +23,6 @@ const worker = new Worker(
       console.log("✅ Enviado!");
     } catch (err) {
       console.error("❌ Telegram erro:", err.message);
-      // isso aqui costuma trazer o motivo real (401/403/400 etc)
       if (err.response?.body) console.error("Detalhe:", err.response.body);
       throw err; // marca o job como failed
     }
