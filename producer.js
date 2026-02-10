@@ -1,16 +1,23 @@
-const { Queue } = require("bullmq");
-const connection = require("./redis");
+const { Queue } = require('bullmq');
+const connection = require('./redis');
 
-const queue = new Queue("disparos", { connection });
+const queue = new Queue('disparos', { connection });
+
+const IDS = [
+  1264397026,
+  987654321,
+  123123123,
+];
 
 (async () => {
-  await queue.add("envio", {
-    id: 1,
-    chatId: 1264397026, // <-- seu ID 
-    mensagem: "🚀 TESTE REAL — chegou?",
-  });
+  for (const chatId of IDS) {
+    await queue.add('envio', {
+      chatId,
+      mensagem: '🚀 TESTE REAL — chegou?',
+    });
+  }
 
-  console.log("1 job enviado para a fila");
+  console.log(`✅ ${IDS.length} jobs enviados para a fila`);
   process.exit(0);
 })();
 
