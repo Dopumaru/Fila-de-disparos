@@ -3,7 +3,7 @@ const { Worker } = require("bullmq");
 const TelegramBot = require("node-telegram-bot-api");
 const connection = require("./redis");
 
-const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: false });
+const bot = new TelegramBot(process.env.8552687174:AAHa4GYl9Av_gm4_7dHG6IMIusIS2YzZrME, { polling: false });
 
 const worker = new Worker(
   "disparos",
