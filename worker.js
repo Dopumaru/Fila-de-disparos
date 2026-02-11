@@ -93,6 +93,16 @@ const worker = new Worker(
            break;
         }
 
+          case "document": {
+           const input = resolveTelegramInput(payload?.file);
+           await bot.sendDocument(chatId, input, {
+           caption: payload?.caption,
+           ...(payload?.options || {}),
+           });
+           break;
+       }
+
+
 
         default:
           throw new Error(`type inválido: ${type}`);
