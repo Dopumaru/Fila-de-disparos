@@ -3,18 +3,22 @@
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
+  "type": "commonjs",
   "scripts": {
-  "start": "node worker.js",
-  "start:producer": "node producer.js"
-},
+    "start": "node worker.js",
+    "start:producer": "node producer.js",
+    "start:api": "node api/server.js"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
     "bullmq": "^5.67.3",
+    "cors": "^2.8.5",
     "dotenv": "^17.2.4",
+    "express": "^4.19.2",
     "ioredis": "^5.9.2",
+    "multer": "^1.4.5-lts.1",
     "node-telegram-bot-api": "^0.67.0"
   }
 }
