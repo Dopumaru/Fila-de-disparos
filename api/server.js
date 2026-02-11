@@ -1,3 +1,4 @@
+// api/server.js
 require("dotenv").config();
 const path = require("path");
 const fs = require("fs");
@@ -8,17 +9,30 @@ const { Queue } = require("bullmq");
 const connection = require("../redis");
 
 const app = express();
+
+// ===== FRONT (public) =====
+// Serve /public (index.html, app.js, etc.)
+app.use(express.static(path.join(__dirname, "..", "public")));
+
+// CORS (ok manter; se quiser travar depois, dá pra limitar origem)
 app.use(cors());
 
-// garante pasta uploads
+// Health
+app.get("/health", (req, res) => res.json({ ok: true }));
+
+// Rota raiz: abre o painel
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "..", "public", "index.html"));
+});
+
+// ===== Uploads =====
 const UPLOAD_DIR = path.join(__dirname, "..", "uploads");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const upload = multer({ dest: UPLOAD_DIR });
 const queue = new Queue("disparos", { connection });
 
-app.get("/health", (req, res) => res.json({ ok: true }));
-
+// ===== Utils =====
 function maskToken(t) {
   if (!t) return "";
   const s = String(t);
@@ -42,7 +56,6 @@ function detectDelimiter(text) {
   return ",";
 }
 
-// parser simples: delim ( , ou ; ) + aspas (básico)
 function parseCsvRows(text) {
   const src = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   const delim = detectDelimiter(src);
@@ -53,7 +66,6 @@ function parseCsvRows(text) {
     .filter((l) => l.trim().length > 0);
 
   const rows = [];
-
   for (const line of lines) {
     const cols = [];
     let cur = "";
@@ -63,7 +75,6 @@ function parseCsvRows(text) {
       const ch = line[i];
 
       if (ch === '"') {
-        // aspas duplicadas dentro de quoted field => ""
         const next = line[i + 1];
         if (inQuotes && next === '"') {
           cur += '"';
@@ -119,7 +130,6 @@ function buildRowObjectsFromCsv(text) {
 
 function applyTemplate(template, rowObj) {
   const t = String(template || "");
-  // substitui {nome} {cidade}...
   return t.replace(/\{(\w+)\}/g, (_, key) => {
     const k = normalizeKey(key);
     const v = rowObj?.[k];
@@ -128,9 +138,8 @@ function applyTemplate(template, rowObj) {
 }
 
 // ===== Botões =====
-
-// Busca username do bot (sem salvar)
 async function getBotUsername(botToken) {
+  // Node 18+ tem fetch global
   const r = await fetch(`https://api.telegram.org/bot${botToken}/getMe`);
   const data = await r.json().catch(() => null);
 
@@ -141,13 +150,10 @@ async function getBotUsername(botToken) {
   return data.result.username; // sem "@"
 }
 
-// Converte array buttons -> options.reply_markup.inline_keyboard
 function buildOptionsFromButtons(buttons, botUsername) {
   if (!Array.isArray(buttons) || buttons.length === 0) return undefined;
 
   const inline_keyboard = [];
-
-  // 2 botões por linha
   for (let i = 0; i < buttons.length; i += 2) {
     const row = [];
 
@@ -178,7 +184,7 @@ function buildOptionsFromButtons(buttons, botUsername) {
 }
 
 // ===== ROUTE =====
-// agora aceita: file (mídia) e csv (leads) — CSV OBRIGATÓRIO
+// aceita: file (mídia) e csv (leads) — CSV OBRIGATÓRIO
 app.post(
   "/disparar",
   upload.fields([
@@ -187,9 +193,10 @@ app.post(
   ]),
   async (req, res) => {
     let csvPathToDelete = null;
+
     try {
       const botToken = (req.body.botToken || "").trim();
-      const type = (req.body.type || "").trim(); // text/photo/video/audio/document/voice/video_note
+      const type = (req.body.type || "").trim();
       const captionTemplate = req.body.caption ?? "";
       const limitMax = Number(req.body.limitMax || 1);
       const limitMs = Number(req.body.limitMs || 1100);
@@ -197,7 +204,6 @@ app.post(
       const idColumnRaw = (req.body.idColumn || "chatId").trim();
       const idColumn = normalizeKey(idColumnRaw) || "chatid";
 
-      // buttons (opcional)
       let buttons = [];
       try {
         buttons = JSON.parse(req.body.buttons || "[]");
@@ -211,33 +217,28 @@ app.post(
         return res.status(400).json({ ok: false, error: "limitMax>=1 e limitMs>=200." });
       }
 
-      // valida template x tipo
-      if (type === "text") {
-        if (!String(captionTemplate).trim()) {
-          return res.status(400).json({ ok: false, error: "Para text, caption (mensagem) é obrigatório." });
-        }
+      if (type === "text" && !String(captionTemplate).trim()) {
+        return res.status(400).json({ ok: false, error: "Para text, caption (mensagem) é obrigatório." });
       }
 
-      // arquivos
       const mediaFile = req.files?.file?.[0] || null;
       const csvFile = req.files?.csv?.[0] || null;
 
-      // CSV obrigatório
       if (!csvFile) {
-        return res.status(400).json({ ok: false, error: "Envie o CSV no campo csv. IDs manuais foram desativados." });
+        return res.status(400).json({
+          ok: false,
+          error: "Envie o CSV no campo csv. IDs manuais foram desativados.",
+        });
       }
       csvPathToDelete = csvFile.path;
 
-      // valida mídia x tipo
       if (type !== "text" && !mediaFile) {
         return res.status(400).json({ ok: false, error: "Para mídia/documento, envie o arquivo no campo file." });
       }
 
-      // limita botões
       if (!Array.isArray(buttons)) buttons = [];
       if (buttons.length > 4) buttons = buttons.slice(0, 4);
 
-      // se tiver START, pega username
       const hasStart = buttons.some((b) => String(b?.type || "").trim() === "start");
       let botUsername = null;
       if (hasStart) {
@@ -248,8 +249,6 @@ app.post(
       }
 
       const options = buildOptionsFromButtons(buttons, botUsername);
-
-      // caminho mídia no servidor
       const mediaPath = mediaFile?.path || null;
 
       // ===== LEADS via CSV =====
@@ -264,7 +263,6 @@ app.post(
       for (const row of items) {
         let chatId = String(row[idColumn] || "").trim();
 
-        // fallback comum
         if (!chatId) chatId = String(row["chatid"] || "").trim();
         if (!chatId) chatId = String(row["chat_id"] || "").trim();
         if (!chatId) chatId = String(row["id"] || "").trim();
@@ -293,24 +291,19 @@ app.post(
       let total = 0;
 
       for (const lead of leads) {
-        const chatId = lead.chatId;
-
         const finalCaption = applyTemplate(captionTemplate, lead.vars);
 
         const jobData =
           type === "text"
             ? {
-                chatId,
+                chatId: lead.chatId,
                 botToken,
                 limit: { max: limitMax, ms: limitMs },
                 type: "text",
-                payload: {
-                  text: finalCaption,
-                  options,
-                },
+                payload: { text: finalCaption, options },
               }
             : {
-                chatId,
+                chatId: lead.chatId,
                 botToken,
                 limit: { max: limitMax, ms: limitMs },
                 type,
@@ -318,7 +311,7 @@ app.post(
                   file: mediaPath,
                   caption: finalCaption || "",
                   options,
-                  tempFile: true, // worker remove media depois
+                  tempFile: true,
                 },
               };
 
@@ -346,7 +339,6 @@ app.post(
     } catch (err) {
       console.error("❌ /disparar erro:", err.message);
 
-      // tenta apagar CSV mesmo em erro
       try {
         if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
       } catch {}
@@ -356,5 +348,6 @@ app.post(
   }
 );
 
+// ===== Start =====
 const PORT = process.env.API_PORT || 3000;
 app.listen(PORT, () => console.log("✅ API rodando na porta", PORT));
