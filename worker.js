@@ -2,21 +2,114 @@ require("dotenv").config();
 const { Worker } = require("bullmq");
 const TelegramBot = require("node-telegram-bot-api");
 const connection = require("./redis");
+const fs = require("fs");
 
-const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: false });
+const botToken = process.env.TELEGRAM_BOT_TOKEN;
+
+if (!botToken) {
+  console.error("❌ TELEGRAM_BOT_TOKEN não definido nas variáveis de ambiente!");
+  process.exit(1);
+}
+
+const bot = new TelegramBot(botToken, { polling: false });
+
+/**
+ * payload.file pode ser:
+ * - file_id (string)
+ * - URL pública (string começando com http/https)
+ * - path local na VPS (string)
+ */
+function resolveTelegramInput(file) {
+  if (!file) throw new Error("payload.file não foi enviado");
+
+  if (typeof file !== "string") {
+    throw new Error("payload.file deve ser string (file_id, URL ou path local)");
+  }
+
+  // URL pública
+  if (/^https?:\/\//i.test(file)) return file;
+
+  // path local
+  if (fs.existsSync(file)) return fs.createReadStream(file);
+
+  // senão assume que é file_id
+  return file;
+}
 
 const worker = new Worker(
   "disparos",
   async (job) => {
-    const { chatId, mensagem } = job.data;
-
     try {
       console.log("Recebi job:", job.id, job.data);
-      await bot.sendMessage(chatId, mensagem);
+
+      const { chatId } = job.data;
+      if (!chatId) throw new Error("chatId ausente no job");
+
+      // ✅ Compatibilidade com o formato antigo:
+      // { chatId, mensagem }
+      if (job.data.mensagem && !job.data.type) {
+        await bot.sendMessage(chatId, job.data.mensagem);
+        console.log("✅ Enviado (texto legado)!");
+        return;
+      }
+
+      // ✅ Formato novo:
+      // { chatId, type, payload }
+      const { type, payload } = job.data;
+      if (!type) throw new Error("type ausente no job (ex: text/audio/video/voice/video_note)");
+
+      switch (type) {
+        case "text": {
+          const text = payload?.text ?? payload?.mensagem; // aceita ambos
+          if (!text) throw new Error("payload.text ausente");
+          await bot.sendMessage(chatId, text, payload?.options);
+          break;
+        }
+
+        case "audio": {
+          const input = resolveTelegramInput(payload?.file);
+          await bot.sendAudio(chatId, input, {
+            caption: payload?.caption,
+            ...(payload?.options || {}),
+          });
+          break;
+        }
+
+        case "video": {
+          const input = resolveTelegramInput(payload?.file);
+          await bot.sendVideo(chatId, input, {
+            caption: payload?.caption,
+            ...(payload?.options || {}),
+          });
+          break;
+        }
+
+        case "voice": {
+          // “mensagem de voz” (normalmente OGG/OPUS)
+          const input = resolveTelegramInput(payload?.file);
+          await bot.sendVoice(chatId, input, {
+            caption: payload?.caption,
+            ...(payload?.options || {}),
+          });
+          break;
+        }
+
+        case "video_note": {
+          // a “bolinha”
+          const input = resolveTelegramInput(payload?.file);
+          await bot.sendVideoNote(chatId, input, {
+            ...(payload?.options || {}),
+          });
+          break;
+        }
+
+        default:
+          throw new Error(`type inválido: ${type}`);
+      }
+
       console.log("✅ Enviado!");
     } catch (err) {
       console.error("❌ Telegram erro:", err.message);
-      // isso aqui costuma trazer o motivo real (401/403/400 etc)
       if (err.response?.body) console.error("Detalhe:", err.response.body);
       throw err; // marca o job como failed
     }
