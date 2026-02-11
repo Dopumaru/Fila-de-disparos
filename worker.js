@@ -13,27 +13,13 @@ if (!botToken) {
 
 const bot = new TelegramBot(botToken, { polling: false });
 
-/**
- * payload.file pode ser:
- * - file_id (string)
- * - URL pública (string começando com http/https)
- * - path local na VPS (string)
- */
 function resolveTelegramInput(file) {
   if (!file) throw new Error("payload.file não foi enviado");
+  if (typeof file !== "string") throw new Error("payload.file deve ser string");
 
-  if (typeof file !== "string") {
-    throw new Error("payload.file deve ser string (file_id, URL ou path local)");
-  }
-
-  // URL pública
-  if (/^https?:\/\//i.test(file)) return file;
-
-  // path local
-  if (fs.existsSync(file)) return fs.createReadStream(file);
-
-  // senão assume que é file_id
-  return file;
+  if (/^https?:\/\//i.test(file)) return file; 
+  if (fs.existsSync(file)) return fs.createReadStream(file); 
+  return file; 
 }
 
 const worker = new Worker(
@@ -45,22 +31,19 @@ const worker = new Worker(
       const { chatId } = job.data;
       if (!chatId) throw new Error("chatId ausente no job");
 
-      // ✅ Compatibilidade com o formato antigo:
-      // { chatId, mensagem }
+      
       if (job.data.mensagem && !job.data.type) {
         await bot.sendMessage(chatId, job.data.mensagem);
         console.log("✅ Enviado (texto legado)!");
         return;
       }
 
-      // ✅ Formato novo:
-      // { chatId, type, payload }
       const { type, payload } = job.data;
-      if (!type) throw new Error("type ausente no job (ex: text/audio/video/voice/video_note)");
+      if (!type) throw new Error("type ausente no job");
 
       switch (type) {
         case "text": {
-          const text = payload?.text ?? payload?.mensagem; // aceita ambos
+          const text = payload?.text ?? payload?.mensagem;
           if (!text) throw new Error("payload.text ausente");
           await bot.sendMessage(chatId, text, payload?.options);
           break;
@@ -85,7 +68,6 @@ const worker = new Worker(
         }
 
         case "voice": {
-          // “mensagem de voz” (normalmente OGG/OPUS)
           const input = resolveTelegramInput(payload?.file);
           await bot.sendVoice(chatId, input, {
             caption: payload?.caption,
@@ -95,7 +77,6 @@ const worker = new Worker(
         }
 
         case "video_note": {
-          // a “bolinha”
           const input = resolveTelegramInput(payload?.file);
           await bot.sendVideoNote(chatId, input, {
             ...(payload?.options || {}),
@@ -111,7 +92,7 @@ const worker = new Worker(
     } catch (err) {
       console.error("❌ Telegram erro:", err.message);
       if (err.response?.body) console.error("Detalhe:", err.response.body);
-      throw err; // marca o job como failed
+      throw err;
     }
   },
   {

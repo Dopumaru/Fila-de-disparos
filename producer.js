@@ -3,10 +3,14 @@ const connection = require("./redis");
 
 const queue = new Queue("disparos", { connection });
 
-const IDS = [ 1532301009];
+
+const IDS = [
+  1532301009,
+  1264397026,
+];
 
 
-const MODO = "video_note"; // text | audio | video | voice | video_note
+const MODO = "text"; // text | audio | video | voice | video_note
 
 const PRESETS = {
   text: (chatId) => ({
@@ -19,8 +23,9 @@ const PRESETS = {
     chatId,
     type: "audio",
     payload: {
-      file: "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3",
-      caption: "🎧 teste",
+    
+      file: "COLE_AQUI_FILE_ID_OU_URL",
+      caption: "🎧 TESTE AUDIO",
     },
   }),
 
@@ -28,8 +33,8 @@ const PRESETS = {
     chatId,
     type: "video",
     payload: {
-      file: "https://sample-videos.com/video321/mp4/720/big_buck_bunny_720p_1mb.mp4",
-      caption: "🎬 Vídeo",
+      file: "COLE_AQUI_FILE_ID_OU_URL",
+      caption: "🎬 TESTE VIDEO",
     },
   }),
 
@@ -37,7 +42,7 @@ const PRESETS = {
     chatId,
     type: "voice",
     payload: {
-      file: "AwACAgEAAxkBAAMPaYwEf1bEVGUJ1y9FNNcTiT-Xj-kAAg8IAALPTWBEAAEhJc8nLFwgOgQ", // ideal: file_id de um ogg/opus
+      file: "COLE_AQUI_FILE_ID_VOICE",
     },
   }),
 
@@ -45,7 +50,7 @@ const PRESETS = {
     chatId,
     type: "video_note",
     payload: {
-      file: "DQACAgEAAxkBAAMUaYwINfTfKPbIyfQGydOt8oZJ4esAAhEIAALPTWBErF0kSjhT8g46BA",
+      file: "COLE_AQUI_FILE_ID_BOLINHA",
     },
   }),
 };
