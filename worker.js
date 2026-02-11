@@ -5,7 +5,7 @@ const connection = require("./redis");
 const fs = require("fs");
 
 // fallback (se chegar job sem botToken)
-const DEFAULT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
+const DEFAULT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
 if (!DEFAULT_TOKEN) {
   console.warn("⚠️ TELEGRAM_BOT_TOKEN não definido (ok se você sempre mandar botToken no job).");
@@ -34,30 +34,42 @@ function resolveTelegramInput(file) {
   if (!file) throw new Error("payload.file não foi enviado");
   if (typeof file !== "string") throw new Error("payload.file deve ser string");
 
-  if (/^https?:\/\//i.test(file)) return file;        // URL
+  if (/^https?:\/\//i.test(file)) return file; // URL
   if (fs.existsSync(file)) return fs.createReadStream(file); // path local
   return file; // file_id
+}
+
+function safeUnlink(p) {
+  try {
+    if (p && fs.existsSync(p)) fs.unlinkSync(p);
+  } catch {
+    // best-effort
+  }
 }
 
 // rate limit por token (sliding window)
 const tokenWindows = new Map(); // token -> [timestamps]
 async function waitForRateLimit(token, max, ms) {
   const key = token || DEFAULT_TOKEN || "no-token";
+
+  // sanitiza valores
+  const safeMax = Math.max(1, Number(max) || 1);
+  const safeMs = Math.max(200, Number(ms) || 1100);
+
   if (!tokenWindows.has(key)) tokenWindows.set(key, []);
   const arr = tokenWindows.get(key);
 
   while (true) {
     const now = Date.now();
-    // remove antigos
-    while (arr.length && now - arr[0] >= ms) arr.shift();
+    while (arr.length && now - arr[0] >= safeMs) arr.shift();
 
-    if (arr.length < max) {
+    if (arr.length < safeMax) {
       arr.push(now);
       return;
     }
 
-    const wait = ms - (now - arr[0]);
-    await new Promise(r => setTimeout(r, Math.max(wait, 50)));
+    const wait = safeMs - (now - arr[0]);
+    await new Promise((r) => setTimeout(r, Math.max(wait, 50)));
   }
 }
 
@@ -73,27 +85,24 @@ const worker = new Worker(
         token: maskToken(job.data?.botToken),
       });
 
-      const { chatId } = job.data;
+      const { chatId } = job.data || {};
       if (!chatId) throw new Error("chatId ausente no job");
 
-      // legado: mensagem sem type
-      if (job.data.mensagem && !job.data.type) {
-        const bot = getBot(job.data.botToken);
-        // rate limit default
-        const lim = job.data.limit || { max: 1, ms: 1100 };
-        await waitForRateLimit(job.data.botToken, lim.max, lim.ms);
+      // rate limit por token (usa job.data.limit)
+      const lim = job.data?.limit || { max: 1, ms: 1100 };
+      await waitForRateLimit(job.data?.botToken, lim.max, lim.ms ?? lim.duration ?? lim.limitMs);
 
+      const bot = getBot(job.data?.botToken);
+
+      // legado: mensagem sem type
+      if (job.data?.mensagem && !job.data?.type) {
         await bot.sendMessage(chatId, job.data.mensagem);
         console.log("✅ Enviado (texto legado)!");
         return;
       }
 
-      const { type, payload } = job.data;
+      const { type, payload } = job.data || {};
       if (!type) throw new Error("type ausente no job");
-
-      const bot = getBot(job.data.botToken);
-      const lim = job.data.limit || { max: 1, ms: 1100 };
-      await waitForRateLimit(job.data.botToken, lim.max, lim.ms);
 
       switch (type) {
         case "text": {
@@ -152,12 +161,14 @@ const worker = new Worker(
       console.log("✅ Enviado!");
 
       // limpa arquivo temp (upload)
-      if (tempPathToDelete && fs.existsSync(tempPathToDelete)) {
-        fs.unlink(tempPathToDelete, () => {});
-      }
+      if (tempPathToDelete) safeUnlink(tempPathToDelete);
     } catch (err) {
       console.error("❌ Telegram erro:", err.message);
       if (err.response?.body) console.error("Detalhe:", err.response.body);
+
+      // tenta limpar mesmo em erro (best-effort)
+      if (tempPathToDelete) safeUnlink(tempPathToDelete);
+
       throw err;
     }
   },
@@ -170,4 +181,3 @@ const worker = new Worker(
 
 worker.on("failed", (job, err) => console.error("❌ Job falhou:", job?.id, err.message));
 worker.on("error", (err) => console.error("❌ Worker error:", err.message));
-
