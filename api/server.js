@@ -15,7 +15,6 @@ const UPLOAD_DIR = path.join(__dirname, "..", "uploads");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const upload = multer({ dest: UPLOAD_DIR });
-
 const queue = new Queue("disparos", { connection });
 
 app.get("/health", (req, res) => res.json({ ok: true }));
@@ -33,29 +32,28 @@ function isHttpUrl(u) {
 
 // ===== CSV (sem libs) =====
 function detectDelimiter(text) {
-  const firstLine = String(text || "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n")
-    .split("\n")[0] || "";
-  // se tiver ; e não tiver , -> ;
+  const firstLine =
+    String(text || "")
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .split("\n")[0] || "";
+
   if (firstLine.includes(";") && !firstLine.includes(",")) return ";";
   return ",";
 }
 
-// parser simples: vírgula ou ; + aspas (básico)
+// parser simples: delim ( , ou ; ) + aspas (básico)
 function parseCsvRows(text) {
-  const src = String(text || "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n");
-
+  const src = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   const delim = detectDelimiter(src);
 
   const lines = src
     .split("\n")
-    .map(l => l.trim())
-    .filter(Boolean);
+    .map((l) => l.replace(/\uFEFF/g, "")) // remove BOM
+    .filter((l) => l.trim().length > 0);
 
   const rows = [];
+
   for (const line of lines) {
     const cols = [];
     let cur = "";
@@ -65,9 +63,17 @@ function parseCsvRows(text) {
       const ch = line[i];
 
       if (ch === '"') {
+        // aspas duplicadas dentro de quoted field => ""
+        const next = line[i + 1];
+        if (inQuotes && next === '"') {
+          cur += '"';
+          i++;
+          continue;
+        }
         inQuotes = !inQuotes;
         continue;
       }
+
       if (!inQuotes && ch === delim) {
         cols.push(cur.trim());
         cur = "";
@@ -95,35 +101,20 @@ function buildRowObjectsFromCsv(text) {
   if (!rows.length) return { headers: [], items: [] };
 
   const headersRaw = rows[0] || [];
-  const headers = headersRaw.map(h => normalizeKey(h));
+  const headers = headersRaw.map((h, idx) => normalizeKey(h) || `col${idx}`);
 
-  // se não tiver header útil, cria header genérico col0, col1...
-  const hasAnyHeader = headers.some(h => h && h !== "col0");
   const items = [];
-
-  if (hasAnyHeader) {
-    for (let i = 1; i < rows.length; i++) {
-      const r = rows[i];
-      const obj = {};
-      for (let c = 0; c < headers.length; c++) {
-        const key = headers[c] || `col${c}`;
-        obj[key] = (r[c] ?? "").toString().trim();
-      }
-      items.push(obj);
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const obj = {};
+    for (let c = 0; c < headers.length; c++) {
+      const key = headers[c] || `col${c}`;
+      obj[key] = (r[c] ?? "").toString().trim();
     }
-    return { headers, items };
-  } else {
-    // sem header: trata primeira coluna como chatId por padrão
-    for (let i = 0; i < rows.length; i++) {
-      const r = rows[i];
-      const obj = {};
-      for (let c = 0; c < r.length; c++) {
-        obj[`col${c}`] = (r[c] ?? "").toString().trim();
-      }
-      items.push(obj);
-    }
-    return { headers: [], items };
+    items.push(obj);
   }
+
+  return { headers, items };
 }
 
 function applyTemplate(template, rowObj) {
@@ -140,7 +131,6 @@ function applyTemplate(template, rowObj) {
 
 // Busca username do bot (sem salvar)
 async function getBotUsername(botToken) {
-  // Node 18+ tem fetch global
   const r = await fetch(`https://api.telegram.org/bot${botToken}/getMe`);
   const data = await r.json().catch(() => null);
 
@@ -156,6 +146,8 @@ function buildOptionsFromButtons(buttons, botUsername) {
   if (!Array.isArray(buttons) || buttons.length === 0) return undefined;
 
   const inline_keyboard = [];
+
+  // 2 botões por linha
   for (let i = 0; i < buttons.length; i += 2) {
     const row = [];
 
@@ -186,7 +178,7 @@ function buildOptionsFromButtons(buttons, botUsername) {
 }
 
 // ===== ROUTE =====
-// agora aceita: file (mídia) e csv (leads)
+// agora aceita: file (mídia) e csv (leads) — CSV OBRIGATÓRIO
 app.post(
   "/disparar",
   upload.fields([
@@ -194,6 +186,7 @@ app.post(
     { name: "csv", maxCount: 1 },
   ]),
   async (req, res) => {
+    let csvPathToDelete = null;
     try {
       const botToken = (req.body.botToken || "").trim();
       const type = (req.body.type || "").trim(); // text/photo/video/audio/document/voice/video_note
@@ -201,8 +194,7 @@ app.post(
       const limitMax = Number(req.body.limitMax || 1);
       const limitMs = Number(req.body.limitMs || 1100);
 
-      // idColumn: qual coluna do CSV contém o chatId
-      const idColumnRaw = (req.body.idColumn || "chatid").trim();
+      const idColumnRaw = (req.body.idColumn || "chatId").trim();
       const idColumn = normalizeKey(idColumnRaw) || "chatid";
 
       // buttons (opcional)
@@ -226,22 +218,26 @@ app.post(
         }
       }
 
-      // pega arquivos (mídia e csv)
+      // arquivos
       const mediaFile = req.files?.file?.[0] || null;
       const csvFile = req.files?.csv?.[0] || null;
 
-      // valida arquivo x tipo (mídia)
-      if (type !== "text") {
-        if (!mediaFile) {
-          return res.status(400).json({ ok: false, error: "Para mídia/documento, envie o arquivo no campo file." });
-        }
+      // CSV obrigatório
+      if (!csvFile) {
+        return res.status(400).json({ ok: false, error: "Envie o CSV no campo csv. IDs manuais foram desativados." });
+      }
+      csvPathToDelete = csvFile.path;
+
+      // valida mídia x tipo
+      if (type !== "text" && !mediaFile) {
+        return res.status(400).json({ ok: false, error: "Para mídia/documento, envie o arquivo no campo file." });
       }
 
       // limita botões
       if (!Array.isArray(buttons)) buttons = [];
       if (buttons.length > 4) buttons = buttons.slice(0, 4);
 
-      // se tiver botão START, precisamos do username
+      // se tiver START, pega username
       const hasStart = buttons.some((b) => String(b?.type || "").trim() === "start");
       let botUsername = null;
       if (hasStart) {
@@ -250,64 +246,42 @@ app.post(
           return res.status(400).json({ ok: false, error: "Não consegui obter username do bot para botão START." });
         }
       }
+
       const options = buildOptionsFromButtons(buttons, botUsername);
 
-      // caminho do arquivo de mídia no servidor
+      // caminho mídia no servidor
       const mediaPath = mediaFile?.path || null;
 
-      // ===== LEADS: CSV ou IDS =====
-      let leads = []; // array de { chatId, vars }
+      // ===== LEADS via CSV =====
+      const csvText = fs.readFileSync(csvFile.path, "utf8");
+      const { items } = buildRowObjectsFromCsv(csvText);
 
-      if (csvFile) {
-        // lê csv e monta leads
-        const csvText = fs.readFileSync(csvFile.path, "utf8");
-        const { items } = buildRowObjectsFromCsv(csvText);
-
-        if (!items.length) {
-          return res.status(400).json({ ok: false, error: "CSV vazio ou inválido." });
-        }
-
-        for (const row of items) {
-          // tenta pegar chatId por coluna escolhida
-          let chatId = String(row[idColumn] || "").trim();
-
-          // fallback comum: chatid/chat_id/id/col0
-          if (!chatId) chatId = String(row["chatid"] || "").trim();
-          if (!chatId) chatId = String(row["chat_id"] || "").trim();
-          if (!chatId) chatId = String(row["id"] || "").trim();
-          if (!chatId) chatId = String(row["col0"] || "").trim();
-
-          if (!chatId) continue;
-
-          leads.push({ chatId, vars: row });
-        }
-
-        if (!leads.length) {
-          return res.status(400).json({
-            ok: false,
-            error: `Não encontrei IDs no CSV. Verifique a coluna "${idColumnRaw}" (ex: chatId).`,
-          });
-        }
-      } else {
-        // ids manual
-        let ids = [];
-        try {
-          ids = JSON.parse(req.body.ids || "[]");
-        } catch {
-          return res.status(400).json({ ok: false, error: 'ids precisa ser JSON (ex: ["123","456"]).' });
-        }
-
-        if (!Array.isArray(ids) || ids.length === 0) {
-          return res.status(400).json({ ok: false, error: "Envie ids (array) ou um csv." });
-        }
-
-        leads = ids
-          .map((rawId) => String(rawId).trim())
-          .filter(Boolean)
-          .map((chatId) => ({ chatId, vars: {} }));
+      if (!items.length) {
+        return res.status(400).json({ ok: false, error: "CSV vazio ou inválido." });
       }
 
-      // remove duplicados por chatId (mantém primeira ocorrência)
+      let leads = [];
+      for (const row of items) {
+        let chatId = String(row[idColumn] || "").trim();
+
+        // fallback comum
+        if (!chatId) chatId = String(row["chatid"] || "").trim();
+        if (!chatId) chatId = String(row["chat_id"] || "").trim();
+        if (!chatId) chatId = String(row["id"] || "").trim();
+        if (!chatId) chatId = String(row["col0"] || "").trim();
+
+        if (!chatId) continue;
+        leads.push({ chatId, vars: row });
+      }
+
+      if (!leads.length) {
+        return res.status(400).json({
+          ok: false,
+          error: `Não encontrei IDs no CSV. Verifique a coluna "${idColumnRaw}" (ex: chatId).`,
+        });
+      }
+
+      // remove duplicados
       const seen = new Set();
       leads = leads.filter((l) => {
         if (seen.has(l.chatId)) return false;
@@ -321,10 +295,7 @@ app.post(
       for (const lead of leads) {
         const chatId = lead.chatId;
 
-        const finalCaption =
-          lead.vars && Object.keys(lead.vars).length
-            ? applyTemplate(captionTemplate, lead.vars)
-            : String(captionTemplate);
+        const finalCaption = applyTemplate(captionTemplate, lead.vars);
 
         const jobData =
           type === "text"
@@ -347,7 +318,7 @@ app.post(
                   file: mediaPath,
                   caption: finalCaption || "",
                   options,
-                  tempFile: true,
+                  tempFile: true, // worker remove media depois
                 },
               };
 
@@ -356,25 +327,30 @@ app.post(
       }
 
       console.log(
-        `✅ Enfileirado: total=${total} type=${type} leads=${csvFile ? "csv" : "ids"} buttons=${buttons.length} token=${maskToken(
-          botToken
-        )}`
+        `✅ Enfileirado: total=${total} type=${type} source=csv buttons=${buttons.length} token=${maskToken(botToken)}`
       );
 
-      // opcional: apaga o csv upload pra não acumular
+      // apaga CSV upload (não precisa guardar)
       try {
-        if (csvFile?.path) fs.unlinkSync(csvFile.path);
+        if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
       } catch {}
 
       return res.json({
         ok: true,
         total,
         buttons: buttons.length,
-        source: csvFile ? "csv" : "ids",
+        source: "csv",
         idColumn: idColumnRaw,
+        unique: leads.length,
       });
     } catch (err) {
       console.error("❌ /disparar erro:", err.message);
+
+      // tenta apagar CSV mesmo em erro
+      try {
+        if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
+      } catch {}
+
       return res.status(500).json({ ok: false, error: "Erro interno" });
     }
   }
@@ -382,4 +358,3 @@ app.post(
 
 const PORT = process.env.API_PORT || 3000;
 app.listen(PORT, () => console.log("✅ API rodando na porta", PORT));
-
