@@ -27,20 +27,85 @@ function maskToken(t) {
   return s.slice(0, 4) + "..." + s.slice(-4);
 }
 
+function isHttpUrl(u) {
+  return /^https?:\/\//i.test(u || "");
+}
+
+// Busca username do bot (sem salvar)
+async function getBotUsername(botToken) {
+  // Node 18+ tem fetch global
+  const r = await fetch(`https://api.telegram.org/bot${botToken}/getMe`);
+  const data = await r.json().catch(() => null);
+
+  if (!data || !data.ok || !data.result) {
+    throw new Error("Token inválido (getMe)");
+  }
+
+  return data.result.username; // sem "@"
+}
+
+// Converte array buttons -> options.reply_markup.inline_keyboard
+function buildOptionsFromButtons(buttons, botUsername) {
+  if (!Array.isArray(buttons) || buttons.length === 0) return undefined;
+
+  // 2 botões por linha (fica bonito)
+  const inline_keyboard = [];
+  for (let i = 0; i < buttons.length; i += 2) {
+    const row = [];
+
+    for (let j = i; j < i + 2 && j < buttons.length; j++) {
+      const b = buttons[j];
+      const text = String(b.text || "").trim();
+      const type = String(b.type || "").trim(); // url | start
+      const value = String(b.value || "").trim();
+
+      if (!text || !type || !value) continue;
+
+      if (type === "url") {
+        if (!isHttpUrl(value)) continue;
+        row.push({ text, url: value });
+      } else if (type === "start") {
+        if (!botUsername) continue;
+        // param do start (encode)
+        const param = encodeURIComponent(value);
+        row.push({ text, url: `https://t.me/${botUsername}?start=${param}` });
+      }
+    }
+
+    if (row.length) inline_keyboard.push(row);
+  }
+
+  if (!inline_keyboard.length) return undefined;
+
+  return {
+    reply_markup: {
+      inline_keyboard,
+    },
+  };
+}
+
 app.post("/disparar", upload.single("file"), async (req, res) => {
   try {
-    // Campos vindo do front
     const botToken = (req.body.botToken || "").trim();
     const type = (req.body.type || "").trim(); // text/photo/video/audio/document/voice/video_note
-    const caption = req.body.caption ?? ""; // pode ser vazio
+    const caption = req.body.caption ?? "";
     const limitMax = Number(req.body.limitMax || 1);
     const limitMs = Number(req.body.limitMs || 1100);
 
+    // ids
     let ids = [];
     try {
       ids = JSON.parse(req.body.ids || "[]");
     } catch {
-      return res.status(400).json({ ok: false, error: "ids precisa ser JSON (ex: [\"123\",\"456\"])." });
+      return res.status(400).json({ ok: false, error: 'ids precisa ser JSON (ex: ["123","456"]).' });
+    }
+
+    // buttons (opcional)
+    let buttons = [];
+    try {
+      buttons = JSON.parse(req.body.buttons || "[]");
+    } catch {
+      return res.status(400).json({ ok: false, error: "buttons precisa ser JSON." });
     }
 
     if (!botToken) return res.status(400).json({ ok: false, error: "botToken é obrigatório." });
@@ -63,7 +128,23 @@ app.post("/disparar", upload.single("file"), async (req, res) => {
       }
     }
 
-    // caminho do arquivo no servidor (o worker já sabe ler arquivo local)
+    // limita botões
+    if (!Array.isArray(buttons)) buttons = [];
+    if (buttons.length > 4) buttons = buttons.slice(0, 4);
+
+    // se tiver botão START, precisamos do username
+    const hasStart = buttons.some((b) => String(b?.type || "").trim() === "start");
+    let botUsername = null;
+    if (hasStart) {
+      botUsername = await getBotUsername(botToken);
+      if (!botUsername) {
+        return res.status(400).json({ ok: false, error: "Não consegui obter username do bot para botão START." });
+      }
+    }
+
+    const options = buildOptionsFromButtons(buttons, botUsername);
+
+    // caminho do arquivo no servidor (worker lê path local)
     const filePath = req.file?.path || null;
 
     let total = 0;
@@ -76,25 +157,23 @@ app.post("/disparar", upload.single("file"), async (req, res) => {
         type === "text"
           ? {
               chatId,
-              // IMPORTANTE: token vai no job (não salvar em DB)
               botToken,
-              // limite por token
               limit: { max: limitMax, ms: limitMs },
-
               type: "text",
-              payload: { text: caption },
+              payload: {
+                text: caption,
+                options, // ✅ injeta botões aqui
+              },
             }
           : {
               chatId,
               botToken,
               limit: { max: limitMax, ms: limitMs },
-
               type,
               payload: {
-                // worker resolve: URL, path local ou file_id
                 file: filePath,
                 caption: caption || "",
-                // marca pra apagar depois do envio
+                options, // ✅ injeta botões aqui
                 tempFile: true,
               },
             };
@@ -103,10 +182,11 @@ app.post("/disparar", upload.single("file"), async (req, res) => {
       total++;
     }
 
-    // NÃO loga token completo
-    console.log(`✅ Enfileirado: total=${total} type=${type} token=${maskToken(botToken)}`);
+    console.log(
+      `✅ Enfileirado: total=${total} type=${type} buttons=${buttons.length} token=${maskToken(botToken)}`
+    );
 
-    return res.json({ ok: true, total });
+    return res.json({ ok: true, total, buttons: buttons.length });
   } catch (err) {
     console.error("❌ /disparar erro:", err.message);
     return res.status(500).json({ ok: false, error: "Erro interno" });
