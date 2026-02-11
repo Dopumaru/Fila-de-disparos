@@ -6,17 +6,17 @@ const queue = new Queue("disparos", { connection });
 
 const IDS = [
   1532301009,
-  1264397026,
+  //1264397026,
 ];
 
 
-const MODO = "text"; // text | audio | video | voice | video_note
+const MODO = "photo"; // text | audio | video | voice | video_note | photo
 
 const PRESETS = {
   text: (chatId) => ({
     chatId,
     type: "text",
-    payload: { text: "✅ TESTE TEXTO OK" },
+    payload: { text: "teste final!" },
   }),
 
   audio: (chatId) => ({
@@ -24,7 +24,7 @@ const PRESETS = {
     type: "audio",
     payload: {
     
-      file: "COLE_AQUI_FILE_ID_OU_URL",
+      file: "AwACAgEAAxkBAAMZaYwPeApVGlZMCDEAAejJm0q77vuBAAITCAACz01gRInXewm2P1ImOgQ",
       caption: "🎧 TESTE AUDIO",
     },
   }),
@@ -33,7 +33,7 @@ const PRESETS = {
     chatId,
     type: "video",
     payload: {
-      file: "COLE_AQUI_FILE_ID_OU_URL",
+      file: "BAACAgEAAxkBAAMbaYwQVZTksfV2eAABM6lIj1FZX6oRAAIUCAACz01gRJSsl6jiSWfDOgQ",
       caption: "🎬 TESTE VIDEO",
     },
   }),
@@ -42,7 +42,7 @@ const PRESETS = {
     chatId,
     type: "voice",
     payload: {
-      file: "COLE_AQUI_FILE_ID_VOICE",
+      file: "AwACAgEAAxkBAAMZaYwPeApVGlZMCDEAAejJm0q77vuBAAITCAACz01gRInXewm2P1ImOgQ",
     },
   }),
 
@@ -50,9 +50,19 @@ const PRESETS = {
     chatId,
     type: "video_note",
     payload: {
-      file: "COLE_AQUI_FILE_ID_BOLINHA",
+      file: "DQACAgEAAxkBAAMWaYwOp0jRA-n37Nusjkj50yZV_KMAAhIIAALPTWBEO__usJ_gr-A6BA",
     },
   }),
+
+   photo: (chatId) => ({
+    chatId,
+    type: "photo",
+    payload: {
+    file: "https://picsum.photos/600/600",
+    caption: "🖼️ TESTE FOTO",
+  },
+}),
+
 };
 
 (async () => {

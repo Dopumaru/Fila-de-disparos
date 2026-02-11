@@ -84,6 +84,16 @@ const worker = new Worker(
           break;
         }
 
+        case "photo": {
+          const input = resolveTelegramInput(payload?.file);
+          await bot.sendPhoto(chatId, input, {
+          caption: payload?.caption,
+           ...(payload?.options || {}),
+           });
+           break;
+        }
+
+
         default:
           throw new Error(`type inválido: ${type}`);
       }
