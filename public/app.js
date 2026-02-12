@@ -1,4 +1,3 @@
-
 const API_URL = "/disparar";
 
 const state = {
@@ -289,4 +288,3 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
 });
 
 renderTokens();
-
