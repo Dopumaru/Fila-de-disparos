@@ -36,7 +36,7 @@ function resolveTelegramInput(file) {
 
   if (/^https?:\/\//i.test(file)) return file; // URL
   if (fs.existsSync(file)) return fs.createReadStream(file); // path local
-  return file; // file_id (não recomendado, mas fica compatível)
+  return file; // file_id (compat)
 }
 
 function safeUnlink(p) {
@@ -51,11 +51,8 @@ function safeUnlink(p) {
  * CAMPANHA (cleanup automático)
  * - API cria: campaign:<id> com { filePath, pending }
  * - Cada job carrega payload.campaignId
- * - Worker decrementa pending quando job "finaliza":
- *   - sucesso => decrementa
- *   - falha final => decrementa
- *   - falha com retry => NÃO decrementa
- * - Quando pending chega em 0, apaga filePath e del key
+ * - Worker decrementa pending quando job "finaliza"
+ * - Quando pending chega em 0 => apaga filePath e del key (uma única vez)
  */
 async function finalizeCampaignIfDone(campaignId) {
   if (!campaignId) return;
@@ -70,14 +67,23 @@ async function finalizeCampaignIfDone(campaignId) {
     return;
   }
 
-  // se já não existe ou ficou >0, ainda tem jobs
+  // se não chegou em 0 ainda, sai
   if (typeof newPending !== "number" || newPending > 0) return;
 
-  // chegou em 0 (ou negativo por algum bug) => limpa
+  // ===== GARANTIR QUE SÓ UM JOB FAÇA O CLEANUP =====
+  // Se vários jobs chegarem juntos no 0/negativo, só 1 apaga.
+  // SETNX em uma chave de lock:
+  const lockKey = `campaign:${campaignId}:cleanup`;
+  const locked = await connection.set(lockKey, "1", "NX", "EX", 300); // 5 min
+  if (!locked) return; // outro job já está limpando
+
   try {
     const filePath = await connection.hget(key, "filePath");
     if (filePath) safeUnlink(filePath);
+
     await connection.del(key);
+    await connection.del(lockKey);
+
     console.log("🧹 Campanha finalizada, arquivo apagado:", campaignId);
   } catch {
     // best-effort
@@ -115,7 +121,6 @@ const worker = new Worker(
     // esse delete é apenas para "tempFile por job"
     let tempPathToDelete = null;
 
-    // pega campaignId se existir
     const campaignId = job?.data?.payload?.campaignId || null;
 
     try {
@@ -139,7 +144,6 @@ const worker = new Worker(
       if (job.data?.mensagem && !job.data?.type) {
         await bot.sendMessage(chatId, job.data.mensagem);
         console.log("✅ Enviado (texto legado)!");
-        // finaliza campanha se existir (legado não usa, mas ok)
         if (campaignId) await finalizeCampaignIfDone(campaignId);
         return;
       }
@@ -151,7 +155,7 @@ const worker = new Worker(
       const markTempIfLocal = () => {
         if (
           payload?.tempFile &&
-          !payload?.campaignId && // campanha controla cleanup, então não apaga por job
+          !payload?.campaignId &&
           typeof payload?.file === "string" &&
           fs.existsSync(payload.file)
         ) {
@@ -215,23 +219,19 @@ const worker = new Worker(
 
       console.log("✅ Enviado!");
 
-      // se for campanha, decrementa e talvez apaga no final
-      if (campaignId) {
-        await finalizeCampaignIfDone(campaignId);
-      }
+      // campanha: decrementa no sucesso
+      if (campaignId) await finalizeCampaignIfDone(campaignId);
 
-      // limpa arquivo temp (apenas no modo tempFile por job)
+      // tempFile por job (não campanha)
       if (tempPathToDelete) safeUnlink(tempPathToDelete);
     } catch (err) {
       console.error("❌ Telegram erro:", err.message);
       if (err.response?.body) console.error("Detalhe:", err.response.body);
 
-      // Se falhou mas vai ter retry, NÃO finaliza campanha ainda.
-      // Só finaliza na falha FINAL (última tentativa).
+      // falha final: attemptsMade >= attempts - 1
       const attempts = job?.opts?.attempts ?? 1;
       const attemptsMade = job?.attemptsMade ?? 0;
-
-      const isFinalFailure = attemptsMade >= attempts;
+      const isFinalFailure = attemptsMade >= (attempts - 1);
 
       if (isFinalFailure && campaignId) {
         await finalizeCampaignIfDone(campaignId);
