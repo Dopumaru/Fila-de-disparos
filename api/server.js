@@ -26,7 +26,9 @@ app.get("/", (req, res) => {
 const UPLOAD_DIR = path.join(__dirname, "..", "uploads");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
+// multer salva em disco (não em RAM)
 const upload = multer({ dest: UPLOAD_DIR });
+
 const queue = new Queue("disparos", { connection });
 
 // ===== Utils =====
@@ -36,9 +38,8 @@ function maskToken(t) {
   if (s.length <= 10) return "***";
   return s.slice(0, 4) + "..." + s.slice(-4);
 }
-
 function isHttpUrl(u) {
-  return /^https?:\/\//i.test(u || "");
+  return /^https?:\/\//i.test(String(u || "").trim());
 }
 
 // ===== CSV (sem libs) =====
@@ -59,7 +60,7 @@ function parseCsvRows(text) {
 
   const lines = src
     .split("\n")
-    .map((l) => l.replace(/\uFEFF/g, ""))
+    .map((l) => l.replace(/\uFEFF/g, "")) // remove BOM
     .filter((l) => l.trim().length > 0);
 
   const rows = [];
@@ -89,6 +90,7 @@ function parseCsvRows(text) {
         cur += ch;
       }
     }
+
     cols.push(cur.trim());
     rows.push(cols);
   }
@@ -175,12 +177,11 @@ function buildOptionsFromButtons(buttons, botUsername) {
   }
 
   if (!inline_keyboard.length) return undefined;
-
   return { reply_markup: { inline_keyboard } };
 }
 
 // ===== ROUTE =====
-// aceita: csv (obrigatório) e (file upload OU fileId string)
+// aceita: csv (obrigatório) e (file upload OU fileUrl string)
 app.post(
   "/disparar",
   upload.fields([
@@ -189,7 +190,6 @@ app.post(
   ]),
   async (req, res) => {
     let csvPathToDelete = null;
-    let uploadFilePathToDelete = null;
 
     try {
       const botToken = (req.body.botToken || "").trim();
@@ -198,8 +198,8 @@ app.post(
       const limitMax = Number(req.body.limitMax || 1);
       const limitMs = Number(req.body.limitMs || 1100);
 
-      // ✅ NOVO: fileId vindo do front (string)
-      const fileId = (req.body.fileId || "").trim();
+      // ✅ NOVO: URL opcional vinda do front
+      const fileUrl = (req.body.fileUrl || "").trim();
 
       const idColumnRaw = (req.body.idColumn || "chatId").trim();
       const idColumn = normalizeKey(idColumnRaw) || "chatid";
@@ -225,19 +225,21 @@ app.post(
       const csvFile = req.files?.csv?.[0] || null;
 
       if (!csvFile) {
-        return res.status(400).json({
-          ok: false,
-          error: "Envie o CSV no campo csv. IDs manuais foram desativados.",
-        });
+        return res.status(400).json({ ok: false, error: "Envie o CSV no campo csv." });
       }
       csvPathToDelete = csvFile.path;
 
-      // ✅ Aqui muda: para mídia, aceita upload OU fileId
-      if (type !== "text" && !mediaFile && !fileId) {
-        return res.status(400).json({
-          ok: false,
-          error: "Para mídia/documento, envie o arquivo no campo file OU cole o file_id no campo fileId.",
-        });
+      // ✅ mídia: exige upload OU URL
+      if (type !== "text") {
+        if (!mediaFile && !fileUrl) {
+          return res.status(400).json({
+            ok: false,
+            error: "Para mídia/documento, envie file (upload) OU preencha fileUrl (http/https).",
+          });
+        }
+        if (fileUrl && !isHttpUrl(fileUrl)) {
+          return res.status(400).json({ ok: false, error: "fileUrl inválida (precisa http/https)." });
+        }
       }
 
       if (!Array.isArray(buttons)) buttons = [];
@@ -254,14 +256,9 @@ app.post(
 
       const options = buildOptionsFromButtons(buttons, botUsername);
 
-      // ✅ fonte da mídia: fileId (preferência) ou path de upload
-      const mediaSource = fileId ? fileId : (mediaFile?.path || null);
-
-      // se for upload, marca pra apagar depois (worker vai apagar se tempFile=true,
-      // mas aqui é API, então vamos deixar o worker apagar e não apagar aqui)
-      if (!fileId && mediaFile?.path) {
-        uploadFilePathToDelete = null; // quem apaga é o worker (tempFile: true)
-      }
+      // ✅ fonte da mídia: URL tem prioridade, senão path do upload
+      const mediaSource = fileUrl || (mediaFile?.path || null);
+      const isUpload = !!mediaFile && !fileUrl;
 
       // ===== LEADS via CSV =====
       const csvText = fs.readFileSync(csvFile.path, "utf8");
@@ -320,12 +317,10 @@ app.post(
                 limit: { max: limitMax, ms: limitMs },
                 type,
                 payload: {
-                  // ✅ agora pode ser file_id OU path
-                  file: mediaSource,
+                  file: mediaSource, // ✅ URL ou path
                   caption: finalCaption || "",
                   options,
-                  // ✅ se veio de upload, worker apaga depois
-                  tempFile: !fileId,
+                  tempFile: isUpload, // ✅ só apaga se for upload
                 },
               };
 
@@ -334,7 +329,7 @@ app.post(
       }
 
       console.log(
-        `✅ Enfileirado: total=${total} type=${type} source=csv buttons=${buttons.length} token=${maskToken(botToken)} fileSrc=${fileId ? "file_id" : "upload"}`
+        `✅ Enfileirado: total=${total} type=${type} source=csv buttons=${buttons.length} token=${maskToken(botToken)} media=${type === "text" ? "none" : (fileUrl ? "url" : "upload")}`
       );
 
       // apaga CSV upload (não precisa guardar)
@@ -349,7 +344,7 @@ app.post(
         source: "csv",
         idColumn: idColumnRaw,
         unique: leads.length,
-        media: type === "text" ? null : (fileId ? "file_id" : "upload"),
+        media: type === "text" ? null : (fileUrl ? "url" : "upload"),
       });
     } catch (err) {
       console.error("❌ /disparar erro:", err.message);
@@ -358,8 +353,6 @@ app.post(
         if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
       } catch {}
 
-      // se em algum ponto você decidir apagar upload aqui, use uploadFilePathToDelete
-      // (mas hoje quem apaga é o worker)
       return res.status(500).json({ ok: false, error: "Erro interno" });
     }
   }
