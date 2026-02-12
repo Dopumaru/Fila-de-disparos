@@ -10,24 +10,17 @@ const connection = require("../redis");
 
 const app = express();
 
-// ===== FRONT (public) =====
 app.use(express.static(path.join(__dirname, "..", "public")));
 app.use(cors());
 
-// Health
 app.get("/health", (req, res) => res.json({ ok: true }));
+app.get("/", (req, res) => res.sendFile(path.join(__dirname, "..", "public", "index.html")));
 
-// Rota raiz: abre o painel
-app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "..", "public", "index.html"));
-});
-
-// ===== Uploads (VOLUME COMPARTILHADO) =====
-// IMPORTANTe: no EasyPanel, monte o volume em /app/uploads (recomendado)
-const UPLOAD_DIR = process.env.UPLOAD_DIR || "/app/uploads";
+// ✅ Upload dir via env (pra bater com o volume)
+const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, "..", "uploads");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-// multer salva em disco (não em RAM)
+// ✅ multer em disco (NÃO RAM)
 const upload = multer({ dest: UPLOAD_DIR });
 
 const queue = new Queue("disparos", { connection });
@@ -46,18 +39,13 @@ function makeCampaignId() {
   return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
 }
 
-// ===== CSV (sem libs) =====
+// ===== CSV helpers =====
 function detectDelimiter(text) {
   const firstLine =
-    String(text || "")
-      .replace(/\r\n/g, "\n")
-      .replace(/\r/g, "\n")
-      .split("\n")[0] || "";
-
+    String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n")[0] || "";
   if (firstLine.includes(";") && !firstLine.includes(",")) return ";";
   return ",";
 }
-
 function parseCsvRows(text) {
   const src = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   const delim = detectDelimiter(src);
@@ -94,14 +82,11 @@ function parseCsvRows(text) {
         cur += ch;
       }
     }
-
     cols.push(cur.trim());
     rows.push(cols);
   }
-
   return rows;
 }
-
 function normalizeKey(k) {
   return String(k || "")
     .trim()
@@ -109,7 +94,6 @@ function normalizeKey(k) {
     .replace(/\s+/g, "")
     .replace(/[^a-z0-9_]/g, "");
 }
-
 function buildRowObjectsFromCsv(text) {
   const rows = parseCsvRows(text);
   if (!rows.length) return { headers: [], items: [] };
@@ -127,10 +111,8 @@ function buildRowObjectsFromCsv(text) {
     }
     items.push(obj);
   }
-
   return { headers, items };
 }
-
 function applyTemplate(template, rowObj) {
   const t = String(template || "");
   return t.replace(/\{(\w+)\}/g, (_, key) => {
@@ -144,26 +126,20 @@ function applyTemplate(template, rowObj) {
 async function getBotUsername(botToken) {
   const r = await fetch(`https://api.telegram.org/bot${botToken}/getMe`);
   const data = await r.json().catch(() => null);
-
-  if (!data || !data.ok || !data.result) {
-    throw new Error("Token inválido (getMe)");
-  }
-  return data.result.username; // sem "@"
+  if (!data || !data.ok || !data.result) throw new Error("Token inválido (getMe)");
+  return data.result.username;
 }
-
 function buildOptionsFromButtons(buttons, botUsername) {
   if (!Array.isArray(buttons) || buttons.length === 0) return undefined;
 
   const inline_keyboard = [];
   for (let i = 0; i < buttons.length; i += 2) {
     const row = [];
-
     for (let j = i; j < i + 2 && j < buttons.length; j++) {
       const b = buttons[j];
       const text = String(b.text || "").trim();
-      const type = String(b.type || "").trim(); // url | start
+      const type = String(b.type || "").trim();
       const value = String(b.value || "").trim();
-
       if (!text || !type || !value) continue;
 
       if (type === "url") {
@@ -175,7 +151,6 @@ function buildOptionsFromButtons(buttons, botUsername) {
         row.push({ text, url: `https://t.me/${botUsername}?start=${param}` });
       }
     }
-
     if (row.length) inline_keyboard.push(row);
   }
 
@@ -184,13 +159,9 @@ function buildOptionsFromButtons(buttons, botUsername) {
 }
 
 // ===== ROUTE =====
-// aceita: csv (obrigatório) e (file upload OU fileUrl string)
 app.post(
   "/disparar",
-  upload.fields([
-    { name: "file", maxCount: 1 },
-    { name: "csv", maxCount: 1 },
-  ]),
+  upload.fields([{ name: "file", maxCount: 1 }, { name: "csv", maxCount: 1 }]),
   async (req, res) => {
     let csvPathToDelete = null;
 
@@ -200,7 +171,6 @@ app.post(
       const captionTemplate = req.body.caption ?? "";
       const limitMax = Number(req.body.limitMax || 1);
       const limitMs = Number(req.body.limitMs || 1100);
-
       const fileUrl = (req.body.fileUrl || "").trim();
 
       const idColumnRaw = (req.body.idColumn || "chatId").trim();
@@ -218,20 +188,16 @@ app.post(
       if (!(limitMax >= 1) || !(limitMs >= 200)) {
         return res.status(400).json({ ok: false, error: "limitMax>=1 e limitMs>=200." });
       }
-
       if (type === "text" && !String(captionTemplate).trim()) {
-        return res.status(400).json({ ok: false, error: "Para text, caption (mensagem) é obrigatório." });
+        return res.status(400).json({ ok: false, error: "Para text, caption é obrigatório." });
       }
 
       const mediaFile = req.files?.file?.[0] || null;
       const csvFile = req.files?.csv?.[0] || null;
 
-      if (!csvFile) {
-        return res.status(400).json({ ok: false, error: "Envie o CSV no campo csv." });
-      }
+      if (!csvFile) return res.status(400).json({ ok: false, error: "Envie o CSV no campo csv." });
       csvPathToDelete = csvFile.path;
 
-      // mídia: exige upload OU URL
       if (type !== "text") {
         if (!mediaFile && !fileUrl) {
           return res.status(400).json({
@@ -249,70 +215,56 @@ app.post(
 
       const hasStart = buttons.some((b) => String(b?.type || "").trim() === "start");
       let botUsername = null;
-      if (hasStart) {
-        botUsername = await getBotUsername(botToken);
-        if (!botUsername) {
-          return res.status(400).json({ ok: false, error: "Não consegui obter username do bot para botão START." });
-        }
-      }
+      if (hasStart) botUsername = await getBotUsername(botToken);
 
       const options = buildOptionsFromButtons(buttons, botUsername);
 
-      // fonte da mídia: URL tem prioridade, senão path do upload
-      const mediaSource = fileUrl || (mediaFile?.path || null);
+      // ✅ fonte da mídia:
+      // - URL: manda a URL pro worker
+      // - Upload: manda "upload:<filename>" pro worker resolver pelo UPLOAD_DIR
       const isUpload = !!mediaFile && !fileUrl;
+      const mediaSource = fileUrl ? fileUrl : (isUpload ? `upload:${mediaFile.filename}` : null);
 
       // ===== LEADS via CSV =====
       const csvText = fs.readFileSync(csvFile.path, "utf8");
       const { items } = buildRowObjectsFromCsv(csvText);
-
-      if (!items.length) {
-        return res.status(400).json({ ok: false, error: "CSV vazio ou inválido." });
-      }
+      if (!items.length) return res.status(400).json({ ok: false, error: "CSV vazio ou inválido." });
 
       let leads = [];
       for (const row of items) {
         let chatId = String(row[idColumn] || "").trim();
-
         if (!chatId) chatId = String(row["chatid"] || "").trim();
         if (!chatId) chatId = String(row["chat_id"] || "").trim();
         if (!chatId) chatId = String(row["id"] || "").trim();
         if (!chatId) chatId = String(row["col0"] || "").trim();
-
         if (!chatId) continue;
         leads.push({ chatId, vars: row });
       }
-
       if (!leads.length) {
         return res.status(400).json({
           ok: false,
-          error: `Não encontrei IDs no CSV. Verifique a coluna "${idColumnRaw}" (ex: chatId).`,
+          error: `Não encontrei IDs no CSV. Verifique a coluna "${idColumnRaw}".`,
         });
       }
 
       // remove duplicados
       const seen = new Set();
-      leads = leads.filter((l) => {
-        if (seen.has(l.chatId)) return false;
-        seen.add(l.chatId);
-        return true;
-      });
+      leads = leads.filter((l) => (seen.has(l.chatId) ? false : (seen.add(l.chatId), true)));
 
-      // ===== CAMPANHA (somente UPLOAD) =====
+      // ===== CAMPANHA: só pro UPLOAD =====
       let campaignId = null;
-
       if (type !== "text" && isUpload) {
         campaignId = makeCampaignId();
+        const filePath = path.join(UPLOAD_DIR, mediaFile.filename);
         await connection.hset(`campaign:${campaignId}`, {
-          filePath: mediaFile.path,          // caminho no volume compartilhado
-          pending: String(leads.length),      // worker vai decrementar
+          filePath,
+          pending: String(leads.length),
           createdAt: String(Date.now()),
         });
       }
 
       // ===== ENFILEIRAR =====
       let total = 0;
-
       for (const lead of leads) {
         const finalCaption = applyTemplate(captionTemplate, lead.vars);
 
@@ -331,10 +283,11 @@ app.post(
                 limit: { max: limitMax, ms: limitMs },
                 type,
                 payload: {
-                  file: mediaSource, // URL ou path (upload)
+                  file: mediaSource,
                   caption: finalCaption || "",
                   options,
                   campaignId: campaignId || null,
+                  tempFile: false,
                 },
               };
 
@@ -343,38 +296,29 @@ app.post(
       }
 
       console.log(
-        `✅ Enfileirado: total=${total} type=${type} buttons=${buttons.length} token=${maskToken(botToken)} media=${type === "text" ? "none" : (fileUrl ? "url" : "upload")} campaignId=${campaignId || "none"}`
+        `✅ Enfileirado: total=${total} type=${type} buttons=${buttons.length} token=${maskToken(
+          botToken
+        )} media=${type === "text" ? "none" : fileUrl ? "url" : "upload"} campaignId=${campaignId || "none"}`
       );
 
-      // apaga CSV upload (não precisa guardar)
-      try {
-        if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
-      } catch {}
+      // apaga CSV
+      try { if (csvPathToDelete) fs.unlinkSync(csvPathToDelete); } catch {}
 
       return res.json({
         ok: true,
         total,
-        buttons: buttons.length,
-        source: "csv",
-        idColumn: idColumnRaw,
         unique: leads.length,
-        media: type === "text" ? null : (fileUrl ? "url" : "upload"),
+        buttons: buttons.length,
+        media: type === "text" ? null : fileUrl ? "url" : "upload",
         campaignId: campaignId || null,
       });
     } catch (err) {
       console.error("❌ /disparar erro:", err.message);
-
-      try {
-        if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
-      } catch {}
-
+      try { if (csvPathToDelete) fs.unlinkSync(csvPathToDelete); } catch {}
       return res.status(500).json({ ok: false, error: "Erro interno" });
     }
   }
 );
 
-// ===== Start =====
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("✅ API rodando na porta", PORT);
-});
+app.listen(PORT, () => console.log("✅ API rodando na porta", PORT));
