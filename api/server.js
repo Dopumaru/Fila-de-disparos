@@ -22,8 +22,9 @@ app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "..", "public", "index.html"));
 });
 
-// ===== Uploads =====
-const UPLOAD_DIR = path.join(__dirname, "..", "uploads");
+// ===== Uploads (VOLUME COMPARTILHADO) =====
+// IMPORTANTe: no EasyPanel, monte o volume em /app/uploads (recomendado)
+const UPLOAD_DIR = process.env.UPLOAD_DIR || "/app/uploads";
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // multer salva em disco (não em RAM)
@@ -63,7 +64,7 @@ function parseCsvRows(text) {
 
   const lines = src
     .split("\n")
-    .map((l) => l.replace(/\uFEFF/g, "")) // remove BOM
+    .map((l) => l.replace(/\uFEFF/g, ""))
     .filter((l) => l.trim().length > 0);
 
   const rows = [];
@@ -147,7 +148,6 @@ async function getBotUsername(botToken) {
   if (!data || !data.ok || !data.result) {
     throw new Error("Token inválido (getMe)");
   }
-
   return data.result.username; // sem "@"
 }
 
@@ -201,7 +201,6 @@ app.post(
       const limitMax = Number(req.body.limitMax || 1);
       const limitMs = Number(req.body.limitMs || 1100);
 
-      // URL opcional vinda do front
       const fileUrl = (req.body.fileUrl || "").trim();
 
       const idColumnRaw = (req.body.idColumn || "chatId").trim();
@@ -299,14 +298,14 @@ app.post(
         return true;
       });
 
-      // ===== CAMPANHA (só para UPLOAD) =====
-      // Se for upload, vamos manter o arquivo até o fim da campanha e apagar automático no worker.
+      // ===== CAMPANHA (somente UPLOAD) =====
       let campaignId = null;
+
       if (type !== "text" && isUpload) {
         campaignId = makeCampaignId();
         await connection.hset(`campaign:${campaignId}`, {
-          filePath: mediaFile.path,
-          pending: String(leads.length),
+          filePath: mediaFile.path,          // caminho no volume compartilhado
+          pending: String(leads.length),      // worker vai decrementar
           createdAt: String(Date.now()),
         });
       }
@@ -332,14 +331,10 @@ app.post(
                 limit: { max: limitMax, ms: limitMs },
                 type,
                 payload: {
-                  file: mediaSource, // URL ou path
+                  file: mediaSource, // URL ou path (upload)
                   caption: finalCaption || "",
                   options,
-                  // IMPORTANTÍSSIMO:
-                  // - URL: não tem campaignId, não apaga nada
-                  // - UPLOAD: campaignId existe, e o worker apaga quando pending chegar em 0
                   campaignId: campaignId || null,
-                  tempFile: false,
                 },
               };
 
@@ -348,7 +343,7 @@ app.post(
       }
 
       console.log(
-        `✅ Enfileirado: total=${total} type=${type} source=csv buttons=${buttons.length} token=${maskToken(botToken)} media=${type === "text" ? "none" : (fileUrl ? "url" : "upload")} campaignId=${campaignId || "none"}`
+        `✅ Enfileirado: total=${total} type=${type} buttons=${buttons.length} token=${maskToken(botToken)} media=${type === "text" ? "none" : (fileUrl ? "url" : "upload")} campaignId=${campaignId || "none"}`
       );
 
       // apaga CSV upload (não precisa guardar)
