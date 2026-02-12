@@ -104,6 +104,13 @@ const worker = new Worker(
       const { type, payload } = job.data || {};
       if (!type) throw new Error("type ausente no job");
 
+      // helper: só marca pra apagar se for arquivo local existente
+      const markTempIfLocal = () => {
+        if (payload?.tempFile && typeof payload?.file === "string" && fs.existsSync(payload.file)) {
+          tempPathToDelete = payload.file;
+        }
+      };
+
       switch (type) {
         case "text": {
           const text = payload?.text ?? payload?.mensagem;
@@ -114,42 +121,42 @@ const worker = new Worker(
 
         case "audio": {
           const input = resolveTelegramInput(payload?.file);
-          if (payload?.tempFile && typeof payload?.file === "string") tempPathToDelete = payload.file;
+          markTempIfLocal();
           await bot.sendAudio(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
           break;
         }
 
         case "video": {
           const input = resolveTelegramInput(payload?.file);
-          if (payload?.tempFile && typeof payload?.file === "string") tempPathToDelete = payload.file;
+          markTempIfLocal();
           await bot.sendVideo(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
           break;
         }
 
         case "voice": {
           const input = resolveTelegramInput(payload?.file);
-          if (payload?.tempFile && typeof payload?.file === "string") tempPathToDelete = payload.file;
+          markTempIfLocal();
           await bot.sendVoice(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
           break;
         }
 
         case "video_note": {
           const input = resolveTelegramInput(payload?.file);
-          if (payload?.tempFile && typeof payload?.file === "string") tempPathToDelete = payload.file;
+          markTempIfLocal();
           await bot.sendVideoNote(chatId, input, { ...(payload?.options || {}) });
           break;
         }
 
         case "photo": {
           const input = resolveTelegramInput(payload?.file);
-          if (payload?.tempFile && typeof payload?.file === "string") tempPathToDelete = payload.file;
+          markTempIfLocal();
           await bot.sendPhoto(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
           break;
         }
 
         case "document": {
           const input = resolveTelegramInput(payload?.file);
-          if (payload?.tempFile && typeof payload?.file === "string") tempPathToDelete = payload.file;
+          markTempIfLocal();
           await bot.sendDocument(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
           break;
         }
@@ -166,17 +173,11 @@ const worker = new Worker(
       console.error("❌ Telegram erro:", err.message);
       if (err.response?.body) console.error("Detalhe:", err.response.body);
 
-      // tenta limpar mesmo em erro (best-effort)
       if (tempPathToDelete) safeUnlink(tempPathToDelete);
-
       throw err;
     }
   },
-  {
-    connection,
-    // IMPORTANTE: não use limiter global aqui, porque agora limit é por token
-    // limiter: { max: 1, duration: 1000 },
-  }
+  { connection }
 );
 
 worker.on("failed", (job, err) => console.error("❌ Job falhou:", job?.id, err.message));
