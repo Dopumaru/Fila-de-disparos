@@ -25,7 +25,6 @@
     .tokenBtn { border:1px solid #ddd; background:#fff; padding: 8px 10px; border-radius: 10px; cursor:pointer; }
     .tokenBtn.active { border-color: #333; }
     .muted { color:#666; font-size: 12px; }
-    .serverTag { display:inline-block; font-size: 12px; padding: 6px 10px; border-radius: 999px; background: #eef6ff; border: 1px solid #d7ebff; color:#0b3a6d; }
   </style>
 </head>
 <body>
@@ -67,20 +66,17 @@
     </div>
 
     <div>
-      <label>Modo de envio da mídia</label>
-      <select id="mediaMode">
-        <option value="file_id">file_id (sem upload, recomendado)</option>
-        <option value="upload" disabled>Upload (desativado por enquanto)</option>
-      </select>
-      <div class="hint">file_id só funciona pro <b>mesmo bot/token</b> que recebeu o arquivo.</div>
+      <label>Arquivo (upload)</label>
+      <input id="arquivo" type="file" />
+      <div class="hint">Use upload para arquivos menores. Para arquivos grandes, prefira URL.</div>
     </div>
   </div>
 
-  <div class="row" id="fileIdRow">
-    <div>
-      <label>file_id (quando não for texto)</label>
-      <input id="fileId" placeholder="Cole o file_id aqui (ex: BAACAgQAAxkBAA...)" />
-      <div class="hint">Pegue com o script getFileId (polling). Não faz upload (não enche memória).</div>
+  <div id="mediaRow">
+    <label>URL do arquivo (opcional)</label>
+    <input id="fileUrl" placeholder="https://... (se preencher, ignora o upload)" />
+    <div class="hint">
+      Preencha <b>URL</b> OU selecione um <b>arquivo</b> (upload). Se preencher URL, não faz upload e não ocupa disco.
     </div>
   </div>
 
@@ -131,7 +127,6 @@
     Tipo <b>START</b>: envia um callback <b>start:PARAM</b> (seu bot pode tratar isso).
   </div>
 
-  <!-- Botões 1-4 -->
   <div class="row">
     <div><label>Botão 1 - Texto</label><input id="b1Text" placeholder="Ex: Ver oferta" /></div>
     <div style="max-width: 180px;"><label>Tipo</label>
@@ -170,11 +165,12 @@
   <pre id="debug"></pre>
 
   <script>
-    // UI: esconder/mostrar file_id quando for texto
+    // UI: esconder/mostrar mídia quando for texto
     const tipo = document.getElementById("tipo");
-    const fileIdRow = document.getElementById("fileIdRow");
+    const mediaRow = document.getElementById("mediaRow");
+
     function refreshUI() {
-      fileIdRow.style.display = (tipo.value === "text") ? "none" : "";
+      mediaRow.style.display = (tipo.value === "text") ? "none" : "";
     }
     tipo.addEventListener("change", refreshUI);
     refreshUI();
