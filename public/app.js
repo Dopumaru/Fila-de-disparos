@@ -146,6 +146,10 @@ function appendDebug(line) {
   debugEl.textContent = (debugEl.textContent || "") + line;
 }
 
+function isHttpUrl(u) {
+  return /^https?:\/\//i.test(String(u || "").trim());
+}
+
 // ===== EVENTOS =====
 document.getElementById("btnAddToken").addEventListener("click", async () => {
   const token = document.getElementById("tokenInput").value.trim();
@@ -193,15 +197,11 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
   const limMax = Number(document.getElementById("limitMax").value || 1);
   const limMs = Number(document.getElementById("limitMs").value || 1100);
 
-  // ⚠️ upload está desativado no seu novo index, mas deixo compatível:
   const file = document.getElementById("arquivo")?.files?.[0] || null;
-
-  // ✅ file_id (novo)
-  const fileId = (document.getElementById("fileId")?.value || "").trim();
+  const fileUrl = (document.getElementById("fileUrl")?.value || "").trim();
 
   const csv = getCsvFile();
   const idColumn = getIdColumn();
-
   const tokenObj = selectedToken();
 
   clearDebug();
@@ -217,13 +217,21 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
     return setStatus("err", "Mensagem obrigatória para texto.");
   }
 
-  // ✅ aqui muda: para mídia, aceita file_id (ou upload se você reativar depois)
-  if (tipo !== "text" && !fileId && !file) {
-    return setStatus("err", "Para mídia/documento, cole o file_id (ou selecione arquivo se o upload estiver ativo).");
-  }
-
   if (!(limMax >= 1) || !(limMs >= 200)) {
     return setStatus("err", "Limite inválido. Use max >= 1 e intervalo >= 200ms.");
+  }
+
+  // mídia: exige URL ou upload
+  if (tipo !== "text") {
+    const hasUrl = !!fileUrl;
+    const hasUpload = !!file;
+
+    if (!hasUrl && !hasUpload) {
+      return setStatus("err", "Para mídia/documento: preencha a URL do arquivo OU selecione um arquivo (upload).");
+    }
+    if (hasUrl && !isHttpUrl(fileUrl)) {
+      return setStatus("err", "A URL do arquivo deve começar com http:// ou https://");
+    }
   }
 
   const buttons = readButtons();
@@ -240,14 +248,14 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
   form.append("limitMs", String(limMs));
   form.append("buttons", JSON.stringify(buttons));
 
-  // ✅ NOVO: manda file_id (string) quando não for texto
-  // backend pode ler req.body.fileId (ou tratar como "file")
+  // Se tiver URL, manda URL e NÃO manda upload (URL tem prioridade)
   if (tipo !== "text") {
-    form.append("fileId", fileId || "");
+    if (fileUrl) {
+      form.append("fileUrl", fileUrl);
+    } else if (file) {
+      form.append("file", file);
+    }
   }
-
-  // compat: se upload voltar no futuro
-  if (file) form.append("file", file);
 
   setSending(true);
   setStatus("", "Enfileirando...");
@@ -260,8 +268,7 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
     "Tipo: " + tipo + "\n" +
     "Botões: " + (buttons.length || 0) + "\n" +
     "Rate: " + limMax + " a cada " + limMs + "ms\n" +
-    (fileId ? "file_id: " + fileId.slice(0, 8) + "..." + fileId.slice(-8) + "\n" : "") +
-    (file ? "Arquivo: " + file.name + "\n" : "")
+    (tipo !== "text" ? (fileUrl ? "URL: " + fileUrl + "\n" : (file ? "Upload: " + file.name + "\n" : "")) : "")
   );
 
   try {
