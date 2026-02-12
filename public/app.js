@@ -221,16 +221,21 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
     return setStatus("err", "Limite inválido. Use max >= 1 e intervalo >= 200ms.");
   }
 
-  // mídia: exige URL ou upload
+  // mídia: exige URL ou upload (e não deixa os dois)
   if (tipo !== "text") {
     const hasUrl = !!fileUrl;
     const hasUpload = !!file;
 
-    if (!hasUrl && !hasUpload) {
-      return setStatus("err", "Para mídia/documento: preencha a URL do arquivo OU selecione um arquivo (upload).");
-    }
     if (hasUrl && !isHttpUrl(fileUrl)) {
       return setStatus("err", "A URL do arquivo deve começar com http:// ou https://");
+    }
+
+    if (hasUrl && hasUpload) {
+      return setStatus("err", "Escolha apenas UM: URL do arquivo OU Upload.");
+    }
+
+    if (!hasUrl && !hasUpload) {
+      return setStatus("err", "Para mídia/documento: preencha a URL do arquivo OU selecione um arquivo (upload).");
     }
   }
 
@@ -250,11 +255,8 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
 
   // Se tiver URL, manda URL e NÃO manda upload (URL tem prioridade)
   if (tipo !== "text") {
-    if (fileUrl) {
-      form.append("fileUrl", fileUrl);
-    } else if (file) {
-      form.append("file", file);
-    }
+    if (fileUrl) form.append("fileUrl", fileUrl);
+    else if (file) form.append("file", file);
   }
 
   setSending(true);
@@ -262,13 +264,15 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
 
   appendDebug(
     "POST " + API_URL + "\n" +
-    "Bot: " + (tokenObj.label || "Bot") + "\n" +
-    "CSV: " + csv.name + "\n" +
-    "Coluna ID: " + idColumn + "\n" +
-    "Tipo: " + tipo + "\n" +
-    "Botões: " + (buttons.length || 0) + "\n" +
-    "Rate: " + limMax + " a cada " + limMs + "ms\n" +
-    (tipo !== "text" ? (fileUrl ? "URL: " + fileUrl + "\n" : (file ? "Upload: " + file.name + "\n" : "")) : "")
+      "Bot: " + (tokenObj.label || "Bot") + "\n" +
+      "CSV: " + csv.name + "\n" +
+      "Coluna ID: " + idColumn + "\n" +
+      "Tipo: " + tipo + "\n" +
+      "Botões: " + (buttons.length || 0) + "\n" +
+      "Rate: " + limMax + " a cada " + limMs + "ms\n" +
+      (tipo !== "text"
+        ? (fileUrl ? "URL: " + fileUrl + "\n" : (file ? "Upload: " + file.name + "\n" : ""))
+        : "")
   );
 
   try {
@@ -282,13 +286,20 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
 
     setStatus(
       "ok",
-      "Campanha enfileirada. Total: " + (data?.total ?? "?") + (data?.unique ? ` (únicos: ${data.unique})` : "")
+      "Campanha enfileirada. Total: " +
+        (data?.total ?? "?") +
+        (data?.unique ? ` (únicos: ${data.unique})` : "")
     );
 
-    appendDebug("\nResposta:\n" + JSON.stringify(data, null, 2));
+    // se for upload, a API devolve campaignId
+    if (data?.campaignId) {
+      appendDebug("\n\ncampaignId: " + data.campaignId + "\n(arquivo será apagado automaticamente no fim da campanha)");
+    }
+
+    appendDebug("\n\nResposta:\n" + JSON.stringify(data, null, 2));
   } catch (err) {
     setStatus("err", "Erro ao enviar para API: " + (err?.message || String(err)));
-    appendDebug("\nErro:\n" + (err?.message || String(err)));
+    appendDebug("\n\nErro:\n" + (err?.message || String(err)));
   } finally {
     setSending(false);
   }
