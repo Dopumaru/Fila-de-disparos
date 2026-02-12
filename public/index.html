@@ -19,26 +19,22 @@
     .ok { color: #0a7a2f; }
     .err { color: #b00020; }
     .warn { color: #8a5a00; }
-    .box { background: #fafafa; padding: 14px; border-radius: 10px; border: 1px solid #eee; }
     .pill { display:inline-block; padding: 6px 10px; border-radius: 999px; background:#eee; margin-right: 6px; margin-top: 6px; }
     .tokens { display:flex; gap:8px; flex-wrap: wrap; margin-top: 8px; }
     .tokenBtn { border:1px solid #ddd; background:#fff; padding: 8px 10px; border-radius: 10px; cursor:pointer; }
     .tokenBtn.active { border-color: #333; }
     .muted { color:#666; font-size: 12px; }
+    .mediaBox { background:#fafafa; padding:14px; border-radius:10px; border:1px solid #eee; margin-top:10px; }
   </style>
 </head>
 <body>
   <h2>Painel de Disparos</h2>
 
-  <hr style="margin:14px 0;border:none;border-top:1px solid #eee" />
+  <hr>
 
   <label>Token do Bot</label>
-  <div class="row">
-    <div>
-      <input id="tokenInput" placeholder="Cole o BOT TOKEN aqui (não é salvo)" />
-      <div class="hint">Dica: o token começa com números + ':' e depois letras. Nunca compartilhe isso.</div>
-    </div>
-  </div>
+  <input id="tokenInput" placeholder="Cole o BOT TOKEN aqui (não é salvo)" />
+  <div class="hint">Nunca compartilhe seu token.</div>
 
   <div class="row">
     <div><button id="btnAddToken" type="button">Adicionar token</button></div>
@@ -48,7 +44,7 @@
   <div id="tokensArea" class="tokens"></div>
   <div class="muted">Token selecionado é usado no disparo.</div>
 
-  <hr style="margin:14px 0;border:none;border-top:1px solid #eee" />
+  <hr>
 
   <div class="row">
     <div>
@@ -57,107 +53,56 @@
         <option value="text">Texto</option>
         <option value="photo">Foto</option>
         <option value="video">Vídeo</option>
-        <option value="video_note">Vídeo redondo (video_note)</option>
-        <option value="voice">Voz (voice)</option>
+        <option value="video_note">Vídeo redondo</option>
+        <option value="voice">Voz</option>
         <option value="audio">Áudio</option>
         <option value="document">Documento</option>
       </select>
-      <div class="hint">Obs: <b>video_note</b> pode exigir vídeo curto/quadrado (depende do Telegram).</div>
-    </div>
-
-    <div>
-      <label>Arquivo (upload)</label>
-      <input id="arquivo" type="file" />
-      <div class="hint">Use upload para arquivos menores. Para arquivos grandes, prefira URL.</div>
     </div>
   </div>
 
-  <div id="mediaRow">
-    <label>URL do arquivo (opcional)</label>
-    <input id="fileUrl" placeholder="https://... (se preencher, ignora o upload)" />
+  <!-- BLOCO DE MÍDIA -->
+  <div id="mediaBlock" class="mediaBox">
+    <label>Arquivo (Upload)</label>
+    <input id="arquivo" type="file" />
+    <div class="hint">Use upload para arquivos menores.</div>
+
+    <label>OU URL do Arquivo</label>
+    <input id="fileUrl" placeholder="https://..." />
     <div class="hint">
-      Preencha <b>URL</b> OU selecione um <b>arquivo</b> (upload). Se preencher URL, não faz upload e não ocupa disco.
+      ⚠️ Preencha <b>URL</b> OU selecione <b>Upload</b> (não os dois).<br>
+      Se usar URL, não ocupa espaço no servidor.
     </div>
   </div>
 
-  <label>Mensagem (texto / legenda) — suporta variáveis do CSV</label>
-  <textarea id="mensagem" rows="4" placeholder="Ex: Olá {nome}, vi sua cidade {cidade}!"></textarea>
-  <div class="hint">
-    Placeholders: <b>{nome}</b>, <b>{cidade}</b>, <b>{produto}</b>... (nomes das colunas do CSV)
-  </div>
+  <label>Mensagem / Legenda (suporta {variáveis})</label>
+  <textarea id="mensagem" placeholder="Ex: Olá {nome}, vi sua cidade {cidade}!"></textarea>
 
-  <hr style="margin:14px 0;border:none;border-top:1px solid #eee" />
+  <hr>
 
   <label>CSV de leads (obrigatório)</label>
   <div class="row">
     <div>
       <input id="csvFile" type="file" accept=".csv,text/csv" />
-      <div class="hint">A API usa 1 linha = 1 lead e aplica {variáveis} no template acima.</div>
     </div>
     <div style="max-width:220px;">
       <label>Coluna do ID</label>
-      <input id="idColumn" placeholder="chatId" value="chatId" />
-      <div class="hint">Ex: chatId | id | chat_id</div>
+      <input id="idColumn" value="chatId" />
     </div>
   </div>
 
   <div class="row">
     <div>
-      <label>Limite (mensagens por intervalo)</label>
+      <label>Limite por intervalo</label>
       <input id="limitMax" type="number" value="1" min="1" />
-      <div class="hint">Sugestão segura: 1 msg por vez.</div>
     </div>
     <div>
       <label>Intervalo (ms)</label>
       <input id="limitMs" type="number" value="1100" min="200" />
-      <div class="hint">Sugestão: 1100ms (≈ 1 msg/seg).</div>
     </div>
   </div>
 
-  <div class="hint warn">
-    ⚠️ Aviso: Disparo rápido demais pode gerar erro 429 (Too Many Requests).<br/>
-    O limite acima será aplicado por token no worker.
-  </div>
-
-  <hr style="margin:14px 0;border:none;border-top:1px solid #eee" />
-
-  <label>Botões (opcional — até 4)</label>
-  <div class="hint">
-    Tipo <b>URL</b>: abre um site/WhatsApp/etc.<br/>
-    Tipo <b>START</b>: envia um callback <b>start:PARAM</b> (seu bot pode tratar isso).
-  </div>
-
-  <div class="row">
-    <div><label>Botão 1 - Texto</label><input id="b1Text" placeholder="Ex: Ver oferta" /></div>
-    <div style="max-width: 180px;"><label>Tipo</label>
-      <select id="b1Type"><option value="none">Nenhum</option><option value="url">URL</option><option value="start">START</option></select>
-    </div>
-    <div><label>Destino (URL ou PARAM)</label><input id="b1Value" placeholder="URL: https://... | START: quero_orcamento" /></div>
-  </div>
-
-  <div class="row">
-    <div><label>Botão 2 - Texto</label><input id="b2Text" placeholder="Ex: Falar no Telegram" /></div>
-    <div style="max-width: 180px;"><label>Tipo</label>
-      <select id="b2Type"><option value="none">Nenhum</option><option value="url">URL</option><option value="start">START</option></select>
-    </div>
-    <div><label>Destino (URL ou PARAM)</label><input id="b2Value" placeholder="URL: https://... | START: quero_falar" /></div>
-  </div>
-
-  <div class="row">
-    <div><label>Botão 3 - Texto</label><input id="b3Text" placeholder="Ex: Instagram" /></div>
-    <div style="max-width: 180px;"><label>Tipo</label>
-      <select id="b3Type"><option value="none">Nenhum</option><option value="url">URL</option><option value="start">START</option></select>
-    </div>
-    <div><label>Destino (URL ou PARAM)</label><input id="b3Value" placeholder="URL: https://... | START: insta" /></div>
-  </div>
-
-  <div class="row">
-    <div><label>Botão 4 - Texto</label><input id="b4Text" placeholder="Ex: Suporte" /></div>
-    <div style="max-width: 180px;"><label>Tipo</label>
-      <select id="b4Type"><option value="none">Nenhum</option><option value="url">URL</option><option value="start">START</option></select>
-    </div>
-    <div><label>Destino (URL ou PARAM)</label><input id="b4Value" placeholder="URL: https://... | START: suporte" /></div>
-  </div>
+  <hr>
 
   <button id="btnEnviar" type="button">Enviar campanha</button>
 
@@ -165,13 +110,13 @@
   <pre id="debug"></pre>
 
   <script>
-    // UI: esconder/mostrar mídia quando for texto
     const tipo = document.getElementById("tipo");
-    const mediaRow = document.getElementById("mediaRow");
+    const mediaBlock = document.getElementById("mediaBlock");
 
     function refreshUI() {
-      mediaRow.style.display = (tipo.value === "text") ? "none" : "";
+      mediaBlock.style.display = (tipo.value === "text") ? "none" : "block";
     }
+
     tipo.addEventListener("change", refreshUI);
     refreshUI();
   </script>
