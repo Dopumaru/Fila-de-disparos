@@ -132,7 +132,6 @@ function validateCsvFile(csv) {
   if (!csv) return "Envie um CSV de leads.";
   const name = (csv.name || "").toLowerCase();
   if (!name.endsWith(".csv")) return "O arquivo de leads precisa ser .csv";
-  // limite simples (ex: 10MB)
   if (csv.size > 10 * 1024 * 1024) return "CSV muito grande (máx 10MB).";
   return null;
 }
@@ -164,7 +163,6 @@ document.getElementById("btnAddToken").addEventListener("click", async () => {
     label = await fetchBotLabel(token);
     setStatus("ok", "Bot conectado: " + label);
   } catch {
-    // não bloqueia o uso — em rede restrita isso acontece
     setStatus("warn", "Token adicionado, mas não consegui buscar o nome do bot (rede/Telegram bloqueado).");
   }
 
@@ -196,7 +194,12 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
   const limMax = Number(document.getElementById("limitMax").value || 1);
   const limMs = Number(document.getElementById("limitMs").value || 1100);
 
-  const file = document.getElementById("arquivo").files[0] || null;
+  // ⚠️ upload está desativado no seu novo index, mas deixo compatível:
+  const file = document.getElementById("arquivo")?.files?.[0] || null;
+
+  // ✅ file_id (novo)
+  const fileId = (document.getElementById("fileId")?.value || "").trim();
+
   const csv = getCsvFile();
   const idColumn = getIdColumn();
 
@@ -215,8 +218,9 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
     return setStatus("err", "Mensagem obrigatória para texto.");
   }
 
-  if (tipo !== "text" && !file) {
-    return setStatus("err", "Selecione um arquivo (mídia/documento).");
+  // ✅ aqui muda: para mídia, aceita file_id (ou upload se você reativar depois)
+  if (tipo !== "text" && !fileId && !file) {
+    return setStatus("err", "Para mídia/documento, cole o file_id (ou selecione arquivo se o upload estiver ativo).");
   }
 
   if (!(limMax >= 1) || !(limMs >= 200)) {
@@ -236,6 +240,14 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
   form.append("limitMax", String(limMax));
   form.append("limitMs", String(limMs));
   form.append("buttons", JSON.stringify(buttons));
+
+  // ✅ NOVO: manda file_id (string) quando não for texto
+  // backend pode ler req.body.fileId (ou tratar como "file")
+  if (tipo !== "text") {
+    form.append("fileId", fileId || "");
+  }
+
+  // compat: se upload voltar no futuro
   if (file) form.append("file", file);
 
   setSending(true);
@@ -249,6 +261,7 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
     "Tipo: " + tipo + "\n" +
     "Botões: " + (buttons.length || 0) + "\n" +
     "Rate: " + limMax + " a cada " + limMs + "ms\n" +
+    (fileId ? "file_id: " + fileId.slice(0, 8) + "..." + fileId.slice(-8) + "\n" : "") +
     (file ? "Arquivo: " + file.name + "\n" : "")
   );
 
@@ -257,21 +270,16 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
     const data = await res.json().catch(() => null);
 
     if (!res.ok) {
-      // tenta mostrar erro “limpo”
       const apiMsg = data?.error || data?.message || (data ? JSON.stringify(data) : "");
       throw new Error(`HTTP ${res.status}${apiMsg ? " - " + apiMsg : ""}`);
     }
 
-    // IMPORTANTE: aqui a API só confirmou “enfileirado”
     setStatus(
       "ok",
       "Campanha enfileirada. Total: " + (data?.total ?? "?") + (data?.unique ? ` (únicos: ${data.unique})` : "")
     );
 
     appendDebug("\nResposta:\n" + JSON.stringify(data, null, 2));
-
-    // Se quiser “progresso real” (enviando X/Y), isso é outra feature:
-    // precisa endpoint de status + worker atualizando contadores.
   } catch (err) {
     setStatus("err", "Erro ao enviar para API: " + (err?.message || String(err)));
     appendDebug("\nErro:\n" + (err?.message || String(err)));
@@ -281,3 +289,4 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
 });
 
 renderTokens();
+
