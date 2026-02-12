@@ -36,7 +36,7 @@ function resolveTelegramInput(file) {
 
   if (/^https?:\/\//i.test(file)) return file; // URL
   if (fs.existsSync(file)) return fs.createReadStream(file); // path local
-  return file; // file_id
+  return file; // file_id (não recomendado, mas fica compatível)
 }
 
 function safeUnlink(p) {
@@ -47,12 +47,48 @@ function safeUnlink(p) {
   }
 }
 
+/**
+ * CAMPANHA (cleanup automático)
+ * - API cria: campaign:<id> com { filePath, pending }
+ * - Cada job carrega payload.campaignId
+ * - Worker decrementa pending quando job "finaliza":
+ *   - sucesso => decrementa
+ *   - falha final => decrementa
+ *   - falha com retry => NÃO decrementa
+ * - Quando pending chega em 0, apaga filePath e del key
+ */
+async function finalizeCampaignIfDone(campaignId) {
+  if (!campaignId) return;
+
+  const key = `campaign:${campaignId}`;
+
+  // decrementa pending de forma atômica
+  let newPending;
+  try {
+    newPending = await connection.hincrby(key, "pending", -1);
+  } catch {
+    return;
+  }
+
+  // se já não existe ou ficou >0, ainda tem jobs
+  if (typeof newPending !== "number" || newPending > 0) return;
+
+  // chegou em 0 (ou negativo por algum bug) => limpa
+  try {
+    const filePath = await connection.hget(key, "filePath");
+    if (filePath) safeUnlink(filePath);
+    await connection.del(key);
+    console.log("🧹 Campanha finalizada, arquivo apagado:", campaignId);
+  } catch {
+    // best-effort
+  }
+}
+
 // rate limit por token (sliding window)
 const tokenWindows = new Map(); // token -> [timestamps]
 async function waitForRateLimit(token, max, ms) {
   const key = token || DEFAULT_TOKEN || "no-token";
 
-  // sanitiza valores
   const safeMax = Math.max(1, Number(max) || 1);
   const safeMs = Math.max(200, Number(ms) || 1100);
 
@@ -76,13 +112,18 @@ async function waitForRateLimit(token, max, ms) {
 const worker = new Worker(
   "disparos",
   async (job) => {
+    // esse delete é apenas para "tempFile por job"
     let tempPathToDelete = null;
+
+    // pega campaignId se existir
+    const campaignId = job?.data?.payload?.campaignId || null;
 
     try {
       console.log("Recebi job:", job.id, {
         chatId: job.data?.chatId,
         type: job.data?.type,
         token: maskToken(job.data?.botToken),
+        campaignId: campaignId || undefined,
       });
 
       const { chatId } = job.data || {};
@@ -98,15 +139,22 @@ const worker = new Worker(
       if (job.data?.mensagem && !job.data?.type) {
         await bot.sendMessage(chatId, job.data.mensagem);
         console.log("✅ Enviado (texto legado)!");
+        // finaliza campanha se existir (legado não usa, mas ok)
+        if (campaignId) await finalizeCampaignIfDone(campaignId);
         return;
       }
 
       const { type, payload } = job.data || {};
       if (!type) throw new Error("type ausente no job");
 
-      // helper: só marca pra apagar se for arquivo local existente
+      // helper: só marca pra apagar se for arquivo local existente E tempFile=true E NÃO for campanha
       const markTempIfLocal = () => {
-        if (payload?.tempFile && typeof payload?.file === "string" && fs.existsSync(payload.file)) {
+        if (
+          payload?.tempFile &&
+          !payload?.campaignId && // campanha controla cleanup, então não apaga por job
+          typeof payload?.file === "string" &&
+          fs.existsSync(payload.file)
+        ) {
           tempPathToDelete = payload.file;
         }
       };
@@ -167,11 +215,27 @@ const worker = new Worker(
 
       console.log("✅ Enviado!");
 
-      // limpa arquivo temp (upload)
+      // se for campanha, decrementa e talvez apaga no final
+      if (campaignId) {
+        await finalizeCampaignIfDone(campaignId);
+      }
+
+      // limpa arquivo temp (apenas no modo tempFile por job)
       if (tempPathToDelete) safeUnlink(tempPathToDelete);
     } catch (err) {
       console.error("❌ Telegram erro:", err.message);
       if (err.response?.body) console.error("Detalhe:", err.response.body);
+
+      // Se falhou mas vai ter retry, NÃO finaliza campanha ainda.
+      // Só finaliza na falha FINAL (última tentativa).
+      const attempts = job?.opts?.attempts ?? 1;
+      const attemptsMade = job?.attemptsMade ?? 0;
+
+      const isFinalFailure = attemptsMade >= attempts;
+
+      if (isFinalFailure && campaignId) {
+        await finalizeCampaignIfDone(campaignId);
+      }
 
       if (tempPathToDelete) safeUnlink(tempPathToDelete);
       throw err;
