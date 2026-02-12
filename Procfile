@@ -1,2 +1,2 @@
-worker: npm run start:worker
-producer: npm run start:producer
+worker: npm run start
+api: npm run start:api
