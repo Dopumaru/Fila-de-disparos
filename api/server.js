@@ -11,10 +11,7 @@ const connection = require("../redis");
 const app = express();
 
 // ===== FRONT (public) =====
-// Serve /public (index.html, app.js, etc.)
 app.use(express.static(path.join(__dirname, "..", "public")));
-
-// CORS (ok manter; se quiser travar depois, dá pra limitar origem)
 app.use(cors());
 
 // Health
@@ -62,7 +59,7 @@ function parseCsvRows(text) {
 
   const lines = src
     .split("\n")
-    .map((l) => l.replace(/\uFEFF/g, "")) // remove BOM
+    .map((l) => l.replace(/\uFEFF/g, ""))
     .filter((l) => l.trim().length > 0);
 
   const rows = [];
@@ -139,7 +136,6 @@ function applyTemplate(template, rowObj) {
 
 // ===== Botões =====
 async function getBotUsername(botToken) {
-  // Node 18+ tem fetch global
   const r = await fetch(`https://api.telegram.org/bot${botToken}/getMe`);
   const data = await r.json().catch(() => null);
 
@@ -184,7 +180,7 @@ function buildOptionsFromButtons(buttons, botUsername) {
 }
 
 // ===== ROUTE =====
-// aceita: file (mídia) e csv (leads) — CSV OBRIGATÓRIO
+// aceita: csv (obrigatório) e (file upload OU fileId string)
 app.post(
   "/disparar",
   upload.fields([
@@ -193,6 +189,7 @@ app.post(
   ]),
   async (req, res) => {
     let csvPathToDelete = null;
+    let uploadFilePathToDelete = null;
 
     try {
       const botToken = (req.body.botToken || "").trim();
@@ -200,6 +197,9 @@ app.post(
       const captionTemplate = req.body.caption ?? "";
       const limitMax = Number(req.body.limitMax || 1);
       const limitMs = Number(req.body.limitMs || 1100);
+
+      // ✅ NOVO: fileId vindo do front (string)
+      const fileId = (req.body.fileId || "").trim();
 
       const idColumnRaw = (req.body.idColumn || "chatId").trim();
       const idColumn = normalizeKey(idColumnRaw) || "chatid";
@@ -232,8 +232,12 @@ app.post(
       }
       csvPathToDelete = csvFile.path;
 
-      if (type !== "text" && !mediaFile) {
-        return res.status(400).json({ ok: false, error: "Para mídia/documento, envie o arquivo no campo file." });
+      // ✅ Aqui muda: para mídia, aceita upload OU fileId
+      if (type !== "text" && !mediaFile && !fileId) {
+        return res.status(400).json({
+          ok: false,
+          error: "Para mídia/documento, envie o arquivo no campo file OU cole o file_id no campo fileId.",
+        });
       }
 
       if (!Array.isArray(buttons)) buttons = [];
@@ -249,7 +253,15 @@ app.post(
       }
 
       const options = buildOptionsFromButtons(buttons, botUsername);
-      const mediaPath = mediaFile?.path || null;
+
+      // ✅ fonte da mídia: fileId (preferência) ou path de upload
+      const mediaSource = fileId ? fileId : (mediaFile?.path || null);
+
+      // se for upload, marca pra apagar depois (worker vai apagar se tempFile=true,
+      // mas aqui é API, então vamos deixar o worker apagar e não apagar aqui)
+      if (!fileId && mediaFile?.path) {
+        uploadFilePathToDelete = null; // quem apaga é o worker (tempFile: true)
+      }
 
       // ===== LEADS via CSV =====
       const csvText = fs.readFileSync(csvFile.path, "utf8");
@@ -308,10 +320,12 @@ app.post(
                 limit: { max: limitMax, ms: limitMs },
                 type,
                 payload: {
-                  file: mediaPath,
+                  // ✅ agora pode ser file_id OU path
+                  file: mediaSource,
                   caption: finalCaption || "",
                   options,
-                  tempFile: false,
+                  // ✅ se veio de upload, worker apaga depois
+                  tempFile: !fileId,
                 },
               };
 
@@ -320,7 +334,7 @@ app.post(
       }
 
       console.log(
-        `✅ Enfileirado: total=${total} type=${type} source=csv buttons=${buttons.length} token=${maskToken(botToken)}`
+        `✅ Enfileirado: total=${total} type=${type} source=csv buttons=${buttons.length} token=${maskToken(botToken)} fileSrc=${fileId ? "file_id" : "upload"}`
       );
 
       // apaga CSV upload (não precisa guardar)
@@ -335,6 +349,7 @@ app.post(
         source: "csv",
         idColumn: idColumnRaw,
         unique: leads.length,
+        media: type === "text" ? null : (fileId ? "file_id" : "upload"),
       });
     } catch (err) {
       console.error("❌ /disparar erro:", err.message);
@@ -343,6 +358,8 @@ app.post(
         if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
       } catch {}
 
+      // se em algum ponto você decidir apagar upload aqui, use uploadFilePathToDelete
+      // (mas hoje quem apaga é o worker)
       return res.status(500).json({ ok: false, error: "Erro interno" });
     }
   }
@@ -353,4 +370,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("✅ API rodando na porta", PORT);
 });
-
