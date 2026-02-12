@@ -311,7 +311,7 @@ app.post(
                   file: mediaPath,
                   caption: finalCaption || "",
                   options,
-                  tempFile: true,
+                  tempFile: false,
                 },
               };
 
