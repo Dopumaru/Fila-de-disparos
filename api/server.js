@@ -218,7 +218,7 @@ function buildOptionsFromButtons(buttons, botUsername) {
 
 // ✅ opcional: limpeza automática depois de X minutos (evita encher disco)
 function scheduleDelete(filePath) {
-  const minutes = Number(process.env.UPLOAD_TTL_MINUTES || 30);
+  const minutes = Number(process.env.UPLOAD_TTL_MINUTES || 180);
   if (!minutes || minutes <= 0) return; // desliga se 0
   setTimeout(() => {
     try {
