@@ -11,13 +11,12 @@ if (!DEFAULT_TOKEN) {
   console.warn("⚠️ TELEGRAM_BOT_TOKEN não definido (ok se você sempre mandar botToken no job).");
 }
 
-// cache de bots por token (em memória)
+// cache de bots por token
 const botCache = new Map();
 function getBot(token) {
   const t = token || DEFAULT_TOKEN;
   if (!t) throw new Error("Nenhum token disponível (botToken do job ou TELEGRAM_BOT_TOKEN no .env)");
   if (botCache.has(t)) return botCache.get(t);
-
   const bot = new TelegramBot(t, { polling: false });
   botCache.set(t, bot);
   return bot;
@@ -30,92 +29,48 @@ function maskToken(t) {
   return s.slice(0, 4) + "..." + s.slice(-4);
 }
 
-function isHttpUrl(u) {
+function isUrl(u) {
   return /^https?:\/\//i.test(String(u || "").trim());
 }
 
-/**
- * ✅ Se vier URL: o worker baixa e manda BUFFER (Telegram aceita).
- * ✅ Se vier path local: manda stream
- * ✅ Senão: assume file_id
- */
+// ✅ Se for URL interna, o worker baixa e manda como upload
+async function urlToBuffer(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`Falha ao baixar URL (${r.status})`);
+  const arr = await r.arrayBuffer();
+  const buf = Buffer.from(arr);
+  const contentType = r.headers.get("content-type") || "";
+  return { buf, contentType };
+}
+
+function resolveFileNameFromUrl(url) {
+  try {
+    const u = new URL(url);
+    const last = decodeURIComponent(u.pathname.split("/").pop() || "file");
+    return last || "file";
+  } catch {
+    return "file";
+  }
+}
+
 async function resolveTelegramInput(file) {
   if (!file) throw new Error("payload.file não foi enviado");
   if (typeof file !== "string") throw new Error("payload.file deve ser string");
 
-  // URL -> baixa no worker (assim Telegram NÃO precisa acessar sua URL)
-  if (isHttpUrl(file)) {
-    let res;
-    try {
-      res = await fetch(file, { redirect: "follow" });
-    } catch (e) {
-      throw new Error(`Falha ao fazer fetch da URL: ${file} (${e.message})`);
-    }
-
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new Error(`Falha ao baixar arquivo (${res.status}) da URL: ${file} ${txt ? "- " + txt.slice(0, 120) : ""}`);
-    }
-
-    const buf = Buffer.from(await res.arrayBuffer());
-
-    // proteção básica (evitar explodir memória com arquivos gigantes)
-    const maxMb = Number(process.env.MAX_DOWNLOAD_MB || 25);
-    const maxBytes = maxMb * 1024 * 1024;
-    if (buf.length > maxBytes) {
-      throw new Error(`Arquivo muito grande para baixar no worker (${(buf.length / 1024 / 1024).toFixed(1)}MB). Aumente MAX_DOWNLOAD_MB ou use outro fluxo.`);
-    }
-
-    return buf;
+  // URL: baixa e manda como arquivo (evita Telegram tentar acessar host interno)
+  if (isUrl(file)) {
+    const { buf } = await urlToBuffer(file);
+    return { source: buf, filename: resolveFileNameFromUrl(file) };
   }
 
   // path local (se existir no container do worker)
   if (fs.existsSync(file)) return fs.createReadStream(file);
 
-  // se não é URL nem path local, assume file_id do Telegram
+  // senão, assume file_id do Telegram
   return file;
 }
 
-/**
- * Cleanup de campanha (controlado no Redis)
- */
-async function finalizeCampaignIfDone(campaignId) {
-  if (!campaignId) return;
-
-  const key = `campaign:${campaignId}`;
-
-  let newPending;
-  try {
-    newPending = await connection.hincrby(key, "pending", -1);
-  } catch {
-    return;
-  }
-
-  if (typeof newPending !== "number" || newPending > 0) return;
-
-  const lockKey = `campaign:${campaignId}:cleanup`;
-  try {
-    const locked = await connection.set(lockKey, "1", "NX", "EX", 300);
-    if (!locked) return;
-  } catch {
-    return;
-  }
-
-  try {
-    const filePath = await connection.hget(key, "filePath");
-    if (filePath && fs.existsSync(filePath)) {
-      try { fs.unlinkSync(filePath); } catch {}
-    }
-
-    await connection.del(key);
-    await connection.del(lockKey);
-    console.log("🧹 Campanha finalizada (redis limpo):", campaignId);
-  } catch {
-    // best-effort
-  }
-}
-
-// rate limit por token (sliding window em memória)
+// rate limit por token
 const tokenWindows = new Map();
 async function waitForRateLimit(token, max, ms) {
   const key = token || DEFAULT_TOKEN || "no-token";
@@ -142,14 +97,11 @@ async function waitForRateLimit(token, max, ms) {
 const worker = new Worker(
   "disparos",
   async (job) => {
-    const campaignId = job?.data?.payload?.campaignId || null;
-
     try {
       console.log("Recebi job:", job.id, {
         chatId: job.data?.chatId,
         type: job.data?.type,
         token: maskToken(job.data?.botToken),
-        campaignId: campaignId || undefined,
       });
 
       const { chatId } = job.data || {};
@@ -164,7 +116,6 @@ const worker = new Worker(
       if (job.data?.mensagem && !job.data?.type) {
         await bot.sendMessage(chatId, job.data.mensagem);
         console.log("✅ Enviado (texto legado)!");
-        if (campaignId) await finalizeCampaignIfDone(campaignId);
         return;
       }
 
@@ -220,18 +171,9 @@ const worker = new Worker(
       }
 
       console.log("✅ Enviado!");
-
-      if (campaignId) await finalizeCampaignIfDone(campaignId);
     } catch (err) {
       console.error("❌ Telegram erro:", err.message);
       if (err.response?.body) console.error("Detalhe:", err.response.body);
-
-      const attempts = job?.opts?.attempts ?? 1;
-      const attemptsMade = job?.attemptsMade ?? 0;
-      const isFinalFailure = attemptsMade >= (attempts - 1);
-
-      if (isFinalFailure && campaignId) await finalizeCampaignIfDone(campaignId);
-
       throw err;
     }
   },
