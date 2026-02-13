@@ -10,6 +10,7 @@ const connection = require("../redis");
 
 const app = express();
 app.use(cors());
+app.set("trust proxy", 1);
 
 // ===== FRONT (public) =====
 app.use(express.static(path.join(__dirname, "..", "public")));
@@ -43,24 +44,37 @@ const UPLOAD_DIR =
   ensureDirWritable("/tmp/uploads");
 
 if (!UPLOAD_DIR) {
-  throw new Error("Nenhum diretório de upload gravável. Configure UPLOAD_DIR para um caminho com permissão.");
+  throw new Error(
+    "Nenhum diretório de upload gravável. Configure UPLOAD_DIR para um caminho com permissão."
+  );
 }
 
 console.log("📁 Upload dir:", UPLOAD_DIR);
 
-// ✅ Servir uploads por HTTP (para o worker pegar por URL e não por path)
-app.use("/uploads", express.static(UPLOAD_DIR));
+// ✅ Servir uploads por HTTP (worker pega por URL)
+app.use("/uploads", express.static(UPLOAD_DIR, {
+  fallthrough: false,
+  maxAge: "1h",
+}));
 
-// ✅ multer em disco + mantém extensão
+// ✅ multer em disco + mantém extensão + limites
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname || "");
-    const name = Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8) + ext;
+    const name =
+      Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8) + ext;
     cb(null, name);
   },
 });
-const upload = multer({ storage });
+
+const upload = multer({
+  storage,
+  limits: {
+    // ajuste se quiser (em bytes)
+    fileSize: Number(process.env.UPLOAD_MAX_BYTES || 50 * 1024 * 1024), // 50MB default
+  },
+});
 
 const queue = new Queue("disparos", { connection });
 
@@ -167,9 +181,8 @@ function buildRowObjectsFromCsv(text) {
 async function getBotUsername(botToken) {
   const r = await fetch(`https://api.telegram.org/bot${botToken}/getMe`);
   const data = await r.json().catch(() => null);
-
   if (!data || !data.ok || !data.result) throw new Error("Token inválido (getMe)");
-  return data.result.username; // sem "@"
+  return data.result.username;
 }
 
 function buildOptionsFromButtons(buttons, botUsername) {
@@ -201,6 +214,17 @@ function buildOptionsFromButtons(buttons, botUsername) {
 
   if (!inline_keyboard.length) return undefined;
   return { reply_markup: { inline_keyboard } };
+}
+
+// ✅ opcional: limpeza automática depois de X minutos (evita encher disco)
+function scheduleDelete(filePath) {
+  const minutes = Number(process.env.UPLOAD_TTL_MINUTES || 30);
+  if (!minutes || minutes <= 0) return; // desliga se 0
+  setTimeout(() => {
+    try {
+      if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    } catch {}
+  }, minutes * 60 * 1000);
 }
 
 // ===== ROUTE =====
@@ -270,9 +294,8 @@ app.post(
 
       // ✅ Fonte da mídia:
       // - se veio fileUrl, usa ela
-      // - se veio upload, transforma em URL /uploads/arquivo.ext (worker consegue baixar)
+      // - se veio upload, transforma em URL /uploads/arquivo.ext (worker baixa por URL)
       const isUpload = !!mediaFile && !fileUrl;
-
       let mediaSource = fileUrl || null;
 
       if (type !== "text" && isUpload) {
@@ -280,6 +303,9 @@ app.post(
         const internalHost = (process.env.API_INTERNAL_HOST || "api-disparos").trim();
         const filename = path.basename(mediaFile.path);
         mediaSource = `http://${internalHost}:${PORT}/uploads/${encodeURIComponent(filename)}`;
+
+        // opcional: limpar arquivo depois de um tempo (evita lotar disco)
+        scheduleDelete(mediaFile.path);
       }
 
       // ===== LEADS via CSV =====
@@ -309,9 +335,6 @@ app.post(
       const seen = new Set();
       leads = leads.filter((l) => (seen.has(l.chatId) ? false : (seen.add(l.chatId), true)));
 
-      // ✅ NÃO USAMOS MAIS campaignId (worker não apaga arquivo)
-      // Se você quiser cleanup automático depois, a gente adiciona na API depois.
-
       let total = 0;
       for (const lead of leads) {
         const finalCaption = applyTemplate(captionTemplate, lead.vars);
@@ -331,11 +354,9 @@ app.post(
                 limit: { max: limitMax, ms: limitMs },
                 type,
                 payload: {
-                  file: mediaSource, // ✅ sempre URL aqui (ou fileUrl)
+                  file: mediaSource, // ✅ URL
                   caption: finalCaption || "",
                   options,
-                  campaignId: null,
-                  tempFile: false,
                 },
               };
 
@@ -344,9 +365,7 @@ app.post(
       }
 
       // apaga CSV upload
-      try {
-        if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
-      } catch {}
+      try { if (csvPathToDelete) fs.unlinkSync(csvPathToDelete); } catch {}
 
       return res.json({
         ok: true,
@@ -360,9 +379,7 @@ app.post(
       });
     } catch (err) {
       console.error("❌ /disparar erro:", err.message);
-      try {
-        if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
-      } catch {}
+      try { if (csvPathToDelete) fs.unlinkSync(csvPathToDelete); } catch {}
       return res.status(500).json({ ok: false, error: "Erro interno" });
     }
   }
