@@ -4,6 +4,9 @@ const { Worker } = require("bullmq");
 const TelegramBot = require("node-telegram-bot-api");
 const connection = require("./redis");
 const fs = require("fs");
+const path = require("path");
+const { pipeline } = require("stream/promises");
+const { Readable } = require("stream");
 
 const DEFAULT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
@@ -15,7 +18,7 @@ if (!DEFAULT_TOKEN) {
 const botCache = new Map();
 function getBot(token) {
   const t = token || DEFAULT_TOKEN;
-  if (!t) throw new Error("Nenhum token disponível (botToken do job ou TELEGRAM_BOT_TOKEN no .env)");
+  if (!t) throw new Error("Nenhum token disponível (botToken do job ou TELEGRAM_BOT_TOKEN no env)");
   if (botCache.has(t)) return botCache.get(t);
   const bot = new TelegramBot(t, { polling: false });
   botCache.set(t, bot);
@@ -29,45 +32,63 @@ function maskToken(t) {
   return s.slice(0, 4) + "..." + s.slice(-4);
 }
 
-function isUrl(u) {
+function isHttpUrl(u) {
   return /^https?:\/\//i.test(String(u || "").trim());
 }
 
-// ✅ Se for URL interna, o worker baixa e manda como upload
-async function urlToBuffer(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`Falha ao baixar URL (${r.status})`);
-  const arr = await r.arrayBuffer();
-  const buf = Buffer.from(arr);
-  const contentType = r.headers.get("content-type") || "";
-  return { buf, contentType };
+function safeUnlink(p) {
+  try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch {}
 }
 
-function resolveFileNameFromUrl(url) {
-  try {
-    const u = new URL(url);
-    const last = decodeURIComponent(u.pathname.split("/").pop() || "file");
-    return last || "file";
-  } catch {
-    return "file";
-  }
+// baixa URL (inclusive interna do docker) -> salva em /tmp -> retorna caminho
+async function downloadUrlToTmp(url) {
+  const u = String(url || "").trim();
+  const urlObj = new URL(u);
+
+  // tenta manter extensão
+  let ext = path.extname(urlObj.pathname || "");
+  if (!ext) ext = ".bin";
+
+  const tmpPath = path.join(
+    "/tmp",
+    `tg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}${ext}`
+  );
+
+  const r = await fetch(u);
+  if (!r.ok) throw new Error(`Falha ao baixar arquivo (${r.status})`);
+
+  // stream web -> node
+  const body = r.body;
+  if (!body) throw new Error("Resposta sem body ao baixar arquivo");
+
+  const nodeStream = Readable.fromWeb(body);
+  await pipeline(nodeStream, fs.createWriteStream(tmpPath));
+  return tmpPath;
 }
 
+/**
+ * Resolve input do Telegram:
+ * - URL: baixa pra /tmp e manda como ReadStream (garante funcionar com url interna)
+ * - path local existente: ReadStream
+ * - senão: assume file_id do Telegram
+ */
 async function resolveTelegramInput(file) {
   if (!file) throw new Error("payload.file não foi enviado");
   if (typeof file !== "string") throw new Error("payload.file deve ser string");
 
-  // URL: baixa e manda como arquivo (evita Telegram tentar acessar host interno)
-  if (isUrl(file)) {
-    const { buf } = await urlToBuffer(file);
-    return { source: buf, filename: resolveFileNameFromUrl(file) };
+  // URL -> baixar e virar stream
+  if (isHttpUrl(file)) {
+    const tmpPath = await downloadUrlToTmp(file);
+    return { input: fs.createReadStream(tmpPath), cleanupPath: tmpPath };
   }
 
-  // path local (se existir no container do worker)
-  if (fs.existsSync(file)) return fs.createReadStream(file);
+  // path local -> stream
+  if (fs.existsSync(file)) {
+    return { input: fs.createReadStream(file), cleanupPath: null };
+  }
 
-  // senão, assume file_id do Telegram
-  return file;
+  // file_id do Telegram
+  return { input: file, cleanupPath: null };
 }
 
 // rate limit por token
@@ -97,6 +118,8 @@ async function waitForRateLimit(token, max, ms) {
 const worker = new Worker(
   "disparos",
   async (job) => {
+    let tmpToCleanup = null;
+
     try {
       console.log("Recebi job:", job.id, {
         chatId: job.data?.chatId,
@@ -131,37 +154,43 @@ const worker = new Worker(
         }
 
         case "audio": {
-          const input = await resolveTelegramInput(payload?.file);
+          const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
+          tmpToCleanup = cleanupPath;
           await bot.sendAudio(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
           break;
         }
 
         case "video": {
-          const input = await resolveTelegramInput(payload?.file);
+          const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
+          tmpToCleanup = cleanupPath;
           await bot.sendVideo(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
           break;
         }
 
         case "voice": {
-          const input = await resolveTelegramInput(payload?.file);
+          const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
+          tmpToCleanup = cleanupPath;
           await bot.sendVoice(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
           break;
         }
 
         case "video_note": {
-          const input = await resolveTelegramInput(payload?.file);
+          const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
+          tmpToCleanup = cleanupPath;
           await bot.sendVideoNote(chatId, input, { ...(payload?.options || {}) });
           break;
         }
 
         case "photo": {
-          const input = await resolveTelegramInput(payload?.file);
+          const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
+          tmpToCleanup = cleanupPath;
           await bot.sendPhoto(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
           break;
         }
 
         case "document": {
-          const input = await resolveTelegramInput(payload?.file);
+          const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
+          tmpToCleanup = cleanupPath;
           await bot.sendDocument(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
           break;
         }
@@ -175,6 +204,9 @@ const worker = new Worker(
       console.error("❌ Telegram erro:", err.message);
       if (err.response?.body) console.error("Detalhe:", err.response.body);
       throw err;
+    } finally {
+      // limpa o arquivo temp baixado pelo worker
+      if (tmpToCleanup) safeUnlink(tmpToCleanup);
     }
   },
   { connection }
