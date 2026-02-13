@@ -30,18 +30,46 @@ function maskToken(t) {
   return s.slice(0, 4) + "..." + s.slice(-4);
 }
 
-// ✅ Worker NÃO usa /app/uploads. Ele aceita:
-// - URL http/https (recomendado)
-// - path local (se existir no worker)
-// - file_id (Telegram)
-function resolveTelegramInput(file) {
+function isHttpUrl(u) {
+  return /^https?:\/\//i.test(String(u || "").trim());
+}
+
+/**
+ * ✅ Se vier URL: o worker baixa e manda BUFFER (Telegram aceita).
+ * ✅ Se vier path local: manda stream
+ * ✅ Senão: assume file_id
+ */
+async function resolveTelegramInput(file) {
   if (!file) throw new Error("payload.file não foi enviado");
   if (typeof file !== "string") throw new Error("payload.file deve ser string");
 
-  // URL (fluxo correto em VPS)
-  if (/^https?:\/\//i.test(file)) return file;
+  // URL -> baixa no worker (assim Telegram NÃO precisa acessar sua URL)
+  if (isHttpUrl(file)) {
+    let res;
+    try {
+      res = await fetch(file, { redirect: "follow" });
+    } catch (e) {
+      throw new Error(`Falha ao fazer fetch da URL: ${file} (${e.message})`);
+    }
 
-  // path local (só se realmente existir no container do worker)
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`Falha ao baixar arquivo (${res.status}) da URL: ${file} ${txt ? "- " + txt.slice(0, 120) : ""}`);
+    }
+
+    const buf = Buffer.from(await res.arrayBuffer());
+
+    // proteção básica (evitar explodir memória com arquivos gigantes)
+    const maxMb = Number(process.env.MAX_DOWNLOAD_MB || 25);
+    const maxBytes = maxMb * 1024 * 1024;
+    if (buf.length > maxBytes) {
+      throw new Error(`Arquivo muito grande para baixar no worker (${(buf.length / 1024 / 1024).toFixed(1)}MB). Aumente MAX_DOWNLOAD_MB ou use outro fluxo.`);
+    }
+
+    return buf;
+  }
+
+  // path local (se existir no container do worker)
   if (fs.existsSync(file)) return fs.createReadStream(file);
 
   // se não é URL nem path local, assume file_id do Telegram
@@ -65,7 +93,6 @@ async function finalizeCampaignIfDone(campaignId) {
 
   if (typeof newPending !== "number" || newPending > 0) return;
 
-  // lock pra evitar 2 workers limpando ao mesmo tempo
   const lockKey = `campaign:${campaignId}:cleanup`;
   try {
     const locked = await connection.set(lockKey, "1", "NX", "EX", 300);
@@ -75,8 +102,6 @@ async function finalizeCampaignIfDone(campaignId) {
   }
 
   try {
-    // no fluxo URL, não tem arquivo local no worker pra apagar.
-    // mas mantemos compatibilidade se você ainda guardar filePath em algum lugar.
     const filePath = await connection.hget(key, "filePath");
     if (filePath && fs.existsSync(filePath)) {
       try { fs.unlinkSync(filePath); } catch {}
@@ -130,13 +155,12 @@ const worker = new Worker(
       const { chatId } = job.data || {};
       if (!chatId) throw new Error("chatId ausente no job");
 
-      // rate limit por token
       const lim = job.data?.limit || { max: 1, ms: 1100 };
       await waitForRateLimit(job.data?.botToken, lim.max, lim.ms ?? lim.duration ?? lim.limitMs);
 
       const bot = getBot(job.data?.botToken);
 
-      // legado: mensagem sem type
+      // legado
       if (job.data?.mensagem && !job.data?.type) {
         await bot.sendMessage(chatId, job.data.mensagem);
         console.log("✅ Enviado (texto legado)!");
@@ -156,37 +180,37 @@ const worker = new Worker(
         }
 
         case "audio": {
-          const input = resolveTelegramInput(payload?.file);
+          const input = await resolveTelegramInput(payload?.file);
           await bot.sendAudio(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
           break;
         }
 
         case "video": {
-          const input = resolveTelegramInput(payload?.file);
+          const input = await resolveTelegramInput(payload?.file);
           await bot.sendVideo(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
           break;
         }
 
         case "voice": {
-          const input = resolveTelegramInput(payload?.file);
+          const input = await resolveTelegramInput(payload?.file);
           await bot.sendVoice(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
           break;
         }
 
         case "video_note": {
-          const input = resolveTelegramInput(payload?.file);
+          const input = await resolveTelegramInput(payload?.file);
           await bot.sendVideoNote(chatId, input, { ...(payload?.options || {}) });
           break;
         }
 
         case "photo": {
-          const input = resolveTelegramInput(payload?.file);
+          const input = await resolveTelegramInput(payload?.file);
           await bot.sendPhoto(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
           break;
         }
 
         case "document": {
-          const input = resolveTelegramInput(payload?.file);
+          const input = await resolveTelegramInput(payload?.file);
           await bot.sendDocument(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
           break;
         }
@@ -202,7 +226,6 @@ const worker = new Worker(
       console.error("❌ Telegram erro:", err.message);
       if (err.response?.body) console.error("Detalhe:", err.response.body);
 
-      // falha final (bullmq attemptsMade é 0-based)
       const attempts = job?.opts?.attempts ?? 1;
       const attemptsMade = job?.attemptsMade ?? 0;
       const isFinalFailure = attemptsMade >= (attempts - 1);
