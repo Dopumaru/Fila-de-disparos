@@ -9,10 +9,10 @@ const { Queue } = require("bullmq");
 const connection = require("../redis");
 
 const app = express();
+app.use(cors());
 
 // ===== FRONT (public) =====
 app.use(express.static(path.join(__dirname, "..", "public")));
-app.use(cors());
 
 // Health
 app.get("/health", (req, res) => res.json({ ok: true }));
@@ -25,6 +25,7 @@ app.get("/", (req, res) => {
 // ===== Uploads (DIR configurável e com fallback) =====
 function ensureDirWritable(dir) {
   try {
+    if (!dir) return null;
     fs.mkdirSync(dir, { recursive: true });
     fs.accessSync(dir, fs.constants.W_OK);
     return dir;
@@ -47,23 +48,42 @@ if (!UPLOAD_DIR) {
 
 console.log("📁 Upload dir:", UPLOAD_DIR);
 
-// multer salva em disco (não em RAM)
-const upload = multer({ dest: UPLOAD_DIR });
+// ✅ Servir uploads por HTTP (para o worker pegar por URL e não por path)
+app.use("/uploads", express.static(UPLOAD_DIR));
+
+// ✅ multer em disco + mantém extensão
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname || "");
+    const name = Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8) + ext;
+    cb(null, name);
+  },
+});
+const upload = multer({ storage });
 
 const queue = new Queue("disparos", { connection });
 
 // ===== Utils =====
-function maskToken(t) {
-  if (!t) return "";
-  const s = String(t);
-  if (s.length <= 10) return "***";
-  return s.slice(0, 4) + "..." + s.slice(-4);
-}
 function isHttpUrl(u) {
   return /^https?:\/\//i.test(String(u || "").trim());
 }
-function makeCampaignId() {
-  return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+
+function normalizeKey(k) {
+  return String(k || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[^a-z0-9_]/g, "");
+}
+
+function applyTemplate(template, rowObj) {
+  const t = String(template || "");
+  return t.replace(/\{(\w+)\}/g, (_, key) => {
+    const k = normalizeKey(key);
+    const v = rowObj?.[k];
+    return v == null ? "" : String(v);
+  });
 }
 
 // ===== CSV (sem libs) =====
@@ -122,14 +142,6 @@ function parseCsvRows(text) {
   return rows;
 }
 
-function normalizeKey(k) {
-  return String(k || "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, "")
-    .replace(/[^a-z0-9_]/g, "");
-}
-
 function buildRowObjectsFromCsv(text) {
   const rows = parseCsvRows(text);
   if (!rows.length) return { headers: [], items: [] };
@@ -151,24 +163,13 @@ function buildRowObjectsFromCsv(text) {
   return { headers, items };
 }
 
-function applyTemplate(template, rowObj) {
-  const t = String(template || "");
-  return t.replace(/\{(\w+)\}/g, (_, key) => {
-    const k = normalizeKey(key);
-    const v = rowObj?.[k];
-    return v == null ? "" : String(v);
-  });
-}
-
 // ===== Botões =====
 async function getBotUsername(botToken) {
   const r = await fetch(`https://api.telegram.org/bot${botToken}/getMe`);
   const data = await r.json().catch(() => null);
 
-  if (!data || !data.ok || !data.result) {
-    throw new Error("Token inválido (getMe)");
-  }
-  return data.result.username;
+  if (!data || !data.ok || !data.result) throw new Error("Token inválido (getMe)");
+  return data.result.username; // sem "@"
 }
 
 function buildOptionsFromButtons(buttons, botUsername) {
@@ -267,9 +268,21 @@ app.post(
 
       const options = buildOptionsFromButtons(buttons, botUsername);
 
-      const mediaSource = fileUrl || (mediaFile?.path || null);
+      // ✅ Fonte da mídia:
+      // - se veio fileUrl, usa ela
+      // - se veio upload, transforma em URL /uploads/arquivo.ext (worker consegue baixar)
       const isUpload = !!mediaFile && !fileUrl;
 
+      let mediaSource = fileUrl || null;
+
+      if (type !== "text" && isUpload) {
+        const PORT = process.env.PORT || 3000;
+        const internalHost = (process.env.API_INTERNAL_HOST || "api-disparos").trim();
+        const filename = path.basename(mediaFile.path);
+        mediaSource = `http://${internalHost}:${PORT}/uploads/${encodeURIComponent(filename)}`;
+      }
+
+      // ===== LEADS via CSV =====
       const csvText = fs.readFileSync(csvFile.path, "utf8");
       const { items } = buildRowObjectsFromCsv(csvText);
       if (!items.length) return res.status(400).json({ ok: false, error: "CSV vazio ou inválido." });
@@ -292,18 +305,12 @@ app.post(
         });
       }
 
+      // remove duplicados
       const seen = new Set();
       leads = leads.filter((l) => (seen.has(l.chatId) ? false : (seen.add(l.chatId), true)));
 
-      let campaignId = null;
-      if (type !== "text" && isUpload) {
-        campaignId = makeCampaignId();
-        await connection.hset(`campaign:${campaignId}`, {
-          filePath: mediaFile.path,
-          pending: String(leads.length),
-          createdAt: String(Date.now()),
-        });
-      }
+      // ✅ NÃO USAMOS MAIS campaignId (worker não apaga arquivo)
+      // Se você quiser cleanup automático depois, a gente adiciona na API depois.
 
       let total = 0;
       for (const lead of leads) {
@@ -311,14 +318,35 @@ app.post(
 
         const jobData =
           type === "text"
-            ? { chatId: lead.chatId, botToken, limit: { max: limitMax, ms: limitMs }, type: "text", payload: { text: finalCaption, options } }
-            : { chatId: lead.chatId, botToken, limit: { max: limitMax, ms: limitMs }, type, payload: { file: mediaSource, caption: finalCaption || "", options, campaignId: campaignId || null, tempFile: false } };
+            ? {
+                chatId: lead.chatId,
+                botToken,
+                limit: { max: limitMax, ms: limitMs },
+                type: "text",
+                payload: { text: finalCaption, options },
+              }
+            : {
+                chatId: lead.chatId,
+                botToken,
+                limit: { max: limitMax, ms: limitMs },
+                type,
+                payload: {
+                  file: mediaSource, // ✅ sempre URL aqui (ou fileUrl)
+                  caption: finalCaption || "",
+                  options,
+                  campaignId: null,
+                  tempFile: false,
+                },
+              };
 
         await queue.add("envio", jobData);
         total++;
       }
 
-      try { if (csvPathToDelete) fs.unlinkSync(csvPathToDelete); } catch {}
+      // apaga CSV upload
+      try {
+        if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
+      } catch {}
 
       return res.json({
         ok: true,
@@ -327,12 +355,14 @@ app.post(
         source: "csv",
         idColumn: idColumnRaw,
         unique: leads.length,
-        media: type === "text" ? null : (fileUrl ? "url" : "upload"),
-        campaignId: campaignId || null,
+        media: type === "text" ? null : fileUrl ? "url" : "upload-url",
+        mediaSource: type === "text" ? null : mediaSource,
       });
     } catch (err) {
       console.error("❌ /disparar erro:", err.message);
-      try { if (csvPathToDelete) fs.unlinkSync(csvPathToDelete); } catch {}
+      try {
+        if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
+      } catch {}
       return res.status(500).json({ ok: false, error: "Erro interno" });
     }
   }
