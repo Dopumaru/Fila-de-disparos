@@ -3,10 +3,21 @@ require("dotenv").config();
 const { Worker } = require("bullmq");
 const TelegramBot = require("node-telegram-bot-api");
 const connection = require("./redis");
+const IORedis = require("ioredis");
 const fs = require("fs");
 const path = require("path");
 const { pipeline } = require("stream/promises");
 const { Readable } = require("stream");
+
+// Redis client (para status da campanha)
+let redis;
+try {
+  redis = new IORedis(connection);
+} catch (e) {
+  console.warn("⚠️ Falha ao iniciar Redis client via 'connection'. Tentando REDIS_URL...");
+  if (!process.env.REDIS_URL) throw e;
+  redis = new IORedis(process.env.REDIS_URL);
+}
 
 const DEFAULT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
@@ -37,7 +48,9 @@ function isHttpUrl(u) {
 }
 
 function safeUnlink(p) {
-  try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch {}
+  try {
+    if (p && fs.existsSync(p)) fs.unlinkSync(p);
+  } catch {}
 }
 
 // baixa URL (inclusive interna do docker) -> salva em /tmp -> retorna caminho
@@ -119,12 +132,14 @@ const worker = new Worker(
   "disparos",
   async (job) => {
     let tmpToCleanup = null;
+    let ok = false;
 
     try {
       console.log("Recebi job:", job.id, {
         chatId: job.data?.chatId,
         type: job.data?.type,
         token: maskToken(job.data?.botToken),
+        campaignId: job.data?.campaignId,
       });
 
       const { chatId } = job.data || {};
@@ -139,6 +154,7 @@ const worker = new Worker(
       if (job.data?.mensagem && !job.data?.type) {
         await bot.sendMessage(chatId, job.data.mensagem);
         console.log("✅ Enviado (texto legado)!");
+        ok = true;
         return;
       }
 
@@ -200,11 +216,24 @@ const worker = new Worker(
       }
 
       console.log("✅ Enviado!");
+      ok = true;
     } catch (err) {
       console.error("❌ Telegram erro:", err.message);
       if (err.response?.body) console.error("Detalhe:", err.response.body);
       throw err;
     } finally {
+      // ✅ atualiza status da campanha (se tiver campaignId)
+      const campaignId = job.data?.campaignId;
+      if (campaignId) {
+        const key = `campaign:${campaignId}`;
+        try {
+          if (ok) await redis.hincrby(key, "sent", 1);
+          else await redis.hincrby(key, "failed", 1);
+        } catch (e) {
+          console.error("❌ campaign counter error:", e.message);
+        }
+      }
+
       // limpa o arquivo temp baixado pelo worker
       if (tmpToCleanup) safeUnlink(tmpToCleanup);
     }
