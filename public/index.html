@@ -164,6 +164,33 @@
 
   <button id="btnEnviar" type="button">Enviar campanha</button>
 
+  <!-- ✅ NOVO: PAINEL DE STATUS DA CAMPANHA + PAUSE/RESUME -->
+  <div class="box" id="campaignBox" style="display:none;">
+    <h3 style="margin:0 0 10px;">Campanha</h3>
+    <div id="campaignMeta" class="muted"></div>
+
+    <div style="margin-top:10px;">
+      <div class="pill" id="stTotal">Total: 0</div>
+      <div class="pill" id="stSent">Enviados: 0</div>
+      <div class="pill" id="stFailed">Falhas: 0</div>
+      <div class="pill" id="stPending">Pendentes: 0</div>
+    </div>
+
+    <div style="margin-top:12px;">
+      <div style="height:10px;background:#222;border-radius:999px;overflow:hidden;">
+        <div id="bar" style="height:10px;width:0%;background:#4caf50;"></div>
+      </div>
+      <div class="muted" id="stProg" style="margin-top:6px;">0%</div>
+    </div>
+
+    <div class="row" style="margin-top:12px;">
+      <div><button id="btnPause" type="button">Pausar fila</button></div>
+      <div><button id="btnResume" type="button">Retomar fila</button></div>
+    </div>
+
+    <div class="muted" id="queuePausedInfo" style="margin-top:6px;"></div>
+  </div>
+
   <p id="status"></p>
   <pre id="debug"></pre>
 
@@ -182,4 +209,3 @@
   <script src="./app.js"></script>
 </body>
 </html>
-
