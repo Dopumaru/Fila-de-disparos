@@ -9,15 +9,38 @@ const path = require("path");
 const { pipeline } = require("stream/promises");
 const { Readable } = require("stream");
 
-// Redis client (para status da campanha)
-let redis;
-try {
-  redis = new IORedis(connection);
-} catch (e) {
-  console.warn("⚠️ Falha ao iniciar Redis client via 'connection'. Tentando REDIS_URL...");
-  if (!process.env.REDIS_URL) throw e;
-  redis = new IORedis(process.env.REDIS_URL);
+// ===== ✅ Redis client (status campanha) — RESOLVIDO =====
+function buildRedisUrlFromConnection(conn) {
+  if (!conn) return null;
+  if (typeof conn === "string") return conn; // se seu redis.js exporta uma URL
+  const host = conn.host || conn.hostname;
+  const port = conn.port || 6379;
+  if (!host) return null;
+
+  const password = conn.password ? encodeURIComponent(conn.password) : null;
+  const db = Number.isFinite(conn.db) ? conn.db : null;
+
+  let auth = "";
+  if (password) auth = `:${password}@`;
+
+  let url = `redis://${auth}${host}:${port}`;
+  if (db != null) url += `/${db}`;
+  return url;
 }
+
+const REDIS_URL =
+  (process.env.REDIS_URL && process.env.REDIS_URL.trim()) ||
+  buildRedisUrlFromConnection(connection);
+
+if (!REDIS_URL) {
+  throw new Error(
+    "REDIS_URL não definido e não foi possível inferir pelo connection. Defina REDIS_URL (ex: redis://redis-fila:6379)."
+  );
+}
+
+const redis = new IORedis(REDIS_URL);
+redis.on("error", (e) => console.error("❌ Redis error:", e.message));
+redis.on("connect", () => console.log("✅ Redis (status) conectado via", REDIS_URL));
 
 const DEFAULT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
