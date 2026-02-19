@@ -17,14 +17,6 @@ app.set("trust proxy", 1);
 // ===== FRONT (public) =====
 app.use(express.static(path.join(__dirname, "..", "public")));
 
-// Health
-app.get("/health", (req, res) => res.json({ ok: true }));
-
-// Rota raiz: abre o painel
-app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "..", "public", "index.html"));
-});
-
 // ===== Uploads (DIR configurável e com fallback) =====
 function ensureDirWritable(dir) {
   try {
@@ -265,6 +257,49 @@ function scheduleDelete(filePath) {
   }, minutes * 60 * 1000);
 }
 
+// ===== 10) Health real =====
+app.get("/health", async (_req, res) => {
+  try {
+    const ping = await redis.ping();
+
+    const counts = await queue.getJobCounts(
+      "waiting",
+      "active",
+      "completed",
+      "failed",
+      "delayed",
+      "paused"
+    );
+
+    let uploadWritable = false;
+    try {
+      fs.accessSync(UPLOAD_DIR, fs.constants.W_OK);
+      uploadWritable = true;
+    } catch {}
+
+    return res.json({
+      ok: true,
+      redis: ping === "PONG" ? "ok" : ping,
+      queue: { name: "disparos", counts },
+      uploads: { dir: UPLOAD_DIR, writable: uploadWritable },
+      ts: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error("❌ /health error:", e.message);
+    return res.status(500).json({
+      ok: false,
+      error: "healthcheck_failed",
+      detail: e?.message,
+      ts: new Date().toISOString(),
+    });
+  }
+});
+
+// Rota raiz: abre o painel
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "..", "public", "index.html"));
+});
+
 // ===== STATUS CAMPANHA =====
 app.get("/campaign/:id/status", async (req, res) => {
   try {
@@ -334,6 +369,26 @@ app.get("/queue/status", async (_req, res) => {
   }
 });
 
+// ===== 7) Validações extras =====
+const ALLOWED_TYPES = new Set([
+  "text",
+  "photo",
+  "video",
+  "audio",
+  "voice",
+  "document",
+  "video_note",
+]);
+
+const allowedByType = {
+  photo: [".jpg", ".jpeg", ".png", ".webp"],
+  video: [".mp4", ".mov", ".mkv", ".webm"],
+  audio: [".mp3", ".m4a", ".wav", ".ogg"],
+  voice: [".ogg"],
+  video_note: [".mp4"],
+  document: [], // deixa livre (PDF/ZIP/etc). Se quiser travar, coloque lista.
+};
+
 // ===== ROUTE =====
 app.post(
   "/disparar",
@@ -362,14 +417,32 @@ app.post(
         return res.status(400).json({ ok: false, error: "buttons precisa ser JSON." });
       }
 
+      // ===== validações base =====
       if (!botToken) return res.status(400).json({ ok: false, error: "botToken é obrigatório." });
       if (!type) return res.status(400).json({ ok: false, error: "type é obrigatório." });
+
+      // ✅ valida type permitido
+      if (!ALLOWED_TYPES.has(type)) {
+        return res.status(400).json({
+          ok: false,
+          error: `type inválido: ${type}`,
+          allowed: Array.from(ALLOWED_TYPES),
+        });
+      }
+
       if (!(limitMax >= 1) || !(limitMs >= 200)) {
         return res.status(400).json({ ok: false, error: "limitMax>=1 e limitMs>=200." });
       }
 
       if (type === "text" && !String(captionTemplate).trim()) {
-        return res.status(400).json({ ok: false, error: "Para text, caption (mensagem) é obrigatório." });
+        return res
+          .status(400)
+          .json({ ok: false, error: "Para text, caption (mensagem) é obrigatório." });
+      }
+
+      // ✅ fileUrl sanity
+      if (fileUrl && fileUrl.length > 2000) {
+        return res.status(400).json({ ok: false, error: "fileUrl muito longa." });
       }
 
       const mediaFile = req.files?.file?.[0] || null;
@@ -390,6 +463,20 @@ app.post(
         }
       }
 
+      // ✅ valida extensão do upload por type (quando aplicável)
+      if (type !== "text" && mediaFile) {
+        const ext = path.extname(mediaFile.originalname || "").toLowerCase();
+        const list = allowedByType[type] || [];
+        if (list.length && !list.includes(ext)) {
+          return res.status(400).json({
+            ok: false,
+            error: `Arquivo inválido para type='${type}'.`,
+            receivedExt: ext,
+            allowedExt: list,
+          });
+        }
+      }
+
       if (!Array.isArray(buttons)) buttons = [];
       if (buttons.length > 4) buttons = buttons.slice(0, 4);
 
@@ -406,6 +493,12 @@ app.post(
       if (type !== "text" && isUpload) {
         const PORT = process.env.PORT || 3000;
         const internalHost = (process.env.API_INTERNAL_HOST || "api-disparos").trim();
+
+        // aviso útil (não quebra)
+        if (!process.env.API_INTERNAL_HOST) {
+          console.warn("⚠️ API_INTERNAL_HOST não definido. Worker pode não conseguir acessar /uploads.");
+        }
+
         const filename = path.basename(mediaFile.path);
         mediaSource = `http://${internalHost}:${PORT}/uploads/${encodeURIComponent(filename)}`;
         scheduleDelete(mediaFile.path);
@@ -413,8 +506,19 @@ app.post(
 
       // ===== LEADS via CSV =====
       const csvText = fs.readFileSync(csvFile.path, "utf8");
-      const { items } = buildRowObjectsFromCsv(csvText);
+      const { headers, items } = buildRowObjectsFromCsv(csvText);
       if (!items.length) return res.status(400).json({ ok: false, error: "CSV vazio ou inválido." });
+
+      // ✅ valida se existe alguma coluna “ID” conhecida no header
+      const possibleIdCols = new Set([idColumn, "chatid", "chat_id", "id", "col0"]);
+      const hasAnyIdCol = headers.some((h) => possibleIdCols.has(h));
+      if (!hasAnyIdCol) {
+        return res.status(400).json({
+          ok: false,
+          error: `CSV não contém coluna de ID válida. Tentativas: ${Array.from(possibleIdCols).join(", ")}`,
+          headersEncontrados: headers,
+        });
+      }
 
       let leads = [];
       for (const row of items) {
@@ -506,11 +610,14 @@ app.post(
         mediaSource: type === "text" ? null : mediaSource,
       });
     } catch (err) {
-      console.error("❌ /disparar erro:", err.message);
+      console.error("❌ /disparar erro:", err);
+
       try {
         if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
       } catch {}
-      return res.status(500).json({ ok: false, error: "Erro interno" });
+
+      // ✅ devolve detail pra debug (não quebra o front)
+      return res.status(500).json({ ok: false, error: "Erro interno", detail: err?.message });
     }
   }
 );
