@@ -74,7 +74,7 @@ const upload = multer({
 
 const queue = new Queue("disparos", { connection });
 
-// ===== ✅ Redis client (para status de campanha) — RESOLVIDO =====
+// ===== ✅ Redis client (para status de campanha) =====
 function buildRedisUrlFromConnection(conn) {
   if (!conn) return null;
   if (typeof conn === "string") return conn; // se seu redis.js exporta uma URL
@@ -389,6 +389,22 @@ const allowedByType = {
   document: [], // deixa livre (PDF/ZIP/etc). Se quiser travar, coloque lista.
 };
 
+// ===== 9) Retenção de jobs (BullMQ) =====
+// Ajuste fino via env (opcional). Defaults seguros.
+const RETAIN_COMPLETED = Number(process.env.RETAIN_COMPLETED || 2000); // últimos 2000 concluídos
+const RETAIN_FAILED = Number(process.env.RETAIN_FAILED || 5000); // últimos 5000 falhados
+
+function jobRetentionOptions() {
+  // BullMQ aceita count/age; aqui usamos count (mais garantido)
+  const completed = Number.isFinite(RETAIN_COMPLETED) && RETAIN_COMPLETED > 0 ? RETAIN_COMPLETED : 2000;
+  const failed = Number.isFinite(RETAIN_FAILED) && RETAIN_FAILED > 0 ? RETAIN_FAILED : 5000;
+
+  return {
+    removeOnComplete: { count: completed },
+    removeOnFail: { count: failed },
+  };
+}
+
 // ===== ROUTE =====
 app.post(
   "/disparar",
@@ -560,6 +576,8 @@ app.post(
       await redis.pexpire(campaignKey, 7 * 24 * 60 * 60 * 1000);
 
       let total = 0;
+      const retention = jobRetentionOptions();
+
       for (const lead of leads) {
         const finalCaption = applyTemplate(captionTemplate, lead.vars);
 
@@ -586,10 +604,8 @@ app.post(
                 },
               };
 
-        await queue.add("envio", jobData, {
-          removeOnComplete: true,
-          removeOnFail: { count: 2000 },
-        });
+        // ✅ Passo 9: retenção de jobs
+        await queue.add("envio", jobData, retention);
         total++;
       }
 
@@ -608,6 +624,10 @@ app.post(
         unique: leads.length,
         media: type === "text" ? null : fileUrl ? "url" : "upload-url",
         mediaSource: type === "text" ? null : mediaSource,
+        retention: {
+          completed: retention.removeOnComplete?.count,
+          failed: retention.removeOnFail?.count,
+        },
       });
     } catch (err) {
       console.error("❌ /disparar erro:", err);
@@ -616,7 +636,6 @@ app.post(
         if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
       } catch {}
 
-      // ✅ devolve detail pra debug (não quebra o front)
       return res.status(500).json({ ok: false, error: "Erro interno", detail: err?.message });
     }
   }
