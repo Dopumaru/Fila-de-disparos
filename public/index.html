@@ -92,15 +92,27 @@
     </div>
   </div>
 
+  <!-- ✅ LIMITES COM HINT + MAX/MIN -->
   <div class="row">
     <div>
       <label>Limite por intervalo</label>
-      <input id="limitMax" type="number" value="1" min="1" />
+      <input id="limitMax" type="number" value="1" min="1" max="5" step="1" />
+      <div class="hint">
+        Recomendado: <b>1</b>. Máximo no painel: <b>5</b> (valores altos aumentam chance de 429/bloqueio).
+      </div>
     </div>
     <div>
       <label>Intervalo (ms)</label>
-      <input id="limitMs" type="number" value="1100" min="200" />
+      <input id="limitMs" type="number" value="1100" min="800" max="60000" step="50" />
+      <div class="hint">
+        Recomendado: <b>1100ms</b> (≈ 1 msg/s). Mínimo no painel: <b>800ms</b>.<br>
+        Quanto menor, maior risco de 429.
+      </div>
     </div>
+  </div>
+
+  <div id="rateWarn" class="hint warn" style="display:none; margin-top:8px;">
+    ⚠️ Configuração agressiva. Se aparecer <b>429 Too Many Requests</b>, aumente o intervalo (ms).
   </div>
 
   <hr>
@@ -204,6 +216,47 @@
 
     tipo.addEventListener("change", refreshUI);
     refreshUI();
+  </script>
+
+  <!-- ✅ CLAMP / AVISO DE RATE LIMIT -->
+  <script>
+    const limitMaxEl = document.getElementById("limitMax");
+    const limitMsEl = document.getElementById("limitMs");
+    const rateWarnEl = document.getElementById("rateWarn");
+
+    // limites do painel (conservador)
+    const LIMIT_MAX_MIN = 1;
+    const LIMIT_MAX_MAX = 5;
+
+    const LIMIT_MS_MIN = 800;
+    const LIMIT_MS_MAX = 60000;
+
+    function clampInt(v, min, max, fallback) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return fallback;
+      return Math.min(max, Math.max(min, Math.trunc(n)));
+    }
+
+    function clampMs(v) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return 1100;
+      return Math.min(LIMIT_MS_MAX, Math.max(LIMIT_MS_MIN, Math.round(n)));
+    }
+
+    function refreshRateWarn() {
+      const max = clampInt(limitMaxEl.value, LIMIT_MAX_MIN, LIMIT_MAX_MAX, 1);
+      const ms = clampMs(limitMsEl.value);
+
+      limitMaxEl.value = String(max);
+      limitMsEl.value = String(ms);
+
+      const aggressive = (max >= 2 && ms < 1000) || (max === 1 && ms < 900);
+      rateWarnEl.style.display = aggressive ? "block" : "none";
+    }
+
+    limitMaxEl.addEventListener("input", refreshRateWarn);
+    limitMsEl.addEventListener("input", refreshRateWarn);
+    refreshRateWarn();
   </script>
 
   <script src="./app.js"></script>
