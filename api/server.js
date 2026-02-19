@@ -76,22 +76,45 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage,
   limits: {
-    // ajuste se quiser (em bytes)
     fileSize: Number(process.env.UPLOAD_MAX_BYTES || 50 * 1024 * 1024), // 50MB default
   },
 });
 
 const queue = new Queue("disparos", { connection });
 
-// Redis client (para status de campanha)
-let redis;
-try {
-  redis = new IORedis(connection);
-} catch (e) {
-  console.warn("⚠️ Falha ao iniciar Redis client via 'connection'. Tentando REDIS_URL...");
-  if (!process.env.REDIS_URL) throw e;
-  redis = new IORedis(process.env.REDIS_URL);
+// ===== ✅ Redis client (para status de campanha) — RESOLVIDO =====
+function buildRedisUrlFromConnection(conn) {
+  if (!conn) return null;
+  if (typeof conn === "string") return conn; // se seu redis.js exporta uma URL
+  const host = conn.host || conn.hostname;
+  const port = conn.port || 6379;
+  if (!host) return null;
+
+  // suporte opcional a senha/db se existirem no objeto
+  const password = conn.password ? encodeURIComponent(conn.password) : null;
+  const db = Number.isFinite(conn.db) ? conn.db : null;
+
+  let auth = "";
+  if (password) auth = `:${password}@`;
+
+  let url = `redis://${auth}${host}:${port}`;
+  if (db != null) url += `/${db}`;
+  return url;
 }
+
+const REDIS_URL =
+  (process.env.REDIS_URL && process.env.REDIS_URL.trim()) ||
+  buildRedisUrlFromConnection(connection);
+
+if (!REDIS_URL) {
+  throw new Error(
+    "REDIS_URL não definido e não foi possível inferir pelo connection. Defina REDIS_URL (ex: redis://redis-fila:6379)."
+  );
+}
+
+const redis = new IORedis(REDIS_URL);
+redis.on("error", (e) => console.error("❌ Redis error:", e.message));
+redis.on("connect", () => console.log("✅ Redis (status) conectado via", REDIS_URL));
 
 // ===== Utils =====
 function isHttpUrl(u) {
@@ -242,7 +265,7 @@ function scheduleDelete(filePath) {
   }, minutes * 60 * 1000);
 }
 
-// ===== NOVO: STATUS CAMPANHA =====
+// ===== STATUS CAMPANHA =====
 app.get("/campaign/:id/status", async (req, res) => {
   try {
     const id = String(req.params.id || "").trim();
@@ -280,7 +303,7 @@ app.get("/campaign/:id/status", async (req, res) => {
   }
 });
 
-// ===== NOVO: PAUSE/RESUME GLOBAL DA FILA =====
+// ===== PAUSE/RESUME GLOBAL DA FILA =====
 app.post("/queue/pause", async (_req, res) => {
   try {
     await queue.pause();
@@ -377,8 +400,6 @@ app.post(
       const options = buildOptionsFromButtons(buttons, botUsername);
 
       // ✅ Fonte da mídia:
-      // - se veio fileUrl, usa ela
-      // - se veio upload, transforma em URL /uploads/arquivo.ext (worker baixa por URL)
       const isUpload = !!mediaFile && !fileUrl;
       let mediaSource = fileUrl || null;
 
@@ -387,8 +408,6 @@ app.post(
         const internalHost = (process.env.API_INTERNAL_HOST || "api-disparos").trim();
         const filename = path.basename(mediaFile.path);
         mediaSource = `http://${internalHost}:${PORT}/uploads/${encodeURIComponent(filename)}`;
-
-        // opcional: limpar arquivo depois de um tempo (evita lotar disco)
         scheduleDelete(mediaFile.path);
       }
 
@@ -419,13 +438,12 @@ app.post(
       const seen = new Set();
       leads = leads.filter((l) => (seen.has(l.chatId) ? false : (seen.add(l.chatId), true)));
 
-      // ===== NOVO: CAMPANHA =====
+      // ===== CAMPANHA =====
       const campaignId = crypto.randomUUID();
       const campaignKey = `campaign:${campaignId}`;
       const createdAt = Date.now();
       const totalLeads = leads.length;
 
-      // salva estado inicial (TTL 7 dias)
       await redis.hset(campaignKey, {
         id: campaignId,
         createdAt: String(createdAt),
@@ -458,7 +476,7 @@ app.post(
                 type,
                 campaignId,
                 payload: {
-                  file: mediaSource, // ✅ URL
+                  file: mediaSource,
                   caption: finalCaption || "",
                   options,
                 },
