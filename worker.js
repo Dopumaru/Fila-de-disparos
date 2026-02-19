@@ -9,7 +9,7 @@ const path = require("path");
 const { pipeline } = require("stream/promises");
 const { Readable } = require("stream");
 
-// ===== ✅ Redis client (status campanha) — RESOLVIDO =====
+// ===== ✅ Redis client (status campanha) =====
 function buildRedisUrlFromConnection(conn) {
   if (!conn) return null;
   if (typeof conn === "string") return conn; // se seu redis.js exporta uma URL
@@ -48,7 +48,7 @@ if (!DEFAULT_TOKEN) {
   console.warn("⚠️ TELEGRAM_BOT_TOKEN não definido (ok se você sempre mandar botToken no job).");
 }
 
-// cache de bots por token
+// ===== cache de bots por token =====
 const botCache = new Map();
 function getBot(token) {
   const t = token || DEFAULT_TOKEN;
@@ -76,7 +76,7 @@ function safeUnlink(p) {
   } catch {}
 }
 
-// baixa URL (inclusive interna do docker) -> salva em /tmp -> retorna caminho
+// ===== Download seguro: URL -> /tmp (com timeout e limite) =====
 async function downloadUrlToTmp(url) {
   const u = String(url || "").trim();
   const urlObj = new URL(u);
@@ -90,16 +90,49 @@ async function downloadUrlToTmp(url) {
     `tg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}${ext}`
   );
 
-  const r = await fetch(u);
-  if (!r.ok) throw new Error(`Falha ao baixar arquivo (${r.status})`);
+  // timeout no fetch
+  const timeoutMs = Number(process.env.DOWNLOAD_TIMEOUT_MS || 20000);
+  const ac = new AbortController();
+  const to = setTimeout(() => ac.abort(), timeoutMs);
 
-  // stream web -> node
-  const body = r.body;
-  if (!body) throw new Error("Resposta sem body ao baixar arquivo");
+  // limite de tamanho (evita estourar disco/tempo)
+  const maxBytes = Number(process.env.DOWNLOAD_MAX_BYTES || 80 * 1024 * 1024); // 80MB
 
-  const nodeStream = Readable.fromWeb(body);
-  await pipeline(nodeStream, fs.createWriteStream(tmpPath));
-  return tmpPath;
+  try {
+    const r = await fetch(u, { signal: ac.signal });
+    if (!r.ok) throw new Error(`Falha ao baixar arquivo (${r.status})`);
+
+    const body = r.body;
+    if (!body) throw new Error("Resposta sem body ao baixar arquivo");
+
+    // se vier content-length, valida
+    const len = Number(r.headers.get("content-length") || 0);
+    if (len && len > maxBytes) {
+      throw new Error(`Arquivo grande demais: ${len} bytes (max ${maxBytes})`);
+    }
+
+    const nodeStream = Readable.fromWeb(body);
+
+    // escreve no disco contando bytes (pra limitar sem depender de header)
+    let written = 0;
+    const ws = fs.createWriteStream(tmpPath);
+    nodeStream.on("data", (chunk) => {
+      written += chunk.length;
+      if (written > maxBytes) {
+        try {
+          ws.destroy(new Error("Arquivo excedeu limite de download"));
+        } catch {}
+        try {
+          ac.abort();
+        } catch {}
+      }
+    });
+
+    await pipeline(nodeStream, ws);
+    return tmpPath;
+  } finally {
+    clearTimeout(to);
+  }
 }
 
 /**
@@ -112,22 +145,19 @@ async function resolveTelegramInput(file) {
   if (!file) throw new Error("payload.file não foi enviado");
   if (typeof file !== "string") throw new Error("payload.file deve ser string");
 
-  // URL -> baixar e virar stream
   if (isHttpUrl(file)) {
     const tmpPath = await downloadUrlToTmp(file);
     return { input: fs.createReadStream(tmpPath), cleanupPath: tmpPath };
   }
 
-  // path local -> stream
   if (fs.existsSync(file)) {
     return { input: fs.createReadStream(file), cleanupPath: null };
   }
 
-  // file_id do Telegram
   return { input: file, cleanupPath: null };
 }
 
-// rate limit por token
+// ===== Rate limit por token =====
 const tokenWindows = new Map();
 async function waitForRateLimit(token, max, ms) {
   const key = token || DEFAULT_TOKEN || "no-token";
@@ -151,6 +181,7 @@ async function waitForRateLimit(token, max, ms) {
   }
 }
 
+// ===== Worker =====
 const worker = new Worker(
   "disparos",
   async (job) => {
@@ -195,21 +226,30 @@ const worker = new Worker(
         case "audio": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendAudio(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
+          await bot.sendAudio(chatId, input, {
+            caption: payload?.caption,
+            ...(payload?.options || {}),
+          });
           break;
         }
 
         case "video": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendVideo(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
+          await bot.sendVideo(chatId, input, {
+            caption: payload?.caption,
+            ...(payload?.options || {}),
+          });
           break;
         }
 
         case "voice": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendVoice(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
+          await bot.sendVoice(chatId, input, {
+            caption: payload?.caption,
+            ...(payload?.options || {}),
+          });
           break;
         }
 
@@ -223,14 +263,20 @@ const worker = new Worker(
         case "photo": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendPhoto(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
+          await bot.sendPhoto(chatId, input, {
+            caption: payload?.caption,
+            ...(payload?.options || {}),
+          });
           break;
         }
 
         case "document": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendDocument(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
+          await bot.sendDocument(chatId, input, {
+            caption: payload?.caption,
+            ...(payload?.options || {}),
+          });
           break;
         }
 
