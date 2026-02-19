@@ -5,6 +5,8 @@ const fs = require("fs");
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
+const crypto = require("crypto");
+const IORedis = require("ioredis");
 const { Queue } = require("bullmq");
 const connection = require("../redis");
 
@@ -52,10 +54,13 @@ if (!UPLOAD_DIR) {
 console.log("📁 Upload dir:", UPLOAD_DIR);
 
 // ✅ Servir uploads por HTTP (worker pega por URL)
-app.use("/uploads", express.static(UPLOAD_DIR, {
-  fallthrough: false,
-  maxAge: "1h",
-}));
+app.use(
+  "/uploads",
+  express.static(UPLOAD_DIR, {
+    fallthrough: false,
+    maxAge: "1h",
+  })
+);
 
 // ✅ multer em disco + mantém extensão + limites
 const storage = multer.diskStorage({
@@ -77,6 +82,16 @@ const upload = multer({
 });
 
 const queue = new Queue("disparos", { connection });
+
+// Redis client (para status de campanha)
+let redis;
+try {
+  redis = new IORedis(connection);
+} catch (e) {
+  console.warn("⚠️ Falha ao iniciar Redis client via 'connection'. Tentando REDIS_URL...");
+  if (!process.env.REDIS_URL) throw e;
+  redis = new IORedis(process.env.REDIS_URL);
+}
 
 // ===== Utils =====
 function isHttpUrl(u) {
@@ -227,6 +242,75 @@ function scheduleDelete(filePath) {
   }, minutes * 60 * 1000);
 }
 
+// ===== NOVO: STATUS CAMPANHA =====
+app.get("/campaign/:id/status", async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    const key = `campaign:${id}`;
+    const data = await redis.hgetall(key);
+
+    if (!data || !data.id) {
+      return res.status(404).json({ ok: false, error: "campaign_not_found" });
+    }
+
+    const total = Number(data.total || 0);
+    const sent = Number(data.sent || 0);
+    const failed = Number(data.failed || 0);
+    const done = sent + failed;
+    const pending = Math.max(0, total - done);
+
+    return res.json({
+      ok: true,
+      campaignId: id,
+      total,
+      sent,
+      failed,
+      pending,
+      done,
+      progress: total > 0 ? done / total : 0,
+      createdAt: data.createdAt ? Number(data.createdAt) : null,
+      meta: {
+        type: data.type || null,
+        idColumn: data.idColumn || null,
+      },
+    });
+  } catch (e) {
+    console.error("❌ campaign status error:", e.message);
+    res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
+// ===== NOVO: PAUSE/RESUME GLOBAL DA FILA =====
+app.post("/queue/pause", async (_req, res) => {
+  try {
+    await queue.pause();
+    res.json({ ok: true, paused: true });
+  } catch (e) {
+    console.error("❌ pause error:", e.message);
+    res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
+app.post("/queue/resume", async (_req, res) => {
+  try {
+    await queue.resume();
+    res.json({ ok: true, paused: false });
+  } catch (e) {
+    console.error("❌ resume error:", e.message);
+    res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
+app.get("/queue/status", async (_req, res) => {
+  try {
+    const paused = await queue.isPaused();
+    res.json({ ok: true, paused: !!paused });
+  } catch (e) {
+    console.error("❌ queue status error:", e.message);
+    res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
 // ===== ROUTE =====
 app.post(
   "/disparar",
@@ -335,6 +419,24 @@ app.post(
       const seen = new Set();
       leads = leads.filter((l) => (seen.has(l.chatId) ? false : (seen.add(l.chatId), true)));
 
+      // ===== NOVO: CAMPANHA =====
+      const campaignId = crypto.randomUUID();
+      const campaignKey = `campaign:${campaignId}`;
+      const createdAt = Date.now();
+      const totalLeads = leads.length;
+
+      // salva estado inicial (TTL 7 dias)
+      await redis.hset(campaignKey, {
+        id: campaignId,
+        createdAt: String(createdAt),
+        total: String(totalLeads),
+        sent: "0",
+        failed: "0",
+        type: String(type),
+        idColumn: String(idColumnRaw),
+      });
+      await redis.pexpire(campaignKey, 7 * 24 * 60 * 60 * 1000);
+
       let total = 0;
       for (const lead of leads) {
         const finalCaption = applyTemplate(captionTemplate, lead.vars);
@@ -346,6 +448,7 @@ app.post(
                 botToken,
                 limit: { max: limitMax, ms: limitMs },
                 type: "text",
+                campaignId,
                 payload: { text: finalCaption, options },
               }
             : {
@@ -353,6 +456,7 @@ app.post(
                 botToken,
                 limit: { max: limitMax, ms: limitMs },
                 type,
+                campaignId,
                 payload: {
                   file: mediaSource, // ✅ URL
                   caption: finalCaption || "",
@@ -360,15 +464,21 @@ app.post(
                 },
               };
 
-        await queue.add("envio", jobData);
+        await queue.add("envio", jobData, {
+          removeOnComplete: true,
+          removeOnFail: { count: 2000 },
+        });
         total++;
       }
 
       // apaga CSV upload
-      try { if (csvPathToDelete) fs.unlinkSync(csvPathToDelete); } catch {}
+      try {
+        if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
+      } catch {}
 
       return res.json({
         ok: true,
+        campaignId,
         total,
         buttons: buttons.length,
         source: "csv",
@@ -379,7 +489,9 @@ app.post(
       });
     } catch (err) {
       console.error("❌ /disparar erro:", err.message);
-      try { if (csvPathToDelete) fs.unlinkSync(csvPathToDelete); } catch {}
+      try {
+        if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
+      } catch {}
       return res.status(500).json({ ok: false, error: "Erro interno" });
     }
   }
