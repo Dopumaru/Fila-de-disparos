@@ -10,49 +10,26 @@ const { pipeline } = require("stream/promises");
 const { Readable } = require("stream");
 
 // ===== ✅ Redis client (status campanha) =====
-function buildRedisUrlFromConnection(conn) {
-  if (!conn) return null;
-  if (typeof conn === "string") return conn; // se seu redis.js exporta uma URL
-  const host = conn.host || conn.hostname;
-  const port = conn.port || 6379;
-  if (!host) return null;
+const redis = new IORedis(connection);
+redis.on("error", (e) => console.error("❌ Redis (status) error:", e.message));
+redis.on("connect", () => console.log("✅ Redis (status) conectado"));
 
-  const password = conn.password ? encodeURIComponent(conn.password) : null;
-  const db = Number.isFinite(conn.db) ? conn.db : null;
-
-  let auth = "";
-  if (password) auth = `:${password}@`;
-
-  let url = `redis://${auth}${host}:${port}`;
-  if (db != null) url += `/${db}`;
-  return url;
-}
-
-const REDIS_URL =
-  (process.env.REDIS_URL && process.env.REDIS_URL.trim()) ||
-  buildRedisUrlFromConnection(connection);
-
-if (!REDIS_URL) {
-  throw new Error(
-    "REDIS_URL não definido e não foi possível inferir pelo connection. Defina REDIS_URL (ex: redis://redis-fila:6379)."
-  );
-}
-
-const redis = new IORedis(REDIS_URL);
-redis.on("error", (e) => console.error("❌ Redis error:", e.message));
-redis.on("connect", () => console.log("✅ Redis (status) conectado via", REDIS_URL));
-
+// ===== Token default (opcional) =====
 const DEFAULT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-
 if (!DEFAULT_TOKEN) {
-  console.warn("⚠️ TELEGRAM_BOT_TOKEN não definido (ok se você sempre mandar botToken no job).");
+  console.warn(
+    "⚠️ TELEGRAM_BOT_TOKEN não definido (ok se você sempre mandar botToken no job)."
+  );
 }
 
 // ===== cache de bots por token =====
 const botCache = new Map();
 function getBot(token) {
   const t = token || DEFAULT_TOKEN;
-  if (!t) throw new Error("Nenhum token disponível (botToken do job ou TELEGRAM_BOT_TOKEN no env)");
+  if (!t)
+    throw new Error(
+      "Nenhum token disponível (botToken do job ou TELEGRAM_BOT_TOKEN no env)"
+    );
   if (botCache.has(t)) return botCache.get(t);
   const bot = new TelegramBot(t, { polling: false });
   botCache.set(t, bot);
@@ -107,9 +84,8 @@ async function downloadUrlToTmp(url) {
     if (!body) throw new Error("Resposta sem body ao baixar arquivo");
 
     const len = Number(r.headers.get("content-length") || 0);
-    if (len && len > maxBytes) {
+    if (len && len > maxBytes)
       throw new Error(`Arquivo grande demais: ${len} bytes (max ${maxBytes})`);
-    }
 
     const nodeStream = Readable.fromWeb(body);
 
@@ -153,10 +129,10 @@ async function resolveTelegramInput(file) {
     return { input: fs.createReadStream(file), cleanupPath: null };
   }
 
-  return { input: file, cleanupPath: null };
+  return { input: file, cleanupPath: null }; // file_id
 }
 
-// ===== Rate limit por token =====
+// ===== Rate limit por token (janela) =====
 const tokenWindows = new Map();
 async function waitForRateLimit(token, max, ms) {
   const key = token || DEFAULT_TOKEN || "no-token";
@@ -226,30 +202,79 @@ async function sendWithBackoff(sendFn, opts = {}) {
 
 // ===== Ramp-up (subir taxa aos poucos) =====
 const WORKER_STARTED_AT = Date.now();
-
 function rampedRate(base, target, rampSeconds) {
   const elapsed = (Date.now() - WORKER_STARTED_AT) / 1000;
   const t = Math.min(1, Math.max(0, elapsed / rampSeconds));
   return Math.round(base + (target - base) * t);
 }
 
-/**
- * Aplica ramp-up e limites por tipo.
- * - Texto: permite subir até o solicitado (cap 25), em 3 minutos.
- * - Mídia: sobe devagar (cap 8), em 5 minutos, e força ms mínimo.
- */
-function getRampedLimit(type, requested) {
+// ===== Adaptive throttle (por token) =====
+const tokenPenalty = new Map(); // tokenKey -> { level, untilTs }
+const PENALTY_BASE_SECONDS = Number(process.env.PENALTY_BASE_SECONDS || 120); // 2 min
+const PENALTY_MAX_LEVEL = Number(process.env.PENALTY_MAX_LEVEL || 6);
+
+function tokenKeyOf(token) {
+  return token || DEFAULT_TOKEN || "no-token";
+}
+
+function getPenaltyLevel(token) {
+  const k = tokenKeyOf(token);
+  const st = tokenPenalty.get(k);
+  if (!st) return 0;
+  if (Date.now() > st.untilTs) {
+    tokenPenalty.delete(k);
+    return 0;
+  }
+  return st.level || 0;
+}
+
+function register429(token, retryAfterSeconds) {
+  const k = tokenKeyOf(token);
+  const now = Date.now();
+  const cur = tokenPenalty.get(k);
+  const curLevel = cur && now <= cur.untilTs ? cur.level : 0;
+
+  const nextLevel = Math.min(PENALTY_MAX_LEVEL, (curLevel || 0) + 1);
+
+  const baseMs = PENALTY_BASE_SECONDS * 1000;
+  const levelMs = baseMs * (1 + nextLevel * 0.6);
+  const retryMs = (Number(retryAfterSeconds) || 0) * 1000;
+
+  const ttlMs = Math.max(levelMs, retryMs || 0);
+
+  tokenPenalty.set(k, { level: nextLevel, untilTs: now + ttlMs });
+
+  console.warn(
+    `🧯 Adaptive throttle: token=${maskToken(k)} level=${nextLevel} por ~${Math.round(
+      ttlMs / 1000
+    )}s`
+  );
+}
+
+function applyPenalty(lim, token) {
+  const level = getPenaltyLevel(token);
+  if (!level) return lim;
+
+  const factor = 1 + level * 0.3;
+
+  const max = Math.max(1, Math.floor(Number(lim.max || 1) / factor));
+  const ms = Math.max(200, Math.round(Number(lim.ms || 1000) * factor));
+
+  return { max, ms };
+}
+
+function getEffectiveLimit(type, requested, token) {
   const reqMax = Number(requested?.max || 1);
   const reqMs = Number(requested?.ms || 1000);
 
+  let base;
   if (type === "text") {
-    const max = rampedRate(3, Math.min(reqMax, 25), 180);
-    return { max, ms: Math.max(200, reqMs) };
+    base = { max: rampedRate(3, Math.min(reqMax, 25), 180), ms: Math.max(200, reqMs) };
+  } else {
+    base = { max: rampedRate(1, Math.min(reqMax, 8), 300), ms: Math.max(700, reqMs) };
   }
 
-  // mídia
-  const max = rampedRate(1, Math.min(reqMax, 8), 300);
-  return { max, ms: Math.max(700, reqMs) };
+  return applyPenalty(base, token);
 }
 
 const worker = new Worker(
@@ -282,23 +307,37 @@ const worker = new Worker(
       const { type, payload } = job.data || {};
       if (!type) throw new Error("type ausente no job");
 
-      // ramp-up + rate limit
       const lim = job.data?.limit || { max: 1, ms: 1100 };
-      const finalLim = getRampedLimit(type, lim);
-      await waitForRateLimit(job.data?.botToken, finalLim.max, finalLim.ms ?? finalLim.duration ?? finalLim.limitMs);
+      const eff = getEffectiveLimit(type, lim, job.data?.botToken);
+
+      await waitForRateLimit(job.data?.botToken, eff.max, eff.ms);
+
+      const wrapSend = (fn) =>
+        sendWithBackoff(async () => {
+          try {
+            return await fn();
+          } catch (err) {
+            const code = err?.response?.body?.error_code;
+            if (code === 429) {
+              const ra = getRetryAfterSeconds(err);
+              register429(job.data?.botToken, ra);
+            }
+            throw err;
+          }
+        });
 
       switch (type) {
         case "text": {
           const text = payload?.text ?? payload?.mensagem;
           if (!text) throw new Error("payload.text ausente");
-          await sendWithBackoff(() => bot.sendMessage(chatId, text, payload?.options));
+          await wrapSend(() => bot.sendMessage(chatId, text, payload?.options));
           break;
         }
 
         case "audio": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await sendWithBackoff(() =>
+          await wrapSend(() =>
             bot.sendAudio(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) })
           );
           break;
@@ -307,7 +346,7 @@ const worker = new Worker(
         case "video": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await sendWithBackoff(() =>
+          await wrapSend(() =>
             bot.sendVideo(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) })
           );
           break;
@@ -316,7 +355,7 @@ const worker = new Worker(
         case "voice": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await sendWithBackoff(() =>
+          await wrapSend(() =>
             bot.sendVoice(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) })
           );
           break;
@@ -325,14 +364,14 @@ const worker = new Worker(
         case "video_note": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await sendWithBackoff(() => bot.sendVideoNote(chatId, input, { ...(payload?.options || {}) }));
+          await wrapSend(() => bot.sendVideoNote(chatId, input, { ...(payload?.options || {}) }));
           break;
         }
 
         case "photo": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await sendWithBackoff(() =>
+          await wrapSend(() =>
             bot.sendPhoto(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) })
           );
           break;
@@ -341,7 +380,7 @@ const worker = new Worker(
         case "document": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await sendWithBackoff(() =>
+          await wrapSend(() =>
             bot.sendDocument(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) })
           );
           break;
@@ -363,7 +402,7 @@ const worker = new Worker(
       if (err.response?.body) console.error("Detalhe:", err.response.body);
       throw err;
     } finally {
-      // ✅ atualiza status da campanha (se tiver campaignId)
+      // ✅ atualiza status da campanha
       const campaignId = job.data?.campaignId;
       if (campaignId) {
         const key = `campaign:${campaignId}`;
@@ -375,7 +414,6 @@ const worker = new Worker(
         }
       }
 
-      // limpa o arquivo temp baixado pelo worker
       if (tmpToCleanup) safeUnlink(tmpToCleanup);
     }
   },
@@ -384,3 +422,5 @@ const worker = new Worker(
 
 worker.on("failed", (job, err) => console.error("❌ Job falhou:", job?.id, err.message));
 worker.on("error", (err) => console.error("❌ Worker error:", err.message));
+
+console.log("✅ Worker iniciado (fila: disparos)");
