@@ -76,15 +76,12 @@ function safeUnlink(p) {
   } catch {}
 }
 
-async function sleep(ms) {
-  await new Promise((r) => setTimeout(r, ms));
-}
-
-// ===== Download seguro: URL -> /tmp (timeout + limite) =====
+// ===== Download seguro: URL -> /tmp (com timeout e limite) =====
 async function downloadUrlToTmp(url) {
   const u = String(url || "").trim();
   const urlObj = new URL(u);
 
+  // tenta manter extensão
   let ext = path.extname(urlObj.pathname || "");
   if (!ext) ext = ".bin";
 
@@ -93,10 +90,12 @@ async function downloadUrlToTmp(url) {
     `tg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}${ext}`
   );
 
+  // timeout no fetch
   const timeoutMs = Number(process.env.DOWNLOAD_TIMEOUT_MS || 20000);
   const ac = new AbortController();
   const to = setTimeout(() => ac.abort(), timeoutMs);
 
+  // limite de tamanho (evita estourar disco/tempo)
   const maxBytes = Number(process.env.DOWNLOAD_MAX_BYTES || 80 * 1024 * 1024); // 80MB
 
   try {
@@ -106,6 +105,7 @@ async function downloadUrlToTmp(url) {
     const body = r.body;
     if (!body) throw new Error("Resposta sem body ao baixar arquivo");
 
+    // se vier content-length, valida
     const len = Number(r.headers.get("content-length") || 0);
     if (len && len > maxBytes) {
       throw new Error(`Arquivo grande demais: ${len} bytes (max ${maxBytes})`);
@@ -113,6 +113,7 @@ async function downloadUrlToTmp(url) {
 
     const nodeStream = Readable.fromWeb(body);
 
+    // escreve no disco contando bytes (pra limitar sem depender de header)
     let written = 0;
     const ws = fs.createWriteStream(tmpPath);
     nodeStream.on("data", (chunk) => {
@@ -136,7 +137,7 @@ async function downloadUrlToTmp(url) {
 
 /**
  * Resolve input do Telegram:
- * - URL: baixa pra /tmp e manda como ReadStream
+ * - URL: baixa pra /tmp e manda como ReadStream (garante funcionar com url interna)
  * - path local existente: ReadStream
  * - senão: assume file_id do Telegram
  */
@@ -176,82 +177,11 @@ async function waitForRateLimit(token, max, ms) {
     }
 
     const wait = safeMs - (now - arr[0]);
-    await sleep(Math.max(wait, 50));
+    await new Promise((r) => setTimeout(r, Math.max(wait, 50)));
   }
 }
 
-// ===== Backoff 429 =====
-function getRetryAfterSeconds(err) {
-  const ra = err?.response?.body?.parameters?.retry_after;
-  if (Number.isFinite(Number(ra)) && Number(ra) > 0) return Number(ra);
-
-  const msg = String(err?.response?.body?.description || err?.message || "");
-  const m = msg.match(/retry after (\d+)/i);
-  if (m) return Number(m[1]);
-
-  return null;
-}
-
-async function sendWithBackoff(sendFn, opts = {}) {
-  const maxAttempts = Number(opts.maxAttempts || process.env.BACKOFF_MAX_ATTEMPTS || 5);
-  let attempt = 0;
-  let extraBackoffMs = 0;
-
-  while (true) {
-    try {
-      return await sendFn();
-    } catch (err) {
-      const code = err?.response?.body?.error_code;
-      const is429 = code === 429 || /too many requests/i.test(String(err?.message || ""));
-
-      if (!is429) throw err;
-
-      attempt++;
-      const retryAfter = getRetryAfterSeconds(err); // seconds
-      const baseWaitMs = retryAfter ? retryAfter * 1000 : 2000;
-
-      extraBackoffMs = Math.min(10000, extraBackoffMs ? extraBackoffMs * 2 : 500);
-      const waitMs = baseWaitMs + extraBackoffMs;
-
-      console.warn(
-        `🚨 429 (flood). Tentativa ${attempt}/${maxAttempts}. retry_after=${retryAfter ?? "?"}s. Aguardando ${waitMs}ms...`
-      );
-
-      if (attempt >= maxAttempts) throw err;
-
-      await sleep(waitMs);
-    }
-  }
-}
-
-// ===== Ramp-up (subir taxa aos poucos) =====
-const WORKER_STARTED_AT = Date.now();
-
-function rampedRate(base, target, rampSeconds) {
-  const elapsed = (Date.now() - WORKER_STARTED_AT) / 1000;
-  const t = Math.min(1, Math.max(0, elapsed / rampSeconds));
-  return Math.round(base + (target - base) * t);
-}
-
-/**
- * Aplica ramp-up e limites por tipo.
- * - Texto: permite subir até o solicitado (cap 25), em 3 minutos.
- * - Mídia: sobe devagar (cap 8), em 5 minutos, e força ms mínimo.
- */
-function getRampedLimit(type, requested) {
-  const reqMax = Number(requested?.max || 1);
-  const reqMs = Number(requested?.ms || 1000);
-
-  if (type === "text") {
-    const max = rampedRate(3, Math.min(reqMax, 25), 180);
-    return { max, ms: Math.max(200, reqMs) };
-  }
-
-  // mídia
-  const max = rampedRate(1, Math.min(reqMax, 8), 300);
-  return { max, ms: Math.max(700, reqMs) };
-}
-
+// ===== Worker =====
 const worker = new Worker(
   "disparos",
   async (job) => {
@@ -269,11 +199,14 @@ const worker = new Worker(
       const { chatId } = job.data || {};
       if (!chatId) throw new Error("chatId ausente no job");
 
+      const lim = job.data?.limit || { max: 1, ms: 1100 };
+      await waitForRateLimit(job.data?.botToken, lim.max, lim.ms ?? lim.duration ?? lim.limitMs);
+
       const bot = getBot(job.data?.botToken);
 
       // legado
       if (job.data?.mensagem && !job.data?.type) {
-        await sendWithBackoff(() => bot.sendMessage(chatId, job.data.mensagem));
+        await bot.sendMessage(chatId, job.data.mensagem);
         console.log("✅ Enviado (texto legado)!");
         ok = true;
         return;
@@ -282,68 +215,68 @@ const worker = new Worker(
       const { type, payload } = job.data || {};
       if (!type) throw new Error("type ausente no job");
 
-      // ramp-up + rate limit
-      const lim = job.data?.limit || { max: 1, ms: 1100 };
-      const finalLim = getRampedLimit(type, lim);
-      await waitForRateLimit(job.data?.botToken, finalLim.max, finalLim.ms ?? finalLim.duration ?? finalLim.limitMs);
-
       switch (type) {
         case "text": {
           const text = payload?.text ?? payload?.mensagem;
           if (!text) throw new Error("payload.text ausente");
-          await sendWithBackoff(() => bot.sendMessage(chatId, text, payload?.options));
+          await bot.sendMessage(chatId, text, payload?.options);
           break;
         }
 
         case "audio": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await sendWithBackoff(() =>
-            bot.sendAudio(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) })
-          );
+          await bot.sendAudio(chatId, input, {
+            caption: payload?.caption,
+            ...(payload?.options || {}),
+          });
           break;
         }
 
         case "video": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await sendWithBackoff(() =>
-            bot.sendVideo(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) })
-          );
+          await bot.sendVideo(chatId, input, {
+            caption: payload?.caption,
+            ...(payload?.options || {}),
+          });
           break;
         }
 
         case "voice": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await sendWithBackoff(() =>
-            bot.sendVoice(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) })
-          );
+          await bot.sendVoice(chatId, input, {
+            caption: payload?.caption,
+            ...(payload?.options || {}),
+          });
           break;
         }
 
         case "video_note": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await sendWithBackoff(() => bot.sendVideoNote(chatId, input, { ...(payload?.options || {}) }));
+          await bot.sendVideoNote(chatId, input, { ...(payload?.options || {}) });
           break;
         }
 
         case "photo": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await sendWithBackoff(() =>
-            bot.sendPhoto(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) })
-          );
+          await bot.sendPhoto(chatId, input, {
+            caption: payload?.caption,
+            ...(payload?.options || {}),
+          });
           break;
         }
 
         case "document": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await sendWithBackoff(() =>
-            bot.sendDocument(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) })
-          );
+          await bot.sendDocument(chatId, input, {
+            caption: payload?.caption,
+            ...(payload?.options || {}),
+          });
           break;
         }
 
@@ -354,11 +287,6 @@ const worker = new Worker(
       console.log("✅ Enviado!");
       ok = true;
     } catch (err) {
-      const code = err?.response?.body?.error_code;
-      if (code === 429) {
-        const ra = err?.response?.body?.parameters?.retry_after;
-        console.error("🚨 429 flood control. retry_after:", ra);
-      }
       console.error("❌ Telegram erro:", err.message);
       if (err.response?.body) console.error("Detalhe:", err.response.body);
       throw err;
