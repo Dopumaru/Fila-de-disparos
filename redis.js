@@ -1,14 +1,23 @@
-// redis.js
-require("dotenv").config();
+const IORedis = require("ioredis");
 
-const url = (process.env.REDIS_URL || "").trim();
-if (url) module.exports = url; // BullMQ e ioredis aceitam string
-
-module.exports = {
-  host: process.env.REDIS_HOST,
+const redis = new IORedis({
+  host: process.env.REDIS_HOST || "127.0.0.1",
   port: Number(process.env.REDIS_PORT) || 6379,
-  username: process.env.REDIS_USERNAME || "default",
-  password: process.env.REDIS_PASSWORD,
+  password: process.env.REDIS_PASSWORD || undefined,
   maxRetriesPerRequest: null,
   enableReadyCheck: true,
-};
+});
+
+redis.on("connect", () => {
+  console.log(
+    `✅ Redis conectado em ${process.env.REDIS_HOST || "127.0.0.1"}:${
+      process.env.REDIS_PORT || 6379
+    }`
+  );
+});
+
+redis.on("error", (err) => {
+  console.error("❌ Erro no Redis:", err.message);
+});
+
+module.exports = redis;
