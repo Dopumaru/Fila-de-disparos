@@ -74,7 +74,6 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage,
   limits: {
-    // ajuste se quiser (em bytes)
     fileSize: Number(process.env.UPLOAD_MAX_BYTES || 50 * 1024 * 1024), // 50MB default
   },
 });
@@ -116,12 +115,18 @@ function detectDelimiter(text) {
 }
 
 function parseCsvRows(text) {
-  const src = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  // remove BOM (UTF-8 BOM) e normaliza quebras
+  const src = String(text || "")
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+
   const delim = detectDelimiter(src);
 
   const lines = src
     .split("\n")
-    .map((l) => l.replace(/\uFEFF/g, ""))
+    .map((l) => l.replace(/\uFEFF/g, "")) // reforço anti-bom
+    .map((l) => l.trimEnd())
     .filter((l) => l.trim().length > 0);
 
   const rows = [];
@@ -159,10 +164,32 @@ function parseCsvRows(text) {
   return rows;
 }
 
+/**
+ * Constrói items:
+ * - Se tiver header + dados: items = [{col0, col1, ... , <headers normalizados>...}]
+ * - Se for lista simples (só IDs): items = [{col0: "id"}...]
+ */
 function buildRowObjectsFromCsv(text) {
   const rows = parseCsvRows(text);
   if (!rows.length) return { headers: [], items: [] };
 
+  // caso lista simples: 1 coluna e (a) 1 linha OU (b) várias linhas sem header
+  // Vamos detectar se a primeira linha parece header:
+  // - se tem letras (a-z) -> provavelmente header
+  // - se é só número/-,_ etc -> provavelmente dado
+  const firstCell = String(rows[0]?.[0] ?? "").trim();
+  const looksLikeHeader = /[a-zA-Z]/.test(firstCell);
+
+  // Se não parecer header, tratamos TUDO como dados (lista simples)
+  if (!looksLikeHeader) {
+    const items = rows
+      .map((r) => String(r?.[0] ?? "").trim())
+      .filter((v) => v.length > 0)
+      .map((v) => ({ col0: v }));
+    return { headers: ["col0"], items };
+  }
+
+  // modo normal (header + linhas)
   const headersRaw = rows[0] || [];
   const headers = headersRaw.map((h, idx) => normalizeKey(h) || `col${idx}`);
 
@@ -173,6 +200,8 @@ function buildRowObjectsFromCsv(text) {
     for (let c = 0; c < headers.length; c++) {
       const key = headers[c] || `col${c}`;
       obj[key] = (r[c] ?? "").toString().trim();
+      // também mantém colunas por índice (col0, col1...) pra facilitar
+      obj[`col${c}`] = (r[c] ?? "").toString().trim();
     }
     items.push(obj);
   }
@@ -248,10 +277,6 @@ app.post(
       const limitMs = Number(req.body.limitMs || 1100);
       const fileUrl = (req.body.fileUrl || "").trim();
 
-      // ⚠️ idColumn agora é IGNORADO — sempre usamos col0 (primeira coluna)
-      // const idColumnRaw = (req.body.idColumn || "chatId").trim();
-      // const idColumn = normalizeKey(idColumnRaw) || "chatid";
-
       let buttons = [];
       try {
         buttons = JSON.parse(req.body.buttons || "[]");
@@ -261,15 +286,9 @@ app.post(
 
       if (!botToken) return res.status(400).json({ ok: false, error: "botToken é obrigatório." });
       if (!type) return res.status(400).json({ ok: false, error: "type é obrigatório." });
-      if (!(limitMax >= 1) || !(limitMs >= 200)) {
-        return res.status(400).json({ ok: false, error: "limitMax>=1 e limitMs>=200." });
-      }
 
       if (type === "text" && !String(captionTemplate).trim()) {
-        return res.status(400).json({
-          ok: false,
-          error: "Para text, caption (mensagem) é obrigatório.",
-        });
+        return res.status(400).json({ ok: false, error: "Para text, caption (mensagem) é obrigatório." });
       }
 
       const mediaFile = req.files?.file?.[0] || null;
@@ -286,10 +305,7 @@ app.post(
           });
         }
         if (fileUrl && !isHttpUrl(fileUrl)) {
-          return res.status(400).json({
-            ok: false,
-            error: "fileUrl inválida (precisa http/https).",
-          });
+          return res.status(400).json({ ok: false, error: "fileUrl inválida (precisa http/https)." });
         }
       }
 
@@ -302,9 +318,7 @@ app.post(
 
       const options = buildOptionsFromButtons(buttons, botUsername);
 
-      // ✅ Fonte da mídia:
-      // - se veio fileUrl, usa ela
-      // - se veio upload, transforma em URL /uploads/arquivo.ext (worker baixa por URL)
+      // Fonte da mídia
       const isUpload = !!mediaFile && !fileUrl;
       let mediaSource = fileUrl || null;
 
@@ -313,8 +327,6 @@ app.post(
         const internalHost = (process.env.API_INTERNAL_HOST || "api-disparos").trim();
         const filename = path.basename(mediaFile.path);
         mediaSource = `http://${internalHost}:${PORT}/uploads/${encodeURIComponent(filename)}`;
-
-        // opcional: limpar arquivo depois de um tempo (evita lotar disco)
         scheduleDelete(mediaFile.path);
       }
 
@@ -323,10 +335,12 @@ app.post(
       const { items } = buildRowObjectsFromCsv(csvText);
       if (!items.length) return res.status(400).json({ ok: false, error: "CSV vazio ou inválido." });
 
-      // ✅ chatId SEMPRE da primeira coluna do CSV (col0)
+      // agora sempre usa a primeira coluna do CSV:
+      // - no modo header: col0 vem do item.col0 (que a gente preencheu)
+      // - no modo lista simples: item.col0 já é o id
       let leads = [];
       for (const row of items) {
-        const chatId = String(row["col0"] || "").trim();
+        const chatId = String(row?.col0 || "").trim();
         if (!chatId) continue;
         leads.push({ chatId, vars: row });
       }
@@ -334,7 +348,7 @@ app.post(
       if (!leads.length) {
         return res.status(400).json({
           ok: false,
-          error: "Não encontrei IDs na primeira coluna do CSV (coluna A / col0).",
+          error: `Não encontrei IDs na primeira coluna do CSV (coluna A / col0).`,
         });
       }
 
@@ -361,7 +375,7 @@ app.post(
                 limit: { max: limitMax, ms: limitMs },
                 type,
                 payload: {
-                  file: mediaSource, // ✅ URL
+                  file: mediaSource,
                   caption: finalCaption || "",
                   options,
                 },
@@ -371,26 +385,20 @@ app.post(
         total++;
       }
 
-      // apaga CSV upload
-      try {
-        if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
-      } catch {}
+      try { if (csvPathToDelete) fs.unlinkSync(csvPathToDelete); } catch {}
 
       return res.json({
         ok: true,
         total,
         buttons: buttons.length,
         source: "csv",
-        idColumn: "col0", // ✅ fixo
         unique: leads.length,
         media: type === "text" ? null : fileUrl ? "url" : "upload-url",
         mediaSource: type === "text" ? null : mediaSource,
       });
     } catch (err) {
       console.error("❌ /disparar erro:", err.message);
-      try {
-        if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
-      } catch {}
+      try { if (csvPathToDelete) fs.unlinkSync(csvPathToDelete); } catch {}
       return res.status(500).json({ ok: false, error: "Erro interno" });
     }
   }
