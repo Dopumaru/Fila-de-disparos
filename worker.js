@@ -14,6 +14,27 @@ if (!DEFAULT_TOKEN) {
   console.warn("⚠️ TELEGRAM_BOT_TOKEN não definido (ok se você sempre mandar botToken no job).");
 }
 
+// ===== Campaign helpers (Redis keys) =====
+function cKey(id, suffix) {
+  return `campaign:${id}:${suffix}`;
+}
+
+async function isCampaignPaused(campaignId) {
+  if (!campaignId) return false;
+  const v = await connection.get(cKey(campaignId, "paused"));
+  return String(v || "0") === "1";
+}
+
+async function incCampaignSent(campaignId) {
+  if (!campaignId) return;
+  await connection.hincrby(cKey(campaignId, "counts"), "sent", 1);
+}
+
+async function incCampaignFailed(campaignId) {
+  if (!campaignId) return;
+  await connection.hincrby(cKey(campaignId, "counts"), "failed", 1);
+}
+
 // cache de bots por token
 const botCache = new Map();
 function getBot(token) {
@@ -37,7 +58,9 @@ function isHttpUrl(u) {
 }
 
 function safeUnlink(p) {
-  try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch {}
+  try {
+    if (p && fs.existsSync(p)) fs.unlinkSync(p);
+  } catch {}
 }
 
 // baixa URL (inclusive interna do docker) -> salva em /tmp -> retorna caminho
@@ -115,13 +138,29 @@ async function waitForRateLimit(token, max, ms) {
   }
 }
 
+const PAUSE_RETRY_MS = Number(process.env.CAMPAIGN_PAUSE_RETRY_MS || 2000);
+
 const worker = new Worker(
   "disparos",
   async (job) => {
     let tmpToCleanup = null;
+    const campaignId = job.data?.campaignId || null;
 
     try {
+      // ✅ pausa por campanha (não trava o worker)
+      if (campaignId) {
+        const paused = await isCampaignPaused(campaignId);
+        if (paused) {
+          // joga o job pra frente e sai sem erro
+          const delayMs = Math.max(500, PAUSE_RETRY_MS);
+          await job.moveToDelayed(Date.now() + delayMs);
+          console.log("⏸️ Campaign pausada. Job adiado:", job.id, "campaignId:", campaignId);
+          return;
+        }
+      }
+
       console.log("Recebi job:", job.id, {
+        campaignId: campaignId || undefined,
         chatId: job.data?.chatId,
         type: job.data?.type,
         token: maskToken(job.data?.botToken),
@@ -138,6 +177,7 @@ const worker = new Worker(
       // legado
       if (job.data?.mensagem && !job.data?.type) {
         await bot.sendMessage(chatId, job.data.mensagem);
+        await incCampaignSent(campaignId);
         console.log("✅ Enviado (texto legado)!");
         return;
       }
@@ -199,10 +239,15 @@ const worker = new Worker(
           throw new Error(`type inválido: ${type}`);
       }
 
+      await incCampaignSent(campaignId);
       console.log("✅ Enviado!");
     } catch (err) {
       console.error("❌ Telegram erro:", err.message);
       if (err.response?.body) console.error("Detalhe:", err.response.body);
+
+      // ✅ marca failed no progresso (somente erro real)
+      await incCampaignFailed(campaignId);
+
       throw err;
     } finally {
       // limpa o arquivo temp baixado pelo worker
