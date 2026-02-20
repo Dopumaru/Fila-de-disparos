@@ -38,7 +38,9 @@ const UPLOAD_DIR =
   ensureDirWritable("/tmp/uploads");
 
 if (!UPLOAD_DIR) {
-  throw new Error("Nenhum diretório de upload gravável. Configure UPLOAD_DIR para um caminho com permissão.");
+  throw new Error(
+    "Nenhum diretório de upload gravável. Configure UPLOAD_DIR para um caminho com permissão."
+  );
 }
 
 console.log("📁 Upload dir:", UPLOAD_DIR);
@@ -57,7 +59,8 @@ const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname || "");
-    const name = Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8) + ext;
+    const name =
+      Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8) + ext;
     cb(null, name);
   },
 });
@@ -65,22 +68,45 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage,
   limits: {
-    fileSize: Number(process.env.UPLOAD_MAX_BYTES || 50 * 1024 * 1024),
+    fileSize: Number(process.env.UPLOAD_MAX_BYTES || 50 * 1024 * 1024), // 50MB default
   },
 });
 
-// ===== BullMQ Queue =====
 const queue = new Queue("disparos", { connection });
 
-// ===== ✅ Redis (status campanha) — usa REDIS_URL =====
-const REDIS_URL = (process.env.REDIS_URL || "").trim();
-if (!REDIS_URL) {
-  throw new Error("REDIS_URL não definido. Defina (ex): redis://default:SENHA@redis-fila:6379/0");
+// ===== ✅ Redis client (para status de campanha) =====
+function buildRedisUrlFromConnection(conn) {
+  if (!conn) return null;
+  if (typeof conn === "string") return conn; // se seu redis.js exporta uma URL
+  const host = conn.host || conn.hostname;
+  const port = conn.port || 6379;
+  if (!host) return null;
+
+  // suporte opcional a senha/db se existirem no objeto
+  const password = conn.password ? encodeURIComponent(conn.password) : null;
+  const db = Number.isFinite(conn.db) ? conn.db : null;
+
+  let auth = "";
+  if (password) auth = `:${password}@`;
+
+  let url = `redis://${auth}${host}:${port}`;
+  if (db != null) url += `/${db}`;
+  return url;
 }
 
-const redis = new IORedis(REDIS_URL, { maxRetriesPerRequest: null });
-redis.on("error", (e) => console.error("❌ Redis(status) error:", e.message));
-redis.on("connect", () => console.log("✅ Redis(status) conectado via", REDIS_URL));
+const REDIS_URL =
+  (process.env.REDIS_URL && process.env.REDIS_URL.trim()) ||
+  buildRedisUrlFromConnection(connection);
+
+if (!REDIS_URL) {
+  throw new Error(
+    "REDIS_URL não definido e não foi possível inferir pelo connection. Defina REDIS_URL (ex: redis://redis-fila:6379)."
+  );
+}
+
+const redis = new IORedis(REDIS_URL);
+redis.on("error", (e) => console.error("❌ Redis error:", e.message));
+redis.on("connect", () => console.log("✅ Redis (status) conectado via", REDIS_URL));
 
 // ===== Utils =====
 function isHttpUrl(u) {
@@ -220,10 +246,10 @@ function buildOptionsFromButtons(buttons, botUsername) {
   return { reply_markup: { inline_keyboard } };
 }
 
-// ✅ opcional: limpeza automática depois de X minutos
+// ✅ opcional: limpeza automática depois de X minutos (evita encher disco)
 function scheduleDelete(filePath) {
   const minutes = Number(process.env.UPLOAD_TTL_MINUTES || 180);
-  if (!minutes || minutes <= 0) return;
+  if (!minutes || minutes <= 0) return; // desliga se 0
   setTimeout(() => {
     try {
       if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
@@ -231,11 +257,19 @@ function scheduleDelete(filePath) {
   }, minutes * 60 * 1000);
 }
 
-// ===== Health =====
+// ===== 10) Health real =====
 app.get("/health", async (_req, res) => {
   try {
     const ping = await redis.ping();
-    const counts = await queue.getJobCounts("waiting", "active", "completed", "failed", "delayed", "paused");
+
+    const counts = await queue.getJobCounts(
+      "waiting",
+      "active",
+      "completed",
+      "failed",
+      "delayed",
+      "paused"
+    );
 
     let uploadWritable = false;
     try {
@@ -261,8 +295,8 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-// Rota raiz
-app.get("/", (_req, res) => {
+// Rota raiz: abre o painel
+app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "..", "public", "index.html"));
 });
 
@@ -273,7 +307,9 @@ app.get("/campaign/:id/status", async (req, res) => {
     const key = `campaign:${id}`;
     const data = await redis.hgetall(key);
 
-    if (!data || !data.id) return res.status(404).json({ ok: false, error: "campaign_not_found" });
+    if (!data || !data.id) {
+      return res.status(404).json({ ok: false, error: "campaign_not_found" });
+    }
 
     const total = Number(data.total || 0);
     const sent = Number(data.sent || 0);
@@ -291,7 +327,10 @@ app.get("/campaign/:id/status", async (req, res) => {
       done,
       progress: total > 0 ? done / total : 0,
       createdAt: data.createdAt ? Number(data.createdAt) : null,
-      meta: { type: data.type || null, idColumn: data.idColumn || null },
+      meta: {
+        type: data.type || null,
+        idColumn: data.idColumn || null,
+      },
     });
   } catch (e) {
     console.error("❌ campaign status error:", e.message);
@@ -299,7 +338,7 @@ app.get("/campaign/:id/status", async (req, res) => {
   }
 });
 
-// ===== PAUSE/RESUME =====
+// ===== PAUSE/RESUME GLOBAL DA FILA =====
 app.post("/queue/pause", async (_req, res) => {
   try {
     await queue.pause();
@@ -330,23 +369,36 @@ app.get("/queue/status", async (_req, res) => {
   }
 });
 
-// ===== validações =====
-const ALLOWED_TYPES = new Set(["text", "photo", "video", "audio", "voice", "document", "video_note"]);
+// ===== 7) Validações extras =====
+const ALLOWED_TYPES = new Set([
+  "text",
+  "photo",
+  "video",
+  "audio",
+  "voice",
+  "document",
+  "video_note",
+]);
+
 const allowedByType = {
   photo: [".jpg", ".jpeg", ".png", ".webp"],
   video: [".mp4", ".mov", ".mkv", ".webm"],
   audio: [".mp3", ".m4a", ".wav", ".ogg"],
   voice: [".ogg"],
   video_note: [".mp4"],
-  document: [],
+  document: [], // deixa livre (PDF/ZIP/etc). Se quiser travar, coloque lista.
 };
 
-// ===== 9) Retenção de jobs =====
-const RETAIN_COMPLETED = Number(process.env.RETAIN_COMPLETED || 2000);
-const RETAIN_FAILED = Number(process.env.RETAIN_FAILED || 5000);
+// ===== 9) Retenção de jobs (BullMQ) =====
+// Ajuste fino via env (opcional). Defaults seguros.
+const RETAIN_COMPLETED = Number(process.env.RETAIN_COMPLETED || 2000); // últimos 2000 concluídos
+const RETAIN_FAILED = Number(process.env.RETAIN_FAILED || 5000); // últimos 5000 falhados
+
 function jobRetentionOptions() {
+  // BullMQ aceita count/age; aqui usamos count (mais garantido)
   const completed = Number.isFinite(RETAIN_COMPLETED) && RETAIN_COMPLETED > 0 ? RETAIN_COMPLETED : 2000;
   const failed = Number.isFinite(RETAIN_FAILED) && RETAIN_FAILED > 0 ? RETAIN_FAILED : 5000;
+
   return {
     removeOnComplete: { count: completed },
     removeOnFail: { count: failed },
@@ -356,7 +408,10 @@ function jobRetentionOptions() {
 // ===== ROUTE =====
 app.post(
   "/disparar",
-  upload.fields([{ name: "file", maxCount: 1 }, { name: "csv", maxCount: 1 }]),
+  upload.fields([
+    { name: "file", maxCount: 1 },
+    { name: "csv", maxCount: 1 },
+  ]),
   async (req, res) => {
     let csvPathToDelete = null;
 
@@ -378,10 +433,17 @@ app.post(
         return res.status(400).json({ ok: false, error: "buttons precisa ser JSON." });
       }
 
+      // ===== validações base =====
       if (!botToken) return res.status(400).json({ ok: false, error: "botToken é obrigatório." });
       if (!type) return res.status(400).json({ ok: false, error: "type é obrigatório." });
+
+      // ✅ valida type permitido
       if (!ALLOWED_TYPES.has(type)) {
-        return res.status(400).json({ ok: false, error: `type inválido: ${type}`, allowed: Array.from(ALLOWED_TYPES) });
+        return res.status(400).json({
+          ok: false,
+          error: `type inválido: ${type}`,
+          allowed: Array.from(ALLOWED_TYPES),
+        });
       }
 
       if (!(limitMax >= 1) || !(limitMs >= 200)) {
@@ -389,9 +451,12 @@ app.post(
       }
 
       if (type === "text" && !String(captionTemplate).trim()) {
-        return res.status(400).json({ ok: false, error: "Para text, caption (mensagem) é obrigatório." });
+        return res
+          .status(400)
+          .json({ ok: false, error: "Para text, caption (mensagem) é obrigatório." });
       }
 
+      // ✅ fileUrl sanity
       if (fileUrl && fileUrl.length > 2000) {
         return res.status(400).json({ ok: false, error: "fileUrl muito longa." });
       }
@@ -404,18 +469,27 @@ app.post(
 
       if (type !== "text") {
         if (!mediaFile && !fileUrl) {
-          return res.status(400).json({ ok: false, error: "Para mídia/documento, envie file (upload) OU preencha fileUrl (http/https)." });
+          return res.status(400).json({
+            ok: false,
+            error: "Para mídia/documento, envie file (upload) OU preencha fileUrl (http/https).",
+          });
         }
         if (fileUrl && !isHttpUrl(fileUrl)) {
           return res.status(400).json({ ok: false, error: "fileUrl inválida (precisa http/https)." });
         }
       }
 
+      // ✅ valida extensão do upload por type (quando aplicável)
       if (type !== "text" && mediaFile) {
         const ext = path.extname(mediaFile.originalname || "").toLowerCase();
         const list = allowedByType[type] || [];
         if (list.length && !list.includes(ext)) {
-          return res.status(400).json({ ok: false, error: `Arquivo inválido para type='${type}'.`, receivedExt: ext, allowedExt: list });
+          return res.status(400).json({
+            ok: false,
+            error: `Arquivo inválido para type='${type}'.`,
+            receivedExt: ext,
+            allowedExt: list,
+          });
         }
       }
 
@@ -428,7 +502,7 @@ app.post(
 
       const options = buildOptionsFromButtons(buttons, botUsername);
 
-      // ✅ Fonte da mídia
+      // ✅ Fonte da mídia:
       const isUpload = !!mediaFile && !fileUrl;
       let mediaSource = fileUrl || null;
 
@@ -436,6 +510,7 @@ app.post(
         const PORT = process.env.PORT || 3000;
         const internalHost = (process.env.API_INTERNAL_HOST || "api-disparos").trim();
 
+        // aviso útil (não quebra)
         if (!process.env.API_INTERNAL_HOST) {
           console.warn("⚠️ API_INTERNAL_HOST não definido. Worker pode não conseguir acessar /uploads.");
         }
@@ -445,15 +520,20 @@ app.post(
         scheduleDelete(mediaFile.path);
       }
 
-      // ===== LEADS =====
+      // ===== LEADS via CSV =====
       const csvText = fs.readFileSync(csvFile.path, "utf8");
       const { headers, items } = buildRowObjectsFromCsv(csvText);
       if (!items.length) return res.status(400).json({ ok: false, error: "CSV vazio ou inválido." });
 
+      // ✅ valida se existe alguma coluna “ID” conhecida no header
       const possibleIdCols = new Set([idColumn, "chatid", "chat_id", "id", "col0"]);
       const hasAnyIdCol = headers.some((h) => possibleIdCols.has(h));
       if (!hasAnyIdCol) {
-        return res.status(400).json({ ok: false, error: `CSV não contém coluna de ID válida. Tentativas: ${Array.from(possibleIdCols).join(", ")}`, headersEncontrados: headers });
+        return res.status(400).json({
+          ok: false,
+          error: `CSV não contém coluna de ID válida. Tentativas: ${Array.from(possibleIdCols).join(", ")}`,
+          headersEncontrados: headers,
+        });
       }
 
       let leads = [];
@@ -468,10 +548,13 @@ app.post(
       }
 
       if (!leads.length) {
-        return res.status(400).json({ ok: false, error: `Não encontrei IDs no CSV. Verifique a coluna "${idColumnRaw}" (ex: chatId).` });
+        return res.status(400).json({
+          ok: false,
+          error: `Não encontrei IDs no CSV. Verifique a coluna "${idColumnRaw}" (ex: chatId).`,
+        });
       }
 
-      // dedupe
+      // remove duplicados
       const seen = new Set();
       leads = leads.filter((l) => (seen.has(l.chatId) ? false : (seen.add(l.chatId), true)));
 
@@ -492,21 +575,41 @@ app.post(
       });
       await redis.pexpire(campaignKey, 7 * 24 * 60 * 60 * 1000);
 
+      let total = 0;
       const retention = jobRetentionOptions();
 
-      let total = 0;
       for (const lead of leads) {
         const finalCaption = applyTemplate(captionTemplate, lead.vars);
 
         const jobData =
           type === "text"
-            ? { chatId: lead.chatId, botToken, limit: { max: limitMax, ms: limitMs }, type: "text", campaignId, payload: { text: finalCaption, options } }
-            : { chatId: lead.chatId, botToken, limit: { max: limitMax, ms: limitMs }, type, campaignId, payload: { file: mediaSource, caption: finalCaption || "", options } };
+            ? {
+                chatId: lead.chatId,
+                botToken,
+                limit: { max: limitMax, ms: limitMs },
+                type: "text",
+                campaignId,
+                payload: { text: finalCaption, options },
+              }
+            : {
+                chatId: lead.chatId,
+                botToken,
+                limit: { max: limitMax, ms: limitMs },
+                type,
+                campaignId,
+                payload: {
+                  file: mediaSource,
+                  caption: finalCaption || "",
+                  options,
+                },
+              };
 
+        // ✅ Passo 9: retenção de jobs
         await queue.add("envio", jobData, retention);
         total++;
       }
 
+      // apaga CSV upload
       try {
         if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
       } catch {}
@@ -521,7 +624,10 @@ app.post(
         unique: leads.length,
         media: type === "text" ? null : fileUrl ? "url" : "upload-url",
         mediaSource: type === "text" ? null : mediaSource,
-        retention: { completed: retention.removeOnComplete?.count, failed: retention.removeOnFail?.count },
+        retention: {
+          completed: retention.removeOnComplete?.count,
+          failed: retention.removeOnFail?.count,
+        },
       });
     } catch (err) {
       console.error("❌ /disparar erro:", err);
