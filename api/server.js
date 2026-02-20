@@ -59,7 +59,8 @@ const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname || "");
-    const name = Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8) + ext;
+    const name =
+      Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8) + ext;
     cb(null, name);
   },
 });
@@ -74,9 +75,38 @@ const upload = multer({
 const queue = new Queue("disparos", { connection });
 
 // ===== ✅ Redis client (para status de campanha) =====
-const redis = new IORedis(connection);
-redis.on("error", (e) => console.error("❌ Redis (status) error:", e.message));
-redis.on("connect", () => console.log("✅ Redis (status) conectado"));
+function buildRedisUrlFromConnection(conn) {
+  if (!conn) return null;
+  if (typeof conn === "string") return conn; // se seu redis.js exporta uma URL
+  const host = conn.host || conn.hostname;
+  const port = conn.port || 6379;
+  if (!host) return null;
+
+  // suporte opcional a senha/db se existirem no objeto
+  const password = conn.password ? encodeURIComponent(conn.password) : null;
+  const db = Number.isFinite(conn.db) ? conn.db : null;
+
+  let auth = "";
+  if (password) auth = `:${password}@`;
+
+  let url = `redis://${auth}${host}:${port}`;
+  if (db != null) url += `/${db}`;
+  return url;
+}
+
+const REDIS_URL =
+  (process.env.REDIS_URL && process.env.REDIS_URL.trim()) ||
+  buildRedisUrlFromConnection(connection);
+
+if (!REDIS_URL) {
+  throw new Error(
+    "REDIS_URL não definido e não foi possível inferir pelo connection. Defina REDIS_URL (ex: redis://redis-fila:6379)."
+  );
+}
+
+const redis = new IORedis(REDIS_URL);
+redis.on("error", (e) => console.error("❌ Redis error:", e.message));
+redis.on("connect", () => console.log("✅ Redis (status) conectado via", REDIS_URL));
 
 // ===== Utils =====
 function isHttpUrl(u) {
@@ -94,8 +124,8 @@ function normalizeKey(k) {
 function applyTemplate(template, rowObj) {
   const t = String(template || "");
   return t.replace(/\{(\w+)\}/g, (_, key) => {
-    const kk = normalizeKey(key);
-    const v = rowObj?.[kk];
+    const k = normalizeKey(key);
+    const v = rowObj?.[k];
     return v == null ? "" : String(v);
   });
 }
@@ -219,7 +249,7 @@ function buildOptionsFromButtons(buttons, botUsername) {
 // ✅ opcional: limpeza automática depois de X minutos (evita encher disco)
 function scheduleDelete(filePath) {
   const minutes = Number(process.env.UPLOAD_TTL_MINUTES || 180);
-  if (!minutes || minutes <= 0) return;
+  if (!minutes || minutes <= 0) return; // desliga se 0
   setTimeout(() => {
     try {
       if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
@@ -227,7 +257,7 @@ function scheduleDelete(filePath) {
   }, minutes * 60 * 1000);
 }
 
-// ===== Health =====
+// ===== 10) Health real =====
 app.get("/health", async (_req, res) => {
   try {
     const ping = await redis.ping();
@@ -266,7 +296,7 @@ app.get("/health", async (_req, res) => {
 });
 
 // Rota raiz: abre o painel
-app.get("/", (_req, res) => {
+app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "..", "public", "index.html"));
 });
 
@@ -339,7 +369,7 @@ app.get("/queue/status", async (_req, res) => {
   }
 });
 
-// ===== Validações =====
+// ===== 7) Validações extras =====
 const ALLOWED_TYPES = new Set([
   "text",
   "photo",
@@ -356,20 +386,18 @@ const allowedByType = {
   audio: [".mp3", ".m4a", ".wav", ".ogg"],
   voice: [".ogg"],
   video_note: [".mp4"],
-  document: [],
+  document: [], // deixa livre (PDF/ZIP/etc). Se quiser travar, coloque lista.
 };
 
-// ===== Retenção de jobs =====
-const RETAIN_COMPLETED = Number(process.env.RETAIN_COMPLETED || 2000);
-const RETAIN_FAILED = Number(process.env.RETAIN_FAILED || 5000);
+// ===== 9) Retenção de jobs (BullMQ) =====
+// Ajuste fino via env (opcional). Defaults seguros.
+const RETAIN_COMPLETED = Number(process.env.RETAIN_COMPLETED || 2000); // últimos 2000 concluídos
+const RETAIN_FAILED = Number(process.env.RETAIN_FAILED || 5000); // últimos 5000 falhados
 
 function jobRetentionOptions() {
-  const completed =
-    Number.isFinite(RETAIN_COMPLETED) && RETAIN_COMPLETED > 0
-      ? RETAIN_COMPLETED
-      : 2000;
-  const failed =
-    Number.isFinite(RETAIN_FAILED) && RETAIN_FAILED > 0 ? RETAIN_FAILED : 5000;
+  // BullMQ aceita count/age; aqui usamos count (mais garantido)
+  const completed = Number.isFinite(RETAIN_COMPLETED) && RETAIN_COMPLETED > 0 ? RETAIN_COMPLETED : 2000;
+  const failed = Number.isFinite(RETAIN_FAILED) && RETAIN_FAILED > 0 ? RETAIN_FAILED : 5000;
 
   return {
     removeOnComplete: { count: completed },
@@ -377,7 +405,7 @@ function jobRetentionOptions() {
   };
 }
 
-// ===== ROUTE /disparar =====
+// ===== ROUTE =====
 app.post(
   "/disparar",
   upload.fields([
@@ -402,17 +430,14 @@ app.post(
       try {
         buttons = JSON.parse(req.body.buttons || "[]");
       } catch {
-        return res
-          .status(400)
-          .json({ ok: false, error: "buttons precisa ser JSON." });
+        return res.status(400).json({ ok: false, error: "buttons precisa ser JSON." });
       }
 
-      // validações base
-      if (!botToken)
-        return res.status(400).json({ ok: false, error: "botToken é obrigatório." });
-      if (!type)
-        return res.status(400).json({ ok: false, error: "type é obrigatório." });
+      // ===== validações base =====
+      if (!botToken) return res.status(400).json({ ok: false, error: "botToken é obrigatório." });
+      if (!type) return res.status(400).json({ ok: false, error: "type é obrigatório." });
 
+      // ✅ valida type permitido
       if (!ALLOWED_TYPES.has(type)) {
         return res.status(400).json({
           ok: false,
@@ -426,12 +451,12 @@ app.post(
       }
 
       if (type === "text" && !String(captionTemplate).trim()) {
-        return res.status(400).json({
-          ok: false,
-          error: "Para text, caption (mensagem) é obrigatório.",
-        });
+        return res
+          .status(400)
+          .json({ ok: false, error: "Para text, caption (mensagem) é obrigatório." });
       }
 
+      // ✅ fileUrl sanity
       if (fileUrl && fileUrl.length > 2000) {
         return res.status(400).json({ ok: false, error: "fileUrl muito longa." });
       }
@@ -439,8 +464,7 @@ app.post(
       const mediaFile = req.files?.file?.[0] || null;
       const csvFile = req.files?.csv?.[0] || null;
 
-      if (!csvFile)
-        return res.status(400).json({ ok: false, error: "Envie o CSV no campo csv." });
+      if (!csvFile) return res.status(400).json({ ok: false, error: "Envie o CSV no campo csv." });
       csvPathToDelete = csvFile.path;
 
       if (type !== "text") {
@@ -455,6 +479,7 @@ app.post(
         }
       }
 
+      // ✅ valida extensão do upload por type (quando aplicável)
       if (type !== "text" && mediaFile) {
         const ext = path.extname(mediaFile.originalname || "").toLowerCase();
         const list = allowedByType[type] || [];
@@ -477,7 +502,7 @@ app.post(
 
       const options = buildOptionsFromButtons(buttons, botUsername);
 
-      // Fonte da mídia:
+      // ✅ Fonte da mídia:
       const isUpload = !!mediaFile && !fileUrl;
       let mediaSource = fileUrl || null;
 
@@ -485,6 +510,7 @@ app.post(
         const PORT = process.env.PORT || 3000;
         const internalHost = (process.env.API_INTERNAL_HOST || "api-disparos").trim();
 
+        // aviso útil (não quebra)
         if (!process.env.API_INTERNAL_HOST) {
           console.warn("⚠️ API_INTERNAL_HOST não definido. Worker pode não conseguir acessar /uploads.");
         }
@@ -494,11 +520,12 @@ app.post(
         scheduleDelete(mediaFile.path);
       }
 
-      // LEADS via CSV
+      // ===== LEADS via CSV =====
       const csvText = fs.readFileSync(csvFile.path, "utf8");
       const { headers, items } = buildRowObjectsFromCsv(csvText);
       if (!items.length) return res.status(400).json({ ok: false, error: "CSV vazio ou inválido." });
 
+      // ✅ valida se existe alguma coluna “ID” conhecida no header
       const possibleIdCols = new Set([idColumn, "chatid", "chat_id", "id", "col0"]);
       const hasAnyIdCol = headers.some((h) => possibleIdCols.has(h));
       if (!hasAnyIdCol) {
@@ -531,7 +558,7 @@ app.post(
       const seen = new Set();
       leads = leads.filter((l) => (seen.has(l.chatId) ? false : (seen.add(l.chatId), true)));
 
-      // CAMPANHA
+      // ===== CAMPANHA =====
       const campaignId = crypto.randomUUID();
       const campaignKey = `campaign:${campaignId}`;
       const createdAt = Date.now();
@@ -577,6 +604,7 @@ app.post(
                 },
               };
 
+        // ✅ Passo 9: retenção de jobs
         await queue.add("envio", jobData, retention);
         total++;
       }
