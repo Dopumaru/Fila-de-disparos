@@ -1,21 +1,10 @@
 const API_URL = "/disparar";
 
-// ===== NOVO: endpoints auxiliares =====
-const STATUS_URL = (id) => `/campaign/${encodeURIComponent(id)}/status`;
-const QUEUE_STATUS_URL = "/queue/status";
-const QUEUE_PAUSE_URL = "/queue/pause";
-const QUEUE_RESUME_URL = "/queue/resume";
-
 const state = {
   tokens: [],
   selectedTokenId: null,
   isSending: false,
   isValidating: false,
-
-  // ===== NOVO: campanha atual =====
-  campaignId: null,
-  pollTimer: null,
-  lastStatus: null,
 };
 
 function uid() {
@@ -161,113 +150,6 @@ function isHttpUrl(u) {
   return /^https?:\/\//i.test(String(u || "").trim());
 }
 
-// ===== NOVO: helpers campanha/queue =====
-async function fetchJson(url, opts) {
-  const res = await fetch(url, opts);
-  const data = await res.json().catch(() => null);
-  if (!res.ok) {
-    const apiMsg = data?.error || data?.message || (data ? JSON.stringify(data) : "");
-    throw new Error(`HTTP ${res.status}${apiMsg ? " - " + apiMsg : ""}`);
-  }
-  return data;
-}
-
-function formatPct(p) {
-  const pct = Math.round((Number(p || 0) * 100));
-  return isFinite(pct) ? `${pct}%` : "0%";
-}
-
-function updateCampaignView(statusObj, queuePaused) {
-  // Esses elementos só existem se você colar o bloco no index.html (instrução abaixo)
-  const box = document.getElementById("campaignBox");
-  if (!box) return;
-
-  box.style.display = "block";
-
-  const meta = document.getElementById("campaignMeta");
-  if (meta) meta.textContent = `ID: ${statusObj.campaignId}`;
-
-  const stTotal = document.getElementById("stTotal");
-  const stSent = document.getElementById("stSent");
-  const stFailed = document.getElementById("stFailed");
-  const stPending = document.getElementById("stPending");
-  const stProg = document.getElementById("stProg");
-  const bar = document.getElementById("bar");
-  const pausedInfo = document.getElementById("queuePausedInfo");
-
-  if (stTotal) stTotal.textContent = `Total: ${statusObj.total}`;
-  if (stSent) stSent.textContent = `Enviados: ${statusObj.sent}`;
-  if (stFailed) stFailed.textContent = `Falhas: ${statusObj.failed}`;
-  if (stPending) stPending.textContent = `Pendentes: ${statusObj.pending}`;
-
-  const pctStr = formatPct(statusObj.progress);
-  if (stProg) stProg.textContent = pctStr;
-  if (bar) bar.style.width = pctStr;
-
-  if (pausedInfo) pausedInfo.textContent = queuePaused ? "Fila está PAUSADA." : "Fila está RODANDO.";
-}
-
-async function pollCampaignOnce() {
-  if (!state.campaignId) return;
-
-  const st = await fetchJson(STATUS_URL(state.campaignId));
-  let q = null;
-  try {
-    q = await fetchJson(QUEUE_STATUS_URL);
-  } catch {
-    q = { paused: null };
-  }
-
-  state.lastStatus = st;
-
-  // Atualiza painel
-  updateCampaignView(st, !!q?.paused);
-
-  // Também escreve uma linha curta no debug (sem spam exagerado)
-  appendDebug(
-    `\n[status] total=${st.total} sent=${st.sent} failed=${st.failed} pending=${st.pending} progress=${formatPct(st.progress)}`
-  );
-
-  // se terminou, para polling
-  if ((st.sent + st.failed) >= st.total && st.total > 0) {
-    stopPolling();
-    appendDebug("\n[status] campanha finalizada ✅\n");
-  }
-}
-
-function startPolling(campaignId) {
-  state.campaignId = campaignId;
-  stopPolling(); // garante limpar timer anterior
-
-  // dispara uma vez agora
-  pollCampaignOnce().catch((e) => {
-    appendDebug("\n[poll] erro: " + (e?.message || String(e)) + "\n");
-  });
-
-  // e depois a cada 1s
-  state.pollTimer = setInterval(() => {
-    pollCampaignOnce().catch((e) => {
-      // não derruba tudo por erro temporário
-      console.warn("poll error:", e);
-    });
-  }, 1000);
-}
-
-function stopPolling() {
-  if (state.pollTimer) clearInterval(state.pollTimer);
-  state.pollTimer = null;
-}
-
-async function pauseQueue() {
-  await fetchJson(QUEUE_PAUSE_URL, { method: "POST" });
-  await pollCampaignOnce();
-}
-
-async function resumeQueue() {
-  await fetchJson(QUEUE_RESUME_URL, { method: "POST" });
-  await pollCampaignOnce();
-}
-
 // ===== EVENTOS =====
 document.getElementById("btnAddToken").addEventListener("click", async () => {
   const token = document.getElementById("tokenInput").value.trim();
@@ -409,11 +291,9 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
         (data?.unique ? ` (únicos: ${data.unique})` : "")
     );
 
+    // se for upload, a API devolve campaignId
     if (data?.campaignId) {
-      appendDebug("\n\ncampaignId: " + data.campaignId + "\n");
-      startPolling(data.campaignId);
-    } else {
-      appendDebug("\n\n⚠️ Sem campaignId na resposta (não vou monitorar status).\n");
+      appendDebug("\n\ncampaignId: " + data.campaignId + "\n(arquivo será apagado automaticamente no fim da campanha)");
     }
 
     appendDebug("\n\nResposta:\n" + JSON.stringify(data, null, 2));
@@ -426,9 +306,3 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
 });
 
 renderTokens();
-
-// ===== NOVO: liga botões pause/resume se existirem no HTML =====
-const btnPause = document.getElementById("btnPause");
-const btnResume = document.getElementById("btnResume");
-if (btnPause) btnPause.addEventListener("click", () => pauseQueue().catch((e) => setStatus("err", e.message)));
-if (btnResume) btnResume.addEventListener("click", () => resumeQueue().catch((e) => setStatus("err", e.message)));
