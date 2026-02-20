@@ -9,19 +9,40 @@ const path = require("path");
 const { pipeline } = require("stream/promises");
 const { Readable } = require("stream");
 
-// ===== ✅ Redis (status campanha) — usa REDIS_URL (mesmo do EasyPanel) =====
-const REDIS_URL = (process.env.REDIS_URL || "").trim();
+// ===== ✅ Redis client (status campanha) =====
+function buildRedisUrlFromConnection(conn) {
+  if (!conn) return null;
+  if (typeof conn === "string") return conn;
+  const host = conn.host || conn.hostname;
+  const port = conn.port || 6379;
+  if (!host) return null;
+
+  const password = conn.password ? encodeURIComponent(conn.password) : null;
+  const db = Number.isFinite(conn.db) ? conn.db : null;
+
+  let auth = "";
+  if (password) auth = `:${password}@`;
+
+  let url = `redis://${auth}${host}:${port}`;
+  if (db != null) url += `/${db}`;
+  return url;
+}
+
+const REDIS_URL =
+  (process.env.REDIS_URL && process.env.REDIS_URL.trim()) ||
+  buildRedisUrlFromConnection(connection);
+
 if (!REDIS_URL) {
   throw new Error(
-    "REDIS_URL não definido. Defina (ex): redis://default:SENHA@redis-fila:6379/0"
+    "REDIS_URL não definido e não foi possível inferir pelo connection. Defina REDIS_URL (ex: redis://redis-fila:6379)."
   );
 }
 
-const redis = new IORedis(REDIS_URL, { maxRetriesPerRequest: null });
-redis.on("error", (e) => console.error("❌ Redis(status) error:", e.message));
-redis.on("connect", () => console.log("✅ Redis(status) conectado via", REDIS_URL));
+const redis = new IORedis(REDIS_URL);
+redis.on("error", (e) => console.error("❌ Redis error:", e.message));
+redis.on("connect", () => console.log("✅ Redis (status) conectado via", REDIS_URL));
 
-const DEFAULT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
+const DEFAULT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!DEFAULT_TOKEN) {
   console.warn("⚠️ TELEGRAM_BOT_TOKEN não definido (ok se você sempre mandar botToken no job).");
 }
@@ -29,7 +50,7 @@ if (!DEFAULT_TOKEN) {
 // ===== cache de bots por token =====
 const botCache = new Map();
 function getBot(token) {
-  const t = (token || DEFAULT_TOKEN || "").trim();
+  const t = token || DEFAULT_TOKEN;
   if (!t) throw new Error("Nenhum token disponível (botToken do job ou TELEGRAM_BOT_TOKEN no env)");
   if (botCache.has(t)) return botCache.get(t);
   const bot = new TelegramBot(t, { polling: false });
@@ -54,7 +75,11 @@ function safeUnlink(p) {
   } catch {}
 }
 
-// baixa URL -> /tmp -> retorna caminho
+async function sleep(ms) {
+  await new Promise((r) => setTimeout(r, ms));
+}
+
+// ===== Download seguro: URL -> /tmp (timeout + limite) =====
 async function downloadUrlToTmp(url) {
   const u = String(url || "").trim();
   const urlObj = new URL(u);
@@ -68,29 +93,38 @@ async function downloadUrlToTmp(url) {
   );
 
   const timeoutMs = Number(process.env.DOWNLOAD_TIMEOUT_MS || 20000);
-  const maxBytes = Number(process.env.DOWNLOAD_MAX_BYTES || 80 * 1024 * 1024);
+  const ac = new AbortController();
+  const to = setTimeout(() => ac.abort(), timeoutMs);
 
-  const controller = new AbortController();
-  const to = setTimeout(() => controller.abort(), timeoutMs);
+  const maxBytes = Number(process.env.DOWNLOAD_MAX_BYTES || 80 * 1024 * 1024); // 80MB
 
-  const r = await fetch(u, { signal: controller.signal }).finally(() => clearTimeout(to));
-  if (!r.ok) throw new Error(`Falha ao baixar arquivo (${r.status})`);
+  try {
+    const r = await fetch(u, { signal: ac.signal });
+    if (!r.ok) throw new Error(`Falha ao baixar arquivo (${r.status})`);
 
-  const body = r.body;
-  if (!body) throw new Error("Resposta sem body ao baixar arquivo");
+    const body = r.body;
+    if (!body) throw new Error("Resposta sem body ao baixar arquivo");
 
-  // limita bytes (evita explodir disco)
-  let downloaded = 0;
-  const nodeStream = Readable.fromWeb(body).on("data", (chunk) => {
-    downloaded += chunk.length;
-    if (downloaded > maxBytes) {
-      controller.abort();
-      throw new Error(`Download excedeu limite de ${maxBytes} bytes`);
-    }
-  });
+    const len = Number(r.headers.get("content-length") || 0);
+    if (len && len > maxBytes) throw new Error(`Arquivo grande demais: ${len} bytes (max ${maxBytes})`);
 
-  await pipeline(nodeStream, fs.createWriteStream(tmpPath));
-  return tmpPath;
+    const nodeStream = Readable.fromWeb(body);
+
+    let written = 0;
+    const ws = fs.createWriteStream(tmpPath);
+    nodeStream.on("data", (chunk) => {
+      written += chunk.length;
+      if (written > maxBytes) {
+        try { ws.destroy(new Error("Arquivo excedeu limite de download")); } catch {}
+        try { ac.abort(); } catch {}
+      }
+    });
+
+    await pipeline(nodeStream, ws);
+    return tmpPath;
+  } finally {
+    clearTimeout(to);
+  }
 }
 
 /**
@@ -112,13 +146,13 @@ async function resolveTelegramInput(file) {
     return { input: fs.createReadStream(file), cleanupPath: null };
   }
 
-  return { input: file, cleanupPath: null };
+  return { input: file, cleanupPath: null }; // file_id
 }
 
-// ===== Rate limit simples por token =====
+// ===== Rate limit por token (janela) =====
 const tokenWindows = new Map();
 async function waitForRateLimit(token, max, ms) {
-  const key = (token || DEFAULT_TOKEN || "no-token").trim();
+  const key = token || DEFAULT_TOKEN || "no-token";
   const safeMax = Math.max(1, Number(max) || 1);
   const safeMs = Math.max(200, Number(ms) || 1100);
 
@@ -135,11 +169,137 @@ async function waitForRateLimit(token, max, ms) {
     }
 
     const wait = safeMs - (now - arr[0]);
-    await new Promise((r) => setTimeout(r, Math.max(wait, 50)));
+    await sleep(Math.max(wait, 50));
   }
 }
 
-console.log("✅ Worker conectando ao Redis (BullMQ) via", `${connection.host}:${connection.port}/${connection.db ?? 0}`);
+// ===== Backoff 429 =====
+function getRetryAfterSeconds(err) {
+  const ra = err?.response?.body?.parameters?.retry_after;
+  if (Number.isFinite(Number(ra)) && Number(ra) > 0) return Number(ra);
+
+  const msg = String(err?.response?.body?.description || err?.message || "");
+  const m = msg.match(/retry after (\d+)/i);
+  if (m) return Number(m[1]);
+
+  return null;
+}
+
+async function sendWithBackoff(sendFn, opts = {}) {
+  const maxAttempts = Number(opts.maxAttempts || process.env.BACKOFF_MAX_ATTEMPTS || 5);
+  let attempt = 0;
+  let extraBackoffMs = 0;
+
+  while (true) {
+    try {
+      return await sendFn();
+    } catch (err) {
+      const code = err?.response?.body?.error_code;
+      const is429 = code === 429 || /too many requests/i.test(String(err?.message || ""));
+
+      if (!is429) throw err;
+
+      attempt++;
+      const retryAfter = getRetryAfterSeconds(err); // seconds
+      const baseWaitMs = retryAfter ? retryAfter * 1000 : 2000;
+
+      extraBackoffMs = Math.min(10000, extraBackoffMs ? extraBackoffMs * 2 : 500);
+      const waitMs = baseWaitMs + extraBackoffMs;
+
+      console.warn(
+        `🚨 429 (flood). Tentativa ${attempt}/${maxAttempts}. retry_after=${retryAfter ?? "?"}s. Aguardando ${waitMs}ms...`
+      );
+
+      if (attempt >= maxAttempts) throw err;
+
+      await sleep(waitMs);
+    }
+  }
+}
+
+// ===== Ramp-up (subir taxa aos poucos) =====
+const WORKER_STARTED_AT = Date.now();
+function rampedRate(base, target, rampSeconds) {
+  const elapsed = (Date.now() - WORKER_STARTED_AT) / 1000;
+  const t = Math.min(1, Math.max(0, elapsed / rampSeconds));
+  return Math.round(base + (target - base) * t);
+}
+
+// ===== Adaptive throttle (por token) =====
+// Ideia: 429 => aumenta penalidade por X minutos. Penalidade reduz max e aumenta ms.
+// Depois a penalidade expira sozinha.
+const tokenPenalty = new Map(); // tokenKey -> { level, untilTs }
+
+const PENALTY_BASE_SECONDS = Number(process.env.PENALTY_BASE_SECONDS || 120); // 2 min
+const PENALTY_MAX_LEVEL = Number(process.env.PENALTY_MAX_LEVEL || 6);
+
+function tokenKeyOf(token) {
+  return token || DEFAULT_TOKEN || "no-token";
+}
+
+function getPenaltyLevel(token) {
+  const k = tokenKeyOf(token);
+  const st = tokenPenalty.get(k);
+  if (!st) return 0;
+  if (Date.now() > st.untilTs) {
+    tokenPenalty.delete(k);
+    return 0;
+  }
+  return st.level || 0;
+}
+
+function register429(token, retryAfterSeconds) {
+  const k = tokenKeyOf(token);
+  const now = Date.now();
+  const cur = tokenPenalty.get(k);
+  const curLevel = cur && now <= cur.untilTs ? cur.level : 0;
+
+  const nextLevel = Math.min(PENALTY_MAX_LEVEL, (curLevel || 0) + 1);
+
+  // duração: base (2min) cresce com level; considera retry_after se vier maior
+  const baseMs = PENALTY_BASE_SECONDS * 1000;
+  const levelMs = baseMs * (1 + nextLevel * 0.6); // 2m, 3.2m, 4.4m...
+  const retryMs = (Number(retryAfterSeconds) || 0) * 1000;
+
+  const ttlMs = Math.max(levelMs, retryMs || 0);
+
+  tokenPenalty.set(k, { level: nextLevel, untilTs: now + ttlMs });
+
+  console.warn(`🧯 Adaptive throttle: token=${maskToken(k)} level=${nextLevel} por ~${Math.round(ttlMs/1000)}s`);
+}
+
+function applyPenalty(lim, token) {
+  const level = getPenaltyLevel(token);
+  if (!level) return lim;
+
+  // quanto maior o level, mais reduz max e aumenta ms
+  // ex level 1 => max/1.3, ms*1.3 ; level 4 => max/2.2, ms*2.2
+  const factor = 1 + level * 0.3;
+
+  const max = Math.max(1, Math.floor((Number(lim.max || 1)) / factor));
+  const ms = Math.max(200, Math.round((Number(lim.ms || 1000)) * factor));
+
+  return { max, ms };
+}
+
+/**
+ * Ramp-up + caps por tipo (seguro) + penalidade adaptativa por token
+ */
+function getEffectiveLimit(type, requested, token) {
+  const reqMax = Number(requested?.max || 1);
+  const reqMs = Number(requested?.ms || 1000);
+
+  let base;
+  if (type === "text") {
+    base = { max: rampedRate(3, Math.min(reqMax, 25), 180), ms: Math.max(200, reqMs) };
+  } else {
+    // mídia: cap mais baixo e ms mínimo
+    base = { max: rampedRate(1, Math.min(reqMax, 8), 300), ms: Math.max(700, reqMs) };
+  }
+
+  // aplica penalidade (se rolou 429 recentemente)
+  return applyPenalty(base, token);
+}
 
 const worker = new Worker(
   "disparos",
@@ -158,14 +318,11 @@ const worker = new Worker(
       const { chatId } = job.data || {};
       if (!chatId) throw new Error("chatId ausente no job");
 
-      const lim = job.data?.limit || { max: 1, ms: 1100 };
-      await waitForRateLimit(job.data?.botToken, lim.max, lim.ms ?? lim.duration ?? lim.limitMs);
-
       const bot = getBot(job.data?.botToken);
 
       // legado
       if (job.data?.mensagem && !job.data?.type) {
-        await bot.sendMessage(chatId, job.data.mensagem);
+        await sendWithBackoff(() => bot.sendMessage(chatId, job.data.mensagem));
         console.log("✅ Enviado (texto legado)!");
         ok = true;
         return;
@@ -174,53 +331,84 @@ const worker = new Worker(
       const { type, payload } = job.data || {};
       if (!type) throw new Error("type ausente no job");
 
+      // efetivo: ramp + caps + adaptive throttle
+      const lim = job.data?.limit || { max: 1, ms: 1100 };
+      const eff = getEffectiveLimit(type, lim, job.data?.botToken);
+
+      await waitForRateLimit(job.data?.botToken, eff.max, eff.ms);
+
+      // helper: se der 429 aqui, registra penalidade e relança pra backoff tratar
+      const wrapSend = (fn) =>
+        sendWithBackoff(async () => {
+          try {
+            return await fn();
+          } catch (err) {
+            const code = err?.response?.body?.error_code;
+            if (code === 429) {
+              const ra = getRetryAfterSeconds(err);
+              register429(job.data?.botToken, ra);
+            }
+            throw err;
+          }
+        });
+
       switch (type) {
         case "text": {
           const text = payload?.text ?? payload?.mensagem;
           if (!text) throw new Error("payload.text ausente");
-          await bot.sendMessage(chatId, text, payload?.options);
+          await wrapSend(() => bot.sendMessage(chatId, text, payload?.options));
           break;
         }
 
         case "audio": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendAudio(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
+          await wrapSend(() =>
+            bot.sendAudio(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) })
+          );
           break;
         }
 
         case "video": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendVideo(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
+          await wrapSend(() =>
+            bot.sendVideo(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) })
+          );
           break;
         }
 
         case "voice": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendVoice(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
+          await wrapSend(() =>
+            bot.sendVoice(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) })
+          );
           break;
         }
 
         case "video_note": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendVideoNote(chatId, input, { ...(payload?.options || {}) });
+          await wrapSend(() => bot.sendVideoNote(chatId, input, { ...(payload?.options || {}) }));
           break;
         }
 
         case "photo": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendPhoto(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
+          await wrapSend(() =>
+            bot.sendPhoto(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) })
+          );
           break;
         }
 
         case "document": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendDocument(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
+          await wrapSend(() =>
+            bot.sendDocument(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) })
+          );
           break;
         }
 
@@ -231,6 +419,11 @@ const worker = new Worker(
       console.log("✅ Enviado!");
       ok = true;
     } catch (err) {
+      const code = err?.response?.body?.error_code;
+      if (code === 429) {
+        const ra = err?.response?.body?.parameters?.retry_after;
+        console.error("🚨 429 flood control. retry_after:", ra);
+      }
       console.error("❌ Telegram erro:", err.message);
       if (err.response?.body) console.error("Detalhe:", err.response.body);
       throw err;
@@ -253,6 +446,5 @@ const worker = new Worker(
   { connection }
 );
 
-worker.on("completed", (job) => console.log("✅ Job completed:", job.id));
 worker.on("failed", (job, err) => console.error("❌ Job falhou:", job?.id, err.message));
 worker.on("error", (err) => console.error("❌ Worker error:", err.message));
