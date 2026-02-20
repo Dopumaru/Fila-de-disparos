@@ -2,6 +2,7 @@
 require("dotenv").config();
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
@@ -52,10 +53,13 @@ if (!UPLOAD_DIR) {
 console.log("📁 Upload dir:", UPLOAD_DIR);
 
 // ✅ Servir uploads por HTTP (worker pega por URL)
-app.use("/uploads", express.static(UPLOAD_DIR, {
-  fallthrough: false,
-  maxAge: "1h",
-}));
+app.use(
+  "/uploads",
+  express.static(UPLOAD_DIR, {
+    fallthrough: false,
+    maxAge: "1h",
+  })
+);
 
 // ✅ multer em disco + mantém extensão + limites
 const storage = multer.diskStorage({
@@ -63,7 +67,10 @@ const storage = multer.diskStorage({
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname || "");
     const name =
-      Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8) + ext;
+      Date.now().toString(36) +
+      "-" +
+      Math.random().toString(36).slice(2, 8) +
+      ext;
     cb(null, name);
   },
 });
@@ -227,6 +234,98 @@ function scheduleDelete(filePath) {
   }, minutes * 60 * 1000);
 }
 
+// ===== CAMPAIGN (Redis keys) =====
+function newCampaignId() {
+  return crypto.randomBytes(8).toString("hex"); // 16 chars
+}
+function cKey(id, suffix) {
+  return `campaign:${id}:${suffix}`;
+}
+async function readCampaign(id) {
+  const [meta, counts, paused] = await Promise.all([
+    connection.hgetall(cKey(id, "meta")),
+    connection.hgetall(cKey(id, "counts")),
+    connection.get(cKey(id, "paused")),
+  ]);
+
+  if (!meta || Object.keys(meta).length === 0) {
+    return null;
+  }
+
+  const total = Number(counts?.total || 0);
+  const sent = Number(counts?.sent || 0);
+  const failed = Number(counts?.failed || 0);
+  const done = sent + failed;
+  const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+
+  return {
+    id,
+    paused: String(paused || "0") === "1",
+    meta: {
+      type: meta.type || "",
+      createdAt: meta.createdAt || "",
+      botTokenMasked: meta.botTokenMasked || "",
+      media: meta.media || "",
+      idColumn: meta.idColumn || "",
+      buttons: Number(meta.buttons || 0),
+      limitMax: Number(meta.limitMax || 1),
+      limitMs: Number(meta.limitMs || 1100),
+    },
+    counts: { total, sent, failed, done, pct },
+  };
+}
+
+// Status campaign
+app.get("/campaign/:id", async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(400).json({ ok: false, error: "campaignId inválido" });
+
+    const data = await readCampaign(id);
+    if (!data) return res.status(404).json({ ok: false, error: "campaign não encontrada" });
+
+    return res.json({ ok: true, campaign: data });
+  } catch (err) {
+    console.error("❌ /campaign/:id erro:", err.message);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+app.post("/campaign/:id/pause", async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(400).json({ ok: false, error: "campaignId inválido" });
+
+    // só pausa se existe
+    const exists = await connection.exists(cKey(id, "meta"));
+    if (!exists) return res.status(404).json({ ok: false, error: "campaign não encontrada" });
+
+    await connection.set(cKey(id, "paused"), "1");
+    const data = await readCampaign(id);
+    return res.json({ ok: true, campaign: data });
+  } catch (err) {
+    console.error("❌ /campaign/:id/pause erro:", err.message);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+app.post("/campaign/:id/resume", async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(400).json({ ok: false, error: "campaignId inválido" });
+
+    const exists = await connection.exists(cKey(id, "meta"));
+    if (!exists) return res.status(404).json({ ok: false, error: "campaign não encontrada" });
+
+    await connection.set(cKey(id, "paused"), "0");
+    const data = await readCampaign(id);
+    return res.json({ ok: true, campaign: data });
+  } catch (err) {
+    console.error("❌ /campaign/:id/resume erro:", err.message);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
 // ===== ROUTE =====
 app.post(
   "/disparar",
@@ -335,6 +434,36 @@ app.post(
       const seen = new Set();
       leads = leads.filter((l) => (seen.has(l.chatId) ? false : (seen.add(l.chatId), true)));
 
+      // ===== cria campanha =====
+      const campaignId = newCampaignId();
+      const createdAt = new Date().toISOString();
+
+      // meta/contadores (inicial)
+      const botTokenMasked =
+        botToken.length <= 10 ? "***" : botToken.slice(0, 4) + "..." + botToken.slice(-4);
+
+      const mediaKind =
+        type === "text" ? "text" : fileUrl ? "url" : isUpload ? "upload-url" : "media";
+
+      const p = connection.pipeline();
+      p.hset(cKey(campaignId, "meta"), {
+        type,
+        createdAt,
+        botTokenMasked,
+        media: mediaKind,
+        idColumn: idColumnRaw,
+        buttons: String(buttons.length || 0),
+        limitMax: String(limitMax),
+        limitMs: String(limitMs),
+      });
+      p.hset(cKey(campaignId, "counts"), {
+        total: String(leads.length),
+        sent: "0",
+        failed: "0",
+      });
+      p.set(cKey(campaignId, "paused"), "0");
+      await p.exec();
+
       let total = 0;
       for (const lead of leads) {
         const finalCaption = applyTemplate(captionTemplate, lead.vars);
@@ -342,6 +471,7 @@ app.post(
         const jobData =
           type === "text"
             ? {
+                campaignId, // ✅ novo (não quebra)
                 chatId: lead.chatId,
                 botToken,
                 limit: { max: limitMax, ms: limitMs },
@@ -349,6 +479,7 @@ app.post(
                 payload: { text: finalCaption, options },
               }
             : {
+                campaignId, // ✅ novo (não quebra)
                 chatId: lead.chatId,
                 botToken,
                 limit: { max: limitMax, ms: limitMs },
@@ -365,10 +496,13 @@ app.post(
       }
 
       // apaga CSV upload
-      try { if (csvPathToDelete) fs.unlinkSync(csvPathToDelete); } catch {}
+      try {
+        if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
+      } catch {}
 
       return res.json({
         ok: true,
+        campaignId, // ✅ novo
         total,
         buttons: buttons.length,
         source: "csv",
@@ -379,7 +513,9 @@ app.post(
       });
     } catch (err) {
       console.error("❌ /disparar erro:", err.message);
-      try { if (csvPathToDelete) fs.unlinkSync(csvPathToDelete); } catch {}
+      try {
+        if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
+      } catch {}
       return res.status(500).json({ ok: false, error: "Erro interno" });
     }
   }
