@@ -1,485 +1,645 @@
-const API_URL = "/disparar";
+// api/server.js
+require("dotenv").config();
+const path = require("path");
+const fs = require("fs");
+const express = require("express");
+const cors = require("cors");
+const multer = require("multer");
+const crypto = require("crypto");
+const IORedis = require("ioredis");
+const { Queue } = require("bullmq");
+const connection = require("../redis");
 
-// ===== endpoints auxiliares =====
-const STATUS_URL = (id) => `/campaign/${encodeURIComponent(id)}/status`;
-const QUEUE_STATUS_URL = "/queue/status";
-const QUEUE_PAUSE_URL = "/queue/pause";
-const QUEUE_RESUME_URL = "/queue/resume";
+const app = express();
+app.use(cors());
+app.set("trust proxy", 1);
 
-const state = {
-  tokens: [],
-  selectedTokenId: null,
-  isSending: false,
-  isValidating: false,
+// ===== FRONT (public) =====
+app.use(express.static(path.join(__dirname, "..", "public")));
 
-  // campanha atual
-  campaignId: null,
-  pollTimer: null,
-  lastStatus: null,
-
-  // ✅ idempotência
-  lastIdempotencyKey: null,
-};
-
-function uid() {
-  return Math.random().toString(16).slice(2) + Date.now().toString(16);
+// ===== Uploads (DIR configurável e com fallback) =====
+function ensureDirWritable(dir) {
+  try {
+    if (!dir) return null;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.accessSync(dir, fs.constants.W_OK);
+    return dir;
+  } catch {
+    return null;
+  }
 }
 
-// ✅ UUID real (melhor) com fallback
-function makeIdempotencyKey() {
-  try {
-    if (window.crypto && typeof window.crypto.randomUUID === "function") {
-      return window.crypto.randomUUID();
-    }
-  } catch {}
-  // fallback ok (só precisa ser único)
-  return (
-    "idem_" +
-    Math.random().toString(16).slice(2) +
-    "_" +
-    Date.now().toString(16) +
-    "_" +
-    Math.random().toString(16).slice(2)
+const DEFAULT_UPLOAD_DIR = path.join(__dirname, "..", "uploads");
+const ENV_UPLOAD_DIR = (process.env.UPLOAD_DIR || "").trim();
+
+const UPLOAD_DIR =
+  ensureDirWritable(ENV_UPLOAD_DIR) ||
+  ensureDirWritable(DEFAULT_UPLOAD_DIR) ||
+  ensureDirWritable("/tmp/uploads");
+
+if (!UPLOAD_DIR) {
+  throw new Error(
+    "Nenhum diretório de upload gravável. Configure UPLOAD_DIR para um caminho com permissão."
   );
 }
 
-function selectedToken() {
-  return state.tokens.find((t) => t.id === state.selectedTokenId) || null;
+console.log("📁 Upload dir:", UPLOAD_DIR);
+
+// ✅ Servir uploads por HTTP (worker pega por URL)
+app.use(
+  "/uploads",
+  express.static(UPLOAD_DIR, {
+    fallthrough: false,
+    maxAge: "1h",
+  })
+);
+
+// ✅ multer em disco + mantém extensão + limites
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname || "");
+    const name =
+      Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8) + ext;
+    cb(null, name);
+  },
+});
+
+const upload = multer({
+  storage,
+  limits: {
+    fileSize: Number(process.env.UPLOAD_MAX_BYTES || 50 * 1024 * 1024), // 50MB default
+  },
+});
+
+const queue = new Queue("disparos", { connection });
+
+// ===== ✅ Redis client (para status de campanha) =====
+function buildRedisUrlFromConnection(conn) {
+  if (!conn) return null;
+  if (typeof conn === "string") return conn; // se seu redis.js exporta uma URL
+  const host = conn.host || conn.hostname;
+  const port = conn.port || 6379;
+  if (!host) return null;
+
+  // suporte opcional a senha/db se existirem no objeto
+  const password = conn.password ? encodeURIComponent(conn.password) : null;
+  const db = Number.isFinite(conn.db) ? conn.db : null;
+
+  let auth = "";
+  if (password) auth = `:${password}@`;
+
+  let url = `redis://${auth}${host}:${port}`;
+  if (db != null) url += `/${db}`;
+  return url;
 }
 
-function tokenExists(token) {
-  return state.tokens.some((t) => t.token === token);
+const REDIS_URL =
+  (process.env.REDIS_URL && process.env.REDIS_URL.trim()) ||
+  buildRedisUrlFromConnection(connection);
+
+if (!REDIS_URL) {
+  throw new Error(
+    "REDIS_URL não definido e não foi possível inferir pelo connection. Defina REDIS_URL (ex: redis://redis-fila:6379)."
+  );
 }
 
-function setStatus(type, msg) {
-  const el = document.getElementById("status");
-  el.className = type;
-  el.textContent = msg || "";
-}
+const redis = new IORedis(REDIS_URL);
+redis.on("error", (e) => console.error("❌ Redis error:", e.message));
+redis.on("connect", () => console.log("✅ Redis (status) conectado via", REDIS_URL));
 
-function setSending(flag) {
-  state.isSending = flag;
-  const btn = document.getElementById("btnEnviar");
-  if (btn) {
-    btn.disabled = flag;
-    btn.textContent = flag ? "Enviando..." : "Enviar campanha";
-  }
-}
-
-function setValidating(flag) {
-  state.isValidating = flag;
-  const btn = document.getElementById("btnAddToken");
-  if (btn) {
-    btn.disabled = flag;
-    btn.textContent = flag ? "Validando token..." : "Adicionar token";
-  }
-}
-
-function renderTokens() {
-  const area = document.getElementById("tokensArea");
-  area.innerHTML = "";
-
-  if (state.tokens.length === 0) {
-    area.innerHTML = `<span class="pill">Nenhum token adicionado</span>`;
-    return;
-  }
-
-  state.tokens.forEach((t) => {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "tokenBtn" + (t.id === state.selectedTokenId ? " active" : "");
-    btn.textContent = t.label || "Bot";
-    btn.onclick = () => {
-      state.selectedTokenId = t.id;
-      renderTokens();
-    };
-    area.appendChild(btn);
-  });
-}
-
-// ===== BOT INFO (GETME) =====
-async function fetchBotLabel(token) {
-  const res = await fetch(`https://api.telegram.org/bot${token}/getMe`);
-  const data = await res.json().catch(() => null);
-
-  if (!data || !data.ok) throw new Error(data?.description || "Token inválido (getMe).");
-
-  const bot = data.result;
-  if (bot?.username) return "@" + bot.username;
-  return bot?.first_name || "Bot";
-}
-
-// ===== BOTÕES (até 4) =====
-function readButtons() {
-  const buttons = [];
-
-  for (let i = 1; i <= 4; i++) {
-    const textEl = document.getElementById(`b${i}Text`);
-    const typeEl = document.getElementById(`b${i}Type`);
-    const valueEl = document.getElementById(`b${i}Value`);
-    if (!textEl || !typeEl || !valueEl) return [];
-
-    const text = (textEl.value || "").trim();
-    const type = (typeEl.value || "none").trim(); // none | url | start
-    const value = (valueEl.value || "").trim();
-
-    if (type === "none") continue;
-    if (!text || !value) continue;
-
-    buttons.push({ text, type, value });
-  }
-
-  return buttons.slice(0, 4);
-}
-
-function validateButtons(buttons) {
-  for (const b of buttons) {
-    if (b.type === "url") {
-      if (!/^https?:\/\//i.test(b.value)) {
-        return `Botão "${b.text}": URL deve começar com http:// ou https://`;
-      }
-    } else if (b.type === "start") {
-      if (b.value.length > 64) {
-        return `Botão "${b.text}": START muito longo (máx ~64 chars recomendado).`;
-      }
-    } else {
-      return `Botão "${b.text}": tipo inválido.`;
-    }
-  }
-  return null;
-}
-
-// ===== CSV helpers =====
-function getCsvFile() {
-  const el = document.getElementById("csvFile");
-  return el?.files?.[0] || null;
-}
-function getIdColumn() {
-  const el = document.getElementById("idColumn");
-  const v = (el?.value || "").trim();
-  return v || "chatId";
-}
-function validateCsvFile(csv) {
-  if (!csv) return "Envie um CSV de leads.";
-  const name = (csv.name || "").toLowerCase();
-  if (!name.endsWith(".csv")) return "O arquivo de leads precisa ser .csv";
-  if (csv.size > 10 * 1024 * 1024) return "CSV muito grande (máx 10MB).";
-  return null;
-}
-
-// ===== helpers de UI =====
-function clearDebug() {
-  const debugEl = document.getElementById("debug");
-  if (debugEl) debugEl.textContent = "";
-}
-function appendDebug(line) {
-  const debugEl = document.getElementById("debug");
-  if (!debugEl) return;
-  debugEl.textContent = (debugEl.textContent || "") + line;
-}
-
+// ===== Utils =====
 function isHttpUrl(u) {
   return /^https?:\/\//i.test(String(u || "").trim());
 }
 
-// ===== helpers campanha/queue =====
-async function fetchJson(url, opts) {
-  const res = await fetch(url, opts);
-  const data = await res.json().catch(() => null);
-  if (!res.ok) {
-    const apiMsg = data?.error || data?.message || (data ? JSON.stringify(data) : "");
-    throw new Error(`HTTP ${res.status}${apiMsg ? " - " + apiMsg : ""}`);
-  }
-  return data;
+function normalizeKey(k) {
+  return String(k || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[^a-z0-9_]/g, "");
 }
 
-function formatPct(p) {
-  const pct = Math.round(Number(p || 0) * 100);
-  return isFinite(pct) ? `${pct}%` : "0%";
-}
-
-function updateCampaignView(statusObj, queuePaused) {
-  const box = document.getElementById("campaignBox");
-  if (!box) return;
-
-  box.style.display = "block";
-
-  const meta = document.getElementById("campaignMeta");
-  if (meta) meta.textContent = `ID: ${statusObj.campaignId}`;
-
-  const stTotal = document.getElementById("stTotal");
-  const stSent = document.getElementById("stSent");
-  const stFailed = document.getElementById("stFailed");
-  const stPending = document.getElementById("stPending");
-  const stProg = document.getElementById("stProg");
-  const bar = document.getElementById("bar");
-  const pausedInfo = document.getElementById("queuePausedInfo");
-
-  if (stTotal) stTotal.textContent = `Total: ${statusObj.total}`;
-  if (stSent) stSent.textContent = `Enviados: ${statusObj.sent}`;
-  if (stFailed) stFailed.textContent = `Falhas: ${statusObj.failed}`;
-  if (stPending) stPending.textContent = `Pendentes: ${statusObj.pending}`;
-
-  const pctStr = formatPct(statusObj.progress);
-  if (stProg) stProg.textContent = pctStr;
-  if (bar) bar.style.width = pctStr;
-
-  if (pausedInfo) pausedInfo.textContent = queuePaused ? "Fila está PAUSADA." : "Fila está RODANDO.";
-}
-
-async function pollCampaignOnce() {
-  if (!state.campaignId) return;
-
-  const st = await fetchJson(STATUS_URL(state.campaignId));
-  let q = null;
-  try {
-    q = await fetchJson(QUEUE_STATUS_URL);
-  } catch {
-    q = { paused: null };
-  }
-
-  state.lastStatus = st;
-  updateCampaignView(st, !!q?.paused);
-
-  appendDebug(
-    `\n[status] total=${st.total} sent=${st.sent} failed=${st.failed} pending=${st.pending} progress=${formatPct(
-      st.progress
-    )}`
-  );
-
-  if (st.sent + st.failed >= st.total && st.total > 0) {
-    stopPolling();
-    appendDebug("\n[status] campanha finalizada ✅\n");
-  }
-}
-
-function startPolling(campaignId) {
-  state.campaignId = campaignId;
-  stopPolling();
-
-  pollCampaignOnce().catch((e) => {
-    appendDebug("\n[poll] erro: " + (e?.message || String(e)) + "\n");
+function applyTemplate(template, rowObj) {
+  const t = String(template || "");
+  return t.replace(/\{(\w+)\}/g, (_, key) => {
+    const k = normalizeKey(key);
+    const v = rowObj?.[k];
+    return v == null ? "" : String(v);
   });
-
-  state.pollTimer = setInterval(() => {
-    pollCampaignOnce().catch((e) => console.warn("poll error:", e));
-  }, 1000);
 }
 
-function stopPolling() {
-  if (state.pollTimer) clearInterval(state.pollTimer);
-  state.pollTimer = null;
+// ===== CSV (sem libs) =====
+function detectDelimiter(text) {
+  const firstLine =
+    String(text || "")
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .split("\n")[0] || "";
+
+  if (firstLine.includes(";") && !firstLine.includes(",")) return ";";
+  return ",";
 }
 
-async function pauseQueue() {
-  await fetchJson(QUEUE_PAUSE_URL, { method: "POST" });
-  await pollCampaignOnce();
-}
+function parseCsvRows(text) {
+  const src = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const delim = detectDelimiter(src);
 
-async function resumeQueue() {
-  await fetchJson(QUEUE_RESUME_URL, { method: "POST" });
-  await pollCampaignOnce();
-}
+  const lines = src
+    .split("\n")
+    .map((l) => l.replace(/\uFEFF/g, ""))
+    .filter((l) => l.trim().length > 0);
 
-// ===== EVENTOS =====
-document.getElementById("btnAddToken").addEventListener("click", async () => {
-  const token = document.getElementById("tokenInput").value.trim();
+  const rows = [];
+  for (const line of lines) {
+    const cols = [];
+    let cur = "";
+    let inQuotes = false;
 
-  if (!token) return setStatus("err", "Cole um token.");
-  if (!token.includes(":") || token.length < 30) return setStatus("err", "Token inválido.");
-  if (tokenExists(token)) return setStatus("err", "Token já adicionado.");
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
 
-  setValidating(true);
-  setStatus("", "Validando token e buscando nome do bot...");
-
-  let label = "Bot (sem nome)";
-  try {
-    label = await fetchBotLabel(token);
-    setStatus("ok", "Bot conectado: " + label);
-  } catch {
-    setStatus("warn", "Token adicionado, mas não consegui buscar o nome do bot (rede/Telegram bloqueado).");
-  }
-
-  const id = uid();
-  state.tokens.push({ id, label, token });
-  state.selectedTokenId = id;
-
-  document.getElementById("tokenInput").value = "";
-  renderTokens();
-  setValidating(false);
-});
-
-document.getElementById("btnRemoveToken").addEventListener("click", () => {
-  if (!state.selectedTokenId) return setStatus("err", "Nenhum token selecionado.");
-
-  state.tokens = state.tokens.filter((t) => t.id !== state.selectedTokenId);
-  state.selectedTokenId = state.tokens[0]?.id || null;
-
-  setStatus("ok", "Token removido.");
-  renderTokens();
-});
-
-document.getElementById("btnEnviar").addEventListener("click", async () => {
-  if (state.isSending) return;
-
-  const tipo = document.getElementById("tipo").value;
-  const mensagemTemplate = document.getElementById("mensagem").value || "";
-
-  const limMax = Number(document.getElementById("limitMax").value || 1);
-  const limMs = Number(document.getElementById("limitMs").value || 1100);
-
-  const file = document.getElementById("arquivo")?.files?.[0] || null;
-  const fileUrl = (document.getElementById("fileUrl")?.value || "").trim();
-
-  const csv = getCsvFile();
-  const idColumn = getIdColumn();
-  const tokenObj = selectedToken();
-
-  clearDebug();
-
-  if (!tokenObj) return setStatus("err", "Adicione um token.");
-
-  const csvErr = validateCsvFile(csv);
-  if (csvErr) return setStatus("err", csvErr);
-
-  if (!idColumn.trim()) return setStatus("err", 'Preencha "Coluna do ID" (ex: chatId).');
-
-  if (tipo === "text" && !mensagemTemplate.trim()) {
-    return setStatus("err", "Mensagem obrigatória para texto.");
-  }
-
-  if (!(limMax >= 1) || !(limMs >= 200)) {
-    return setStatus("err", "Limite inválido. Use max >= 1 e intervalo >= 200ms.");
-  }
-
-  if (tipo !== "text") {
-    const hasUrl = !!fileUrl;
-    const hasUpload = !!file;
-
-    if (hasUrl && !isHttpUrl(fileUrl)) {
-      return setStatus("err", "A URL do arquivo deve começar com http:// ou https://");
-    }
-
-    if (hasUrl && hasUpload) {
-      return setStatus("err", "Escolha apenas UM: URL do arquivo OU Upload.");
-    }
-
-    if (!hasUrl && !hasUpload) {
-      return setStatus("err", "Para mídia/documento: preencha a URL do arquivo OU selecione um arquivo (upload).");
-    }
-  }
-
-  const buttons = readButtons();
-  const btnErr = validateButtons(buttons);
-  if (btnErr) return setStatus("err", btnErr);
-
-  // ✅ idempotencyKey por envio (evita clique duplo / reenvio acidental)
-  const idempotencyKey = makeIdempotencyKey();
-  state.lastIdempotencyKey = idempotencyKey;
-
-  const form = new FormData();
-  form.append("botToken", tokenObj.token);
-  form.append("type", tipo);
-  form.append("caption", mensagemTemplate);
-  form.append("csv", csv);
-  form.append("idColumn", idColumn);
-  form.append("limitMax", String(limMax));
-  form.append("limitMs", String(limMs));
-  form.append("buttons", JSON.stringify(buttons));
-  form.append("idempotencyKey", idempotencyKey); // ✅ novo
-
-  if (tipo !== "text") {
-    if (fileUrl) form.append("fileUrl", fileUrl);
-    else if (file) form.append("file", file);
-  }
-
-  setSending(true);
-  setStatus("", "Enfileirando...");
-
-  appendDebug(
-    "POST " +
-      API_URL +
-      "\n" +
-      "Bot: " +
-      (tokenObj.label || "Bot") +
-      "\n" +
-      "CSV: " +
-      csv.name +
-      "\n" +
-      "Coluna ID: " +
-      idColumn +
-      "\n" +
-      "Tipo: " +
-      tipo +
-      "\n" +
-      "Botões: " +
-      (buttons.length || 0) +
-      "\n" +
-      "Rate: " +
-      limMax +
-      " a cada " +
-      limMs +
-      "ms\n" +
-      "Idempotency: " +
-      idempotencyKey +
-      "\n" +
-      (tipo !== "text"
-        ? fileUrl
-          ? "URL: " + fileUrl + "\n"
-          : file
-          ? "Upload: " + file.name + "\n"
-          : ""
-        : "")
-  );
-
-  try {
-    const res = await fetch(API_URL, { method: "POST", body: form });
-    const data = await res.json().catch(() => null);
-
-    // ✅ trata duplicado (quando você implementar no server.js)
-    if (res.status === 409) {
-      setStatus("warn", "Esse disparo já foi processado (evitei duplicar).");
-      appendDebug("\n\n[dup] HTTP 409 - disparo duplicado bloqueado.\n");
-      appendDebug("\nResposta:\n" + JSON.stringify(data, null, 2));
-
-      // opcional: se seu server devolver campaignId no 409, a gente monitora
-      if (data?.campaignId) {
-        appendDebug("\n\ncampaignId existente: " + data.campaignId + "\n");
-        startPolling(data.campaignId);
+      if (ch === '"') {
+        const next = line[i + 1];
+        if (inQuotes && next === '"') {
+          cur += '"';
+          i++;
+          continue;
+        }
+        inQuotes = !inQuotes;
+        continue;
       }
-      return;
+
+      if (!inQuotes && ch === delim) {
+        cols.push(cur.trim());
+        cur = "";
+      } else {
+        cur += ch;
+      }
     }
 
-    if (!res.ok) {
-      const apiMsg = data?.error || data?.message || (data ? JSON.stringify(data) : "");
-      throw new Error(`HTTP ${res.status}${apiMsg ? " - " + apiMsg : ""}`);
+    cols.push(cur.trim());
+    rows.push(cols);
+  }
+
+  return rows;
+}
+
+function buildRowObjectsFromCsv(text) {
+  const rows = parseCsvRows(text);
+  if (!rows.length) return { headers: [], items: [] };
+
+  const headersRaw = rows[0] || [];
+  const headers = headersRaw.map((h, idx) => normalizeKey(h) || `col${idx}`);
+
+  const items = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const obj = {};
+    for (let c = 0; c < headers.length; c++) {
+      const key = headers[c] || `col${c}`;
+      obj[key] = (r[c] ?? "").toString().trim();
+    }
+    items.push(obj);
+  }
+
+  return { headers, items };
+}
+
+// ===== Botões =====
+async function getBotUsername(botToken) {
+  const r = await fetch(`https://api.telegram.org/bot${botToken}/getMe`);
+  const data = await r.json().catch(() => null);
+  if (!data || !data.ok || !data.result) throw new Error("Token inválido (getMe)");
+  return data.result.username;
+}
+
+function buildOptionsFromButtons(buttons, botUsername) {
+  if (!Array.isArray(buttons) || buttons.length === 0) return undefined;
+
+  const inline_keyboard = [];
+  for (let i = 0; i < buttons.length; i += 2) {
+    const row = [];
+
+    for (let j = i; j < i + 2 && j < buttons.length; j++) {
+      const b = buttons[j];
+      const text = String(b.text || "").trim();
+      const type = String(b.type || "").trim(); // url | start
+      const value = String(b.value || "").trim();
+      if (!text || !type || !value) continue;
+
+      if (type === "url") {
+        if (!isHttpUrl(value)) continue;
+        row.push({ text, url: value });
+      } else if (type === "start") {
+        if (!botUsername) continue;
+        const param = encodeURIComponent(value);
+        row.push({ text, url: `https://t.me/${botUsername}?start=${param}` });
+      }
     }
 
-    setStatus(
-      "ok",
-      "Campanha enfileirada. Total: " + (data?.total ?? "?") + (data?.unique ? ` (únicos: ${data.unique})` : "")
+    if (row.length) inline_keyboard.push(row);
+  }
+
+  if (!inline_keyboard.length) return undefined;
+  return { reply_markup: { inline_keyboard } };
+}
+
+// ✅ opcional: limpeza automática depois de X minutos (evita encher disco)
+function scheduleDelete(filePath) {
+  const minutes = Number(process.env.UPLOAD_TTL_MINUTES || 180);
+  if (!minutes || minutes <= 0) return; // desliga se 0
+  setTimeout(() => {
+    try {
+      if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    } catch {}
+  }, minutes * 60 * 1000);
+}
+
+// ===== 10) Health real =====
+app.get("/health", async (_req, res) => {
+  try {
+    const ping = await redis.ping();
+
+    const counts = await queue.getJobCounts(
+      "waiting",
+      "active",
+      "completed",
+      "failed",
+      "delayed",
+      "paused"
     );
 
-    if (data?.campaignId) {
-      appendDebug("\n\ncampaignId: " + data.campaignId + "\n");
-      startPolling(data.campaignId);
-    } else {
-      appendDebug("\n\n⚠️ Sem campaignId na resposta (não vou monitorar status).\n");
-    }
+    let uploadWritable = false;
+    try {
+      fs.accessSync(UPLOAD_DIR, fs.constants.W_OK);
+      uploadWritable = true;
+    } catch {}
 
-    appendDebug("\n\nResposta:\n" + JSON.stringify(data, null, 2));
-  } catch (err) {
-    setStatus("err", "Erro ao enviar para API: " + (err?.message || String(err)));
-    appendDebug("\n\nErro:\n" + (err?.message || String(err)));
-  } finally {
-    setSending(false);
+    return res.json({
+      ok: true,
+      redis: ping === "PONG" ? "ok" : ping,
+      queue: { name: "disparos", counts },
+      uploads: { dir: UPLOAD_DIR, writable: uploadWritable },
+      ts: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error("❌ /health error:", e.message);
+    return res.status(500).json({
+      ok: false,
+      error: "healthcheck_failed",
+      detail: e?.message,
+      ts: new Date().toISOString(),
+    });
   }
 });
 
-renderTokens();
+// Rota raiz: abre o painel
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "..", "public", "index.html"));
+});
 
-// ===== liga botões pause/resume se existirem no HTML =====
-const btnPause = document.getElementById("btnPause");
-const btnResume = document.getElementById("btnResume");
-if (btnPause) btnPause.addEventListener("click", () => pauseQueue().catch((e) => setStatus("err", e.message)));
-if (btnResume) btnResume.addEventListener("click", () => resumeQueue().catch((e) => setStatus("err", e.message)));
+// ===== STATUS CAMPANHA =====
+app.get("/campaign/:id/status", async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    const key = `campaign:${id}`;
+    const data = await redis.hgetall(key);
+
+    if (!data || !data.id) {
+      return res.status(404).json({ ok: false, error: "campaign_not_found" });
+    }
+
+    const total = Number(data.total || 0);
+    const sent = Number(data.sent || 0);
+    const failed = Number(data.failed || 0);
+    const done = sent + failed;
+    const pending = Math.max(0, total - done);
+
+    return res.json({
+      ok: true,
+      campaignId: id,
+      total,
+      sent,
+      failed,
+      pending,
+      done,
+      progress: total > 0 ? done / total : 0,
+      createdAt: data.createdAt ? Number(data.createdAt) : null,
+      meta: {
+        type: data.type || null,
+        idColumn: data.idColumn || null,
+      },
+    });
+  } catch (e) {
+    console.error("❌ campaign status error:", e.message);
+    res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
+// ===== PAUSE/RESUME GLOBAL DA FILA =====
+app.post("/queue/pause", async (_req, res) => {
+  try {
+    await queue.pause();
+    res.json({ ok: true, paused: true });
+  } catch (e) {
+    console.error("❌ pause error:", e.message);
+    res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
+app.post("/queue/resume", async (_req, res) => {
+  try {
+    await queue.resume();
+    res.json({ ok: true, paused: false });
+  } catch (e) {
+    console.error("❌ resume error:", e.message);
+    res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
+app.get("/queue/status", async (_req, res) => {
+  try {
+    const paused = await queue.isPaused();
+    res.json({ ok: true, paused: !!paused });
+  } catch (e) {
+    console.error("❌ queue status error:", e.message);
+    res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
+// ===== 7) Validações extras =====
+const ALLOWED_TYPES = new Set([
+  "text",
+  "photo",
+  "video",
+  "audio",
+  "voice",
+  "document",
+  "video_note",
+]);
+
+const allowedByType = {
+  photo: [".jpg", ".jpeg", ".png", ".webp"],
+  video: [".mp4", ".mov", ".mkv", ".webm"],
+  audio: [".mp3", ".m4a", ".wav", ".ogg"],
+  voice: [".ogg"],
+  video_note: [".mp4"],
+  document: [], // deixa livre (PDF/ZIP/etc). Se quiser travar, coloque lista.
+};
+
+// ===== 9) Retenção de jobs (BullMQ) =====
+// Ajuste fino via env (opcional). Defaults seguros.
+const RETAIN_COMPLETED = Number(process.env.RETAIN_COMPLETED || 2000); // últimos 2000 concluídos
+const RETAIN_FAILED = Number(process.env.RETAIN_FAILED || 5000); // últimos 5000 falhados
+
+function jobRetentionOptions() {
+  // BullMQ aceita count/age; aqui usamos count (mais garantido)
+  const completed = Number.isFinite(RETAIN_COMPLETED) && RETAIN_COMPLETED > 0 ? RETAIN_COMPLETED : 2000;
+  const failed = Number.isFinite(RETAIN_FAILED) && RETAIN_FAILED > 0 ? RETAIN_FAILED : 5000;
+
+  return {
+    removeOnComplete: { count: completed },
+    removeOnFail: { count: failed },
+  };
+}
+
+// ===== ROUTE =====
+app.post(
+  "/disparar",
+  upload.fields([
+    { name: "file", maxCount: 1 },
+    { name: "csv", maxCount: 1 },
+  ]),
+  async (req, res) => {
+    let csvPathToDelete = null;
+
+    try {
+      const botToken = (req.body.botToken || "").trim();
+      const type = (req.body.type || "").trim();
+      const captionTemplate = req.body.caption ?? "";
+      const limitMax = Number(req.body.limitMax || 1);
+      const limitMs = Number(req.body.limitMs || 1100);
+      const fileUrl = (req.body.fileUrl || "").trim();
+
+      const idColumnRaw = (req.body.idColumn || "chatId").trim();
+      const idColumn = normalizeKey(idColumnRaw) || "chatid";
+
+      let buttons = [];
+      try {
+        buttons = JSON.parse(req.body.buttons || "[]");
+      } catch {
+        return res.status(400).json({ ok: false, error: "buttons precisa ser JSON." });
+      }
+
+      // ===== validações base =====
+      if (!botToken) return res.status(400).json({ ok: false, error: "botToken é obrigatório." });
+      if (!type) return res.status(400).json({ ok: false, error: "type é obrigatório." });
+
+      // ✅ valida type permitido
+      if (!ALLOWED_TYPES.has(type)) {
+        return res.status(400).json({
+          ok: false,
+          error: `type inválido: ${type}`,
+          allowed: Array.from(ALLOWED_TYPES),
+        });
+      }
+
+      if (!(limitMax >= 1) || !(limitMs >= 200)) {
+        return res.status(400).json({ ok: false, error: "limitMax>=1 e limitMs>=200." });
+      }
+
+      if (type === "text" && !String(captionTemplate).trim()) {
+        return res
+          .status(400)
+          .json({ ok: false, error: "Para text, caption (mensagem) é obrigatório." });
+      }
+
+      // ✅ fileUrl sanity
+      if (fileUrl && fileUrl.length > 2000) {
+        return res.status(400).json({ ok: false, error: "fileUrl muito longa." });
+      }
+
+      const mediaFile = req.files?.file?.[0] || null;
+      const csvFile = req.files?.csv?.[0] || null;
+
+      if (!csvFile) return res.status(400).json({ ok: false, error: "Envie o CSV no campo csv." });
+      csvPathToDelete = csvFile.path;
+
+      if (type !== "text") {
+        if (!mediaFile && !fileUrl) {
+          return res.status(400).json({
+            ok: false,
+            error: "Para mídia/documento, envie file (upload) OU preencha fileUrl (http/https).",
+          });
+        }
+        if (fileUrl && !isHttpUrl(fileUrl)) {
+          return res.status(400).json({ ok: false, error: "fileUrl inválida (precisa http/https)." });
+        }
+      }
+
+      // ✅ valida extensão do upload por type (quando aplicável)
+      if (type !== "text" && mediaFile) {
+        const ext = path.extname(mediaFile.originalname || "").toLowerCase();
+        const list = allowedByType[type] || [];
+        if (list.length && !list.includes(ext)) {
+          return res.status(400).json({
+            ok: false,
+            error: `Arquivo inválido para type='${type}'.`,
+            receivedExt: ext,
+            allowedExt: list,
+          });
+        }
+      }
+
+      if (!Array.isArray(buttons)) buttons = [];
+      if (buttons.length > 4) buttons = buttons.slice(0, 4);
+
+      const hasStart = buttons.some((b) => String(b?.type || "").trim() === "start");
+      let botUsername = null;
+      if (hasStart) botUsername = await getBotUsername(botToken);
+
+      const options = buildOptionsFromButtons(buttons, botUsername);
+
+      // ✅ Fonte da mídia:
+      const isUpload = !!mediaFile && !fileUrl;
+      let mediaSource = fileUrl || null;
+
+      if (type !== "text" && isUpload) {
+        const PORT = process.env.PORT || 3000;
+        const internalHost = (process.env.API_INTERNAL_HOST || "api-disparos").trim();
+
+        // aviso útil (não quebra)
+        if (!process.env.API_INTERNAL_HOST) {
+          console.warn("⚠️ API_INTERNAL_HOST não definido. Worker pode não conseguir acessar /uploads.");
+        }
+
+        const filename = path.basename(mediaFile.path);
+        mediaSource = `http://${internalHost}:${PORT}/uploads/${encodeURIComponent(filename)}`;
+        scheduleDelete(mediaFile.path);
+      }
+
+      // ===== LEADS via CSV =====
+      const csvText = fs.readFileSync(csvFile.path, "utf8");
+      const { headers, items } = buildRowObjectsFromCsv(csvText);
+      if (!items.length) return res.status(400).json({ ok: false, error: "CSV vazio ou inválido." });
+
+      // ✅ valida se existe alguma coluna “ID” conhecida no header
+      const possibleIdCols = new Set([idColumn, "chatid", "chat_id", "id", "col0"]);
+      const hasAnyIdCol = headers.some((h) => possibleIdCols.has(h));
+      if (!hasAnyIdCol) {
+        return res.status(400).json({
+          ok: false,
+          error: `CSV não contém coluna de ID válida. Tentativas: ${Array.from(possibleIdCols).join(", ")}`,
+          headersEncontrados: headers,
+        });
+      }
+
+      let leads = [];
+      for (const row of items) {
+        let chatId = String(row[idColumn] || "").trim();
+        if (!chatId) chatId = String(row["chatid"] || "").trim();
+        if (!chatId) chatId = String(row["chat_id"] || "").trim();
+        if (!chatId) chatId = String(row["id"] || "").trim();
+        if (!chatId) chatId = String(row["col0"] || "").trim();
+        if (!chatId) continue;
+        leads.push({ chatId, vars: row });
+      }
+
+      if (!leads.length) {
+        return res.status(400).json({
+          ok: false,
+          error: `Não encontrei IDs no CSV. Verifique a coluna "${idColumnRaw}" (ex: chatId).`,
+        });
+      }
+
+      // remove duplicados
+      const seen = new Set();
+      leads = leads.filter((l) => (seen.has(l.chatId) ? false : (seen.add(l.chatId), true)));
+
+      // ===== CAMPANHA =====
+      const campaignId = crypto.randomUUID();
+      const campaignKey = `campaign:${campaignId}`;
+      const createdAt = Date.now();
+      const totalLeads = leads.length;
+
+      await redis.hset(campaignKey, {
+        id: campaignId,
+        createdAt: String(createdAt),
+        total: String(totalLeads),
+        sent: "0",
+        failed: "0",
+        type: String(type),
+        idColumn: String(idColumnRaw),
+      });
+      await redis.pexpire(campaignKey, 7 * 24 * 60 * 60 * 1000);
+
+      let total = 0;
+      const retention = jobRetentionOptions();
+
+      for (const lead of leads) {
+        const finalCaption = applyTemplate(captionTemplate, lead.vars);
+
+        const jobData =
+          type === "text"
+            ? {
+                chatId: lead.chatId,
+                botToken,
+                limit: { max: limitMax, ms: limitMs },
+                type: "text",
+                campaignId,
+                payload: { text: finalCaption, options },
+              }
+            : {
+                chatId: lead.chatId,
+                botToken,
+                limit: { max: limitMax, ms: limitMs },
+                type,
+                campaignId,
+                payload: {
+                  file: mediaSource,
+                  caption: finalCaption || "",
+                  options,
+                },
+              };
+
+        // ✅ Passo 9: retenção de jobs
+        await queue.add("envio", jobData, retention);
+        total++;
+      }
+
+      // apaga CSV upload
+      try {
+        if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
+      } catch {}
+
+      return res.json({
+        ok: true,
+        campaignId,
+        total,
+        buttons: buttons.length,
+        source: "csv",
+        idColumn: idColumnRaw,
+        unique: leads.length,
+        media: type === "text" ? null : fileUrl ? "url" : "upload-url",
+        mediaSource: type === "text" ? null : mediaSource,
+        retention: {
+          completed: retention.removeOnComplete?.count,
+          failed: retention.removeOnFail?.count,
+        },
+      });
+    } catch (err) {
+      console.error("❌ /disparar erro:", err);
+
+      try {
+        if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
+      } catch {}
+
+      return res.status(500).json({ ok: false, error: "Erro interno", detail: err?.message });
+    }
+  }
+);
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("✅ API rodando na porta", PORT));
