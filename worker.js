@@ -10,48 +10,26 @@ const { pipeline } = require("stream/promises");
 const { Readable } = require("stream");
 
 // ===== ✅ Redis client (status campanha) =====
-function buildRedisUrlFromConnection(conn) {
-  if (!conn) return null;
-  if (typeof conn === "string") return conn;
-  const host = conn.host || conn.hostname;
-  const port = conn.port || 6379;
-  if (!host) return null;
+const redis = new IORedis(connection);
+redis.on("error", (e) => console.error("❌ Redis (status) error:", e.message));
+redis.on("connect", () => console.log("✅ Redis (status) conectado"));
 
-  const password = conn.password ? encodeURIComponent(conn.password) : null;
-  const db = Number.isFinite(conn.db) ? conn.db : null;
-
-  let auth = "";
-  if (password) auth = `:${password}@`;
-
-  let url = `redis://${auth}${host}:${port}`;
-  if (db != null) url += `/${db}`;
-  return url;
-}
-
-const REDIS_URL =
-  (process.env.REDIS_URL && process.env.REDIS_URL.trim()) ||
-  buildRedisUrlFromConnection(connection);
-
-if (!REDIS_URL) {
-  throw new Error(
-    "REDIS_URL não definido e não foi possível inferir pelo connection. Defina REDIS_URL (ex: redis://redis-fila:6379)."
-  );
-}
-
-const redis = new IORedis(REDIS_URL);
-redis.on("error", (e) => console.error("❌ Redis error:", e.message));
-redis.on("connect", () => console.log("✅ Redis (status) conectado via", REDIS_URL));
-
+// ===== Token default (opcional) =====
 const DEFAULT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!DEFAULT_TOKEN) {
-  console.warn("⚠️ TELEGRAM_BOT_TOKEN não definido (ok se você sempre mandar botToken no job).");
+  console.warn(
+    "⚠️ TELEGRAM_BOT_TOKEN não definido (ok se você sempre mandar botToken no job)."
+  );
 }
 
 // ===== cache de bots por token =====
 const botCache = new Map();
 function getBot(token) {
   const t = token || DEFAULT_TOKEN;
-  if (!t) throw new Error("Nenhum token disponível (botToken do job ou TELEGRAM_BOT_TOKEN no env)");
+  if (!t)
+    throw new Error(
+      "Nenhum token disponível (botToken do job ou TELEGRAM_BOT_TOKEN no env)"
+    );
   if (botCache.has(t)) return botCache.get(t);
   const bot = new TelegramBot(t, { polling: false });
   botCache.set(t, bot);
@@ -106,7 +84,8 @@ async function downloadUrlToTmp(url) {
     if (!body) throw new Error("Resposta sem body ao baixar arquivo");
 
     const len = Number(r.headers.get("content-length") || 0);
-    if (len && len > maxBytes) throw new Error(`Arquivo grande demais: ${len} bytes (max ${maxBytes})`);
+    if (len && len > maxBytes)
+      throw new Error(`Arquivo grande demais: ${len} bytes (max ${maxBytes})`);
 
     const nodeStream = Readable.fromWeb(body);
 
@@ -115,8 +94,12 @@ async function downloadUrlToTmp(url) {
     nodeStream.on("data", (chunk) => {
       written += chunk.length;
       if (written > maxBytes) {
-        try { ws.destroy(new Error("Arquivo excedeu limite de download")); } catch {}
-        try { ac.abort(); } catch {}
+        try {
+          ws.destroy(new Error("Arquivo excedeu limite de download"));
+        } catch {}
+        try {
+          ac.abort();
+        } catch {}
       }
     });
 
@@ -226,10 +209,7 @@ function rampedRate(base, target, rampSeconds) {
 }
 
 // ===== Adaptive throttle (por token) =====
-// Ideia: 429 => aumenta penalidade por X minutos. Penalidade reduz max e aumenta ms.
-// Depois a penalidade expira sozinha.
 const tokenPenalty = new Map(); // tokenKey -> { level, untilTs }
-
 const PENALTY_BASE_SECONDS = Number(process.env.PENALTY_BASE_SECONDS || 120); // 2 min
 const PENALTY_MAX_LEVEL = Number(process.env.PENALTY_MAX_LEVEL || 6);
 
@@ -256,35 +236,33 @@ function register429(token, retryAfterSeconds) {
 
   const nextLevel = Math.min(PENALTY_MAX_LEVEL, (curLevel || 0) + 1);
 
-  // duração: base (2min) cresce com level; considera retry_after se vier maior
   const baseMs = PENALTY_BASE_SECONDS * 1000;
-  const levelMs = baseMs * (1 + nextLevel * 0.6); // 2m, 3.2m, 4.4m...
+  const levelMs = baseMs * (1 + nextLevel * 0.6);
   const retryMs = (Number(retryAfterSeconds) || 0) * 1000;
 
   const ttlMs = Math.max(levelMs, retryMs || 0);
 
   tokenPenalty.set(k, { level: nextLevel, untilTs: now + ttlMs });
 
-  console.warn(`🧯 Adaptive throttle: token=${maskToken(k)} level=${nextLevel} por ~${Math.round(ttlMs/1000)}s`);
+  console.warn(
+    `🧯 Adaptive throttle: token=${maskToken(k)} level=${nextLevel} por ~${Math.round(
+      ttlMs / 1000
+    )}s`
+  );
 }
 
 function applyPenalty(lim, token) {
   const level = getPenaltyLevel(token);
   if (!level) return lim;
 
-  // quanto maior o level, mais reduz max e aumenta ms
-  // ex level 1 => max/1.3, ms*1.3 ; level 4 => max/2.2, ms*2.2
   const factor = 1 + level * 0.3;
 
-  const max = Math.max(1, Math.floor((Number(lim.max || 1)) / factor));
-  const ms = Math.max(200, Math.round((Number(lim.ms || 1000)) * factor));
+  const max = Math.max(1, Math.floor(Number(lim.max || 1) / factor));
+  const ms = Math.max(200, Math.round(Number(lim.ms || 1000) * factor));
 
   return { max, ms };
 }
 
-/**
- * Ramp-up + caps por tipo (seguro) + penalidade adaptativa por token
- */
 function getEffectiveLimit(type, requested, token) {
   const reqMax = Number(requested?.max || 1);
   const reqMs = Number(requested?.ms || 1000);
@@ -293,11 +271,9 @@ function getEffectiveLimit(type, requested, token) {
   if (type === "text") {
     base = { max: rampedRate(3, Math.min(reqMax, 25), 180), ms: Math.max(200, reqMs) };
   } else {
-    // mídia: cap mais baixo e ms mínimo
     base = { max: rampedRate(1, Math.min(reqMax, 8), 300), ms: Math.max(700, reqMs) };
   }
 
-  // aplica penalidade (se rolou 429 recentemente)
   return applyPenalty(base, token);
 }
 
@@ -331,13 +307,11 @@ const worker = new Worker(
       const { type, payload } = job.data || {};
       if (!type) throw new Error("type ausente no job");
 
-      // efetivo: ramp + caps + adaptive throttle
       const lim = job.data?.limit || { max: 1, ms: 1100 };
       const eff = getEffectiveLimit(type, lim, job.data?.botToken);
 
       await waitForRateLimit(job.data?.botToken, eff.max, eff.ms);
 
-      // helper: se der 429 aqui, registra penalidade e relança pra backoff tratar
       const wrapSend = (fn) =>
         sendWithBackoff(async () => {
           try {
@@ -448,3 +422,5 @@ const worker = new Worker(
 
 worker.on("failed", (job, err) => console.error("❌ Job falhou:", job?.id, err.message));
 worker.on("error", (err) => console.error("❌ Worker error:", err.message));
+
+console.log("✅ Worker iniciado (fila: disparos)");
