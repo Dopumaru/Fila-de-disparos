@@ -1,13 +1,23 @@
-// redis.js
-require("dotenv").config();
+const IORedis = require("ioredis");
 
-const connection = {
+const redis = new IORedis({
   host: process.env.REDIS_HOST || "127.0.0.1",
   port: Number(process.env.REDIS_PORT) || 6379,
   password: process.env.REDIS_PASSWORD || undefined,
-  db: process.env.REDIS_DB ? Number(process.env.REDIS_DB) : undefined,
   maxRetriesPerRequest: null,
   enableReadyCheck: true,
-};
+});
 
-module.exports = connection;
+redis.on("connect", () => {
+  console.log(
+    `✅ Redis conectado em ${process.env.REDIS_HOST || "127.0.0.1"}:${
+      process.env.REDIS_PORT || 6379
+    }`
+  );
+});
+
+redis.on("error", (err) => {
+  console.error("❌ Erro no Redis:", err.message);
+});
+
+module.exports = redis;
