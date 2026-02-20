@@ -9,49 +9,15 @@ const path = require("path");
 const { pipeline } = require("stream/promises");
 const { Readable } = require("stream");
 
-// fetch fallback (caso Node < 18)
-let _fetch = global.fetch;
-if (!_fetch) {
-  try {
-    _fetch = require("node-fetch");
-  } catch (e) {
-    console.warn("⚠️ Node sem fetch nativo. Instale node-fetch ou use Node 18+.");
-  }
+// Redis client (para status da campanha)
+let redis;
+try {
+  redis = new IORedis(connection);
+} catch (e) {
+  console.warn("⚠️ Falha ao iniciar Redis client via 'connection'. Tentando REDIS_URL...");
+  if (!process.env.REDIS_URL) throw e;
+  redis = new IORedis(process.env.REDIS_URL);
 }
-
-// ===== ✅ Redis client (status campanha) =====
-function buildRedisUrlFromConnection(conn) {
-  if (!conn) return null;
-  if (typeof conn === "string") return conn;
-
-  const host = conn.host || conn.hostname;
-  const port = conn.port || 6379;
-  if (!host) return null;
-
-  const password = conn.password ? encodeURIComponent(conn.password) : null;
-  const db = Number.isFinite(conn.db) ? conn.db : null;
-
-  let auth = "";
-  if (password) auth = `:${password}@`;
-
-  let url = `redis://${auth}${host}:${port}`;
-  if (db != null) url += `/${db}`;
-  return url;
-}
-
-const REDIS_URL =
-  (process.env.REDIS_URL && process.env.REDIS_URL.trim()) ||
-  buildRedisUrlFromConnection(connection);
-
-if (!REDIS_URL) {
-  throw new Error(
-    "REDIS_URL não definido e não foi possível inferir pelo connection. Defina REDIS_URL (ex: redis://host:6379)."
-  );
-}
-
-const redis = new IORedis(REDIS_URL);
-redis.on("error", (e) => console.error("❌ Redis error:", e.message));
-redis.on("connect", () => console.log("✅ Redis (status) conectado via", REDIS_URL));
 
 const DEFAULT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
@@ -59,7 +25,7 @@ if (!DEFAULT_TOKEN) {
   console.warn("⚠️ TELEGRAM_BOT_TOKEN não definido (ok se você sempre mandar botToken no job).");
 }
 
-// ===== cache de bots por token =====
+// cache de bots por token
 const botCache = new Map();
 function getBot(token) {
   const t = token || DEFAULT_TOKEN;
@@ -87,13 +53,12 @@ function safeUnlink(p) {
   } catch {}
 }
 
-// ===== Download seguro: URL -> /tmp (com timeout e limite) =====
+// baixa URL (inclusive interna do docker) -> salva em /tmp -> retorna caminho
 async function downloadUrlToTmp(url) {
-  if (!_fetch) throw new Error("fetch não disponível no Node. Use Node 18+ ou instale node-fetch.");
-
   const u = String(url || "").trim();
   const urlObj = new URL(u);
 
+  // tenta manter extensão
   let ext = path.extname(urlObj.pathname || "");
   if (!ext) ext = ".bin";
 
@@ -102,60 +67,44 @@ async function downloadUrlToTmp(url) {
     `tg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}${ext}`
   );
 
-  const timeoutMs = Number(process.env.DOWNLOAD_TIMEOUT_MS || 20000);
-  const ac = new AbortController();
-  const to = setTimeout(() => ac.abort(), timeoutMs);
+  const r = await fetch(u);
+  if (!r.ok) throw new Error(`Falha ao baixar arquivo (${r.status})`);
 
-  const maxBytes = Number(process.env.DOWNLOAD_MAX_BYTES || 80 * 1024 * 1024); // 80MB
+  // stream web -> node
+  const body = r.body;
+  if (!body) throw new Error("Resposta sem body ao baixar arquivo");
 
-  try {
-    const r = await _fetch(u, { signal: ac.signal });
-    if (!r.ok) throw new Error(`Falha ao baixar arquivo (${r.status})`);
-
-    const body = r.body;
-    if (!body) throw new Error("Resposta sem body ao baixar arquivo");
-
-    const len = Number(r.headers?.get?.("content-length") || 0);
-    if (len && len > maxBytes) {
-      throw new Error(`Arquivo grande demais: ${len} bytes (max ${maxBytes})`);
-    }
-
-    const nodeStream = Readable.fromWeb(body);
-
-    let written = 0;
-    const ws = fs.createWriteStream(tmpPath);
-    nodeStream.on("data", (chunk) => {
-      written += chunk.length;
-      if (written > maxBytes) {
-        try { ws.destroy(new Error("Arquivo excedeu limite de download")); } catch {}
-        try { ac.abort(); } catch {}
-      }
-    });
-
-    await pipeline(nodeStream, ws);
-    return tmpPath;
-  } finally {
-    clearTimeout(to);
-  }
+  const nodeStream = Readable.fromWeb(body);
+  await pipeline(nodeStream, fs.createWriteStream(tmpPath));
+  return tmpPath;
 }
 
+/**
+ * Resolve input do Telegram:
+ * - URL: baixa pra /tmp e manda como ReadStream (garante funcionar com url interna)
+ * - path local existente: ReadStream
+ * - senão: assume file_id do Telegram
+ */
 async function resolveTelegramInput(file) {
   if (!file) throw new Error("payload.file não foi enviado");
   if (typeof file !== "string") throw new Error("payload.file deve ser string");
 
+  // URL -> baixar e virar stream
   if (isHttpUrl(file)) {
     const tmpPath = await downloadUrlToTmp(file);
     return { input: fs.createReadStream(tmpPath), cleanupPath: tmpPath };
   }
 
+  // path local -> stream
   if (fs.existsSync(file)) {
     return { input: fs.createReadStream(file), cleanupPath: null };
   }
 
-  return { input: file, cleanupPath: null }; // file_id do Telegram
+  // file_id do Telegram
+  return { input: file, cleanupPath: null };
 }
 
-// ===== Rate limit por token =====
+// rate limit por token
 const tokenWindows = new Map();
 async function waitForRateLimit(token, max, ms) {
   const key = token || DEFAULT_TOKEN || "no-token";
@@ -179,7 +128,6 @@ async function waitForRateLimit(token, max, ms) {
   }
 }
 
-// ===== Worker =====
 const worker = new Worker(
   "disparos",
   async (job) => {
@@ -274,6 +222,7 @@ const worker = new Worker(
       if (err.response?.body) console.error("Detalhe:", err.response.body);
       throw err;
     } finally {
+      // ✅ atualiza status da campanha (se tiver campaignId)
       const campaignId = job.data?.campaignId;
       if (campaignId) {
         const key = `campaign:${campaignId}`;
@@ -285,6 +234,7 @@ const worker = new Worker(
         }
       }
 
+      // limpa o arquivo temp baixado pelo worker
       if (tmpToCleanup) safeUnlink(tmpToCleanup);
     }
   },
