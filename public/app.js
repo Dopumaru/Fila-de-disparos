@@ -1,6 +1,6 @@
 const API_URL = "/disparar";
 
-// ===== NOVO: endpoints auxiliares =====
+// ===== endpoints auxiliares =====
 const STATUS_URL = (id) => `/campaign/${encodeURIComponent(id)}/status`;
 const QUEUE_STATUS_URL = "/queue/status";
 const QUEUE_PAUSE_URL = "/queue/pause";
@@ -12,14 +12,35 @@ const state = {
   isSending: false,
   isValidating: false,
 
-  // ===== NOVO: campanha atual =====
+  // campanha atual
   campaignId: null,
   pollTimer: null,
   lastStatus: null,
+
+  // ✅ idempotência
+  lastIdempotencyKey: null,
 };
 
 function uid() {
   return Math.random().toString(16).slice(2) + Date.now().toString(16);
+}
+
+// ✅ UUID real (melhor) com fallback
+function makeIdempotencyKey() {
+  try {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+      return window.crypto.randomUUID();
+    }
+  } catch {}
+  // fallback ok (só precisa ser único)
+  return (
+    "idem_" +
+    Math.random().toString(16).slice(2) +
+    "_" +
+    Date.now().toString(16) +
+    "_" +
+    Math.random().toString(16).slice(2)
+  );
 }
 
 function selectedToken() {
@@ -161,7 +182,7 @@ function isHttpUrl(u) {
   return /^https?:\/\//i.test(String(u || "").trim());
 }
 
-// ===== NOVO: helpers campanha/queue =====
+// ===== helpers campanha/queue =====
 async function fetchJson(url, opts) {
   const res = await fetch(url, opts);
   const data = await res.json().catch(() => null);
@@ -173,12 +194,11 @@ async function fetchJson(url, opts) {
 }
 
 function formatPct(p) {
-  const pct = Math.round((Number(p || 0) * 100));
+  const pct = Math.round(Number(p || 0) * 100);
   return isFinite(pct) ? `${pct}%` : "0%";
 }
 
 function updateCampaignView(statusObj, queuePaused) {
-  // Esses elementos só existem se você colar o bloco no index.html (instrução abaixo)
   const box = document.getElementById("campaignBox");
   if (!box) return;
 
@@ -219,17 +239,15 @@ async function pollCampaignOnce() {
   }
 
   state.lastStatus = st;
-
-  // Atualiza painel
   updateCampaignView(st, !!q?.paused);
 
-  // Também escreve uma linha curta no debug (sem spam exagerado)
   appendDebug(
-    `\n[status] total=${st.total} sent=${st.sent} failed=${st.failed} pending=${st.pending} progress=${formatPct(st.progress)}`
+    `\n[status] total=${st.total} sent=${st.sent} failed=${st.failed} pending=${st.pending} progress=${formatPct(
+      st.progress
+    )}`
   );
 
-  // se terminou, para polling
-  if ((st.sent + st.failed) >= st.total && st.total > 0) {
+  if (st.sent + st.failed >= st.total && st.total > 0) {
     stopPolling();
     appendDebug("\n[status] campanha finalizada ✅\n");
   }
@@ -237,19 +255,14 @@ async function pollCampaignOnce() {
 
 function startPolling(campaignId) {
   state.campaignId = campaignId;
-  stopPolling(); // garante limpar timer anterior
+  stopPolling();
 
-  // dispara uma vez agora
   pollCampaignOnce().catch((e) => {
     appendDebug("\n[poll] erro: " + (e?.message || String(e)) + "\n");
   });
 
-  // e depois a cada 1s
   state.pollTimer = setInterval(() => {
-    pollCampaignOnce().catch((e) => {
-      // não derruba tudo por erro temporário
-      console.warn("poll error:", e);
-    });
+    pollCampaignOnce().catch((e) => console.warn("poll error:", e));
   }, 1000);
 }
 
@@ -339,7 +352,6 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
     return setStatus("err", "Limite inválido. Use max >= 1 e intervalo >= 200ms.");
   }
 
-  // mídia: exige URL ou upload (e não deixa os dois)
   if (tipo !== "text") {
     const hasUrl = !!fileUrl;
     const hasUpload = !!file;
@@ -361,6 +373,10 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
   const btnErr = validateButtons(buttons);
   if (btnErr) return setStatus("err", btnErr);
 
+  // ✅ idempotencyKey por envio (evita clique duplo / reenvio acidental)
+  const idempotencyKey = makeIdempotencyKey();
+  state.lastIdempotencyKey = idempotencyKey;
+
   const form = new FormData();
   form.append("botToken", tokenObj.token);
   form.append("type", tipo);
@@ -370,8 +386,8 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
   form.append("limitMax", String(limMax));
   form.append("limitMs", String(limMs));
   form.append("buttons", JSON.stringify(buttons));
+  form.append("idempotencyKey", idempotencyKey); // ✅ novo
 
-  // Se tiver URL, manda URL e NÃO manda upload (URL tem prioridade)
   if (tipo !== "text") {
     if (fileUrl) form.append("fileUrl", fileUrl);
     else if (file) form.append("file", file);
@@ -381,21 +397,58 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
   setStatus("", "Enfileirando...");
 
   appendDebug(
-    "POST " + API_URL + "\n" +
-      "Bot: " + (tokenObj.label || "Bot") + "\n" +
-      "CSV: " + csv.name + "\n" +
-      "Coluna ID: " + idColumn + "\n" +
-      "Tipo: " + tipo + "\n" +
-      "Botões: " + (buttons.length || 0) + "\n" +
-      "Rate: " + limMax + " a cada " + limMs + "ms\n" +
+    "POST " +
+      API_URL +
+      "\n" +
+      "Bot: " +
+      (tokenObj.label || "Bot") +
+      "\n" +
+      "CSV: " +
+      csv.name +
+      "\n" +
+      "Coluna ID: " +
+      idColumn +
+      "\n" +
+      "Tipo: " +
+      tipo +
+      "\n" +
+      "Botões: " +
+      (buttons.length || 0) +
+      "\n" +
+      "Rate: " +
+      limMax +
+      " a cada " +
+      limMs +
+      "ms\n" +
+      "Idempotency: " +
+      idempotencyKey +
+      "\n" +
       (tipo !== "text"
-        ? (fileUrl ? "URL: " + fileUrl + "\n" : (file ? "Upload: " + file.name + "\n" : ""))
+        ? fileUrl
+          ? "URL: " + fileUrl + "\n"
+          : file
+          ? "Upload: " + file.name + "\n"
+          : ""
         : "")
   );
 
   try {
     const res = await fetch(API_URL, { method: "POST", body: form });
     const data = await res.json().catch(() => null);
+
+    // ✅ trata duplicado (quando você implementar no server.js)
+    if (res.status === 409) {
+      setStatus("warn", "Esse disparo já foi processado (evitei duplicar).");
+      appendDebug("\n\n[dup] HTTP 409 - disparo duplicado bloqueado.\n");
+      appendDebug("\nResposta:\n" + JSON.stringify(data, null, 2));
+
+      // opcional: se seu server devolver campaignId no 409, a gente monitora
+      if (data?.campaignId) {
+        appendDebug("\n\ncampaignId existente: " + data.campaignId + "\n");
+        startPolling(data.campaignId);
+      }
+      return;
+    }
 
     if (!res.ok) {
       const apiMsg = data?.error || data?.message || (data ? JSON.stringify(data) : "");
@@ -404,9 +457,7 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
 
     setStatus(
       "ok",
-      "Campanha enfileirada. Total: " +
-        (data?.total ?? "?") +
-        (data?.unique ? ` (únicos: ${data.unique})` : "")
+      "Campanha enfileirada. Total: " + (data?.total ?? "?") + (data?.unique ? ` (únicos: ${data.unique})` : "")
     );
 
     if (data?.campaignId) {
@@ -427,7 +478,7 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
 
 renderTokens();
 
-// ===== NOVO: liga botões pause/resume se existirem no HTML =====
+// ===== liga botões pause/resume se existirem no HTML =====
 const btnPause = document.getElementById("btnPause");
 const btnResume = document.getElementById("btnResume");
 if (btnPause) btnPause.addEventListener("click", () => pauseQueue().catch((e) => setStatus("err", e.message)));
