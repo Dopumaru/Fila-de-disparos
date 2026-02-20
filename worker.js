@@ -9,10 +9,21 @@ const path = require("path");
 const { pipeline } = require("stream/promises");
 const { Readable } = require("stream");
 
+// fetch fallback (caso Node < 18)
+let _fetch = global.fetch;
+if (!_fetch) {
+  try {
+    _fetch = require("node-fetch");
+  } catch (e) {
+    console.warn("⚠️ Node sem fetch nativo. Instale node-fetch ou use Node 18+.");
+  }
+}
+
 // ===== ✅ Redis client (status campanha) =====
 function buildRedisUrlFromConnection(conn) {
   if (!conn) return null;
-  if (typeof conn === "string") return conn; // se seu redis.js exporta uma URL
+  if (typeof conn === "string") return conn;
+
   const host = conn.host || conn.hostname;
   const port = conn.port || 6379;
   if (!host) return null;
@@ -34,7 +45,7 @@ const REDIS_URL =
 
 if (!REDIS_URL) {
   throw new Error(
-    "REDIS_URL não definido e não foi possível inferir pelo connection. Defina REDIS_URL (ex: redis://redis-fila:6379)."
+    "REDIS_URL não definido e não foi possível inferir pelo connection. Defina REDIS_URL (ex: redis://host:6379)."
   );
 }
 
@@ -78,10 +89,11 @@ function safeUnlink(p) {
 
 // ===== Download seguro: URL -> /tmp (com timeout e limite) =====
 async function downloadUrlToTmp(url) {
+  if (!_fetch) throw new Error("fetch não disponível no Node. Use Node 18+ ou instale node-fetch.");
+
   const u = String(url || "").trim();
   const urlObj = new URL(u);
 
-  // tenta manter extensão
   let ext = path.extname(urlObj.pathname || "");
   if (!ext) ext = ".bin";
 
@@ -90,41 +102,33 @@ async function downloadUrlToTmp(url) {
     `tg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}${ext}`
   );
 
-  // timeout no fetch
   const timeoutMs = Number(process.env.DOWNLOAD_TIMEOUT_MS || 20000);
   const ac = new AbortController();
   const to = setTimeout(() => ac.abort(), timeoutMs);
 
-  // limite de tamanho (evita estourar disco/tempo)
   const maxBytes = Number(process.env.DOWNLOAD_MAX_BYTES || 80 * 1024 * 1024); // 80MB
 
   try {
-    const r = await fetch(u, { signal: ac.signal });
+    const r = await _fetch(u, { signal: ac.signal });
     if (!r.ok) throw new Error(`Falha ao baixar arquivo (${r.status})`);
 
     const body = r.body;
     if (!body) throw new Error("Resposta sem body ao baixar arquivo");
 
-    // se vier content-length, valida
-    const len = Number(r.headers.get("content-length") || 0);
+    const len = Number(r.headers?.get?.("content-length") || 0);
     if (len && len > maxBytes) {
       throw new Error(`Arquivo grande demais: ${len} bytes (max ${maxBytes})`);
     }
 
     const nodeStream = Readable.fromWeb(body);
 
-    // escreve no disco contando bytes (pra limitar sem depender de header)
     let written = 0;
     const ws = fs.createWriteStream(tmpPath);
     nodeStream.on("data", (chunk) => {
       written += chunk.length;
       if (written > maxBytes) {
-        try {
-          ws.destroy(new Error("Arquivo excedeu limite de download"));
-        } catch {}
-        try {
-          ac.abort();
-        } catch {}
+        try { ws.destroy(new Error("Arquivo excedeu limite de download")); } catch {}
+        try { ac.abort(); } catch {}
       }
     });
 
@@ -135,12 +139,6 @@ async function downloadUrlToTmp(url) {
   }
 }
 
-/**
- * Resolve input do Telegram:
- * - URL: baixa pra /tmp e manda como ReadStream (garante funcionar com url interna)
- * - path local existente: ReadStream
- * - senão: assume file_id do Telegram
- */
 async function resolveTelegramInput(file) {
   if (!file) throw new Error("payload.file não foi enviado");
   if (typeof file !== "string") throw new Error("payload.file deve ser string");
@@ -154,7 +152,7 @@ async function resolveTelegramInput(file) {
     return { input: fs.createReadStream(file), cleanupPath: null };
   }
 
-  return { input: file, cleanupPath: null };
+  return { input: file, cleanupPath: null }; // file_id do Telegram
 }
 
 // ===== Rate limit por token =====
@@ -226,30 +224,21 @@ const worker = new Worker(
         case "audio": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendAudio(chatId, input, {
-            caption: payload?.caption,
-            ...(payload?.options || {}),
-          });
+          await bot.sendAudio(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
           break;
         }
 
         case "video": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendVideo(chatId, input, {
-            caption: payload?.caption,
-            ...(payload?.options || {}),
-          });
+          await bot.sendVideo(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
           break;
         }
 
         case "voice": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendVoice(chatId, input, {
-            caption: payload?.caption,
-            ...(payload?.options || {}),
-          });
+          await bot.sendVoice(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
           break;
         }
 
@@ -263,20 +252,14 @@ const worker = new Worker(
         case "photo": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendPhoto(chatId, input, {
-            caption: payload?.caption,
-            ...(payload?.options || {}),
-          });
+          await bot.sendPhoto(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
           break;
         }
 
         case "document": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendDocument(chatId, input, {
-            caption: payload?.caption,
-            ...(payload?.options || {}),
-          });
+          await bot.sendDocument(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
           break;
         }
 
@@ -291,7 +274,6 @@ const worker = new Worker(
       if (err.response?.body) console.error("Detalhe:", err.response.body);
       throw err;
     } finally {
-      // ✅ atualiza status da campanha (se tiver campaignId)
       const campaignId = job.data?.campaignId;
       if (campaignId) {
         const key = `campaign:${campaignId}`;
@@ -303,7 +285,6 @@ const worker = new Worker(
         }
       }
 
-      // limpa o arquivo temp baixado pelo worker
       if (tmpToCleanup) safeUnlink(tmpToCleanup);
     }
   },
