@@ -8,7 +8,6 @@ const multer = require("multer");
 const crypto = require("crypto");
 const IORedis = require("ioredis");
 const { Queue } = require("bullmq");
-const connection = require("../redis");
 
 const app = express();
 app.use(cors());
@@ -56,8 +55,8 @@ app.use(
 
 // ✅ multer em disco + mantém extensão + limites
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => {
+  destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
+  filename: (_req, file, cb) => {
     const ext = path.extname(file.originalname || "");
     const name =
       Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8) + ext;
@@ -72,41 +71,24 @@ const upload = multer({
   },
 });
 
-const queue = new Queue("disparos", { connection });
-
-// ===== ✅ Redis client (para status de campanha) =====
-function buildRedisUrlFromConnection(conn) {
-  if (!conn) return null;
-  if (typeof conn === "string") return conn; // se seu redis.js exporta uma URL
-  const host = conn.host || conn.hostname;
-  const port = conn.port || 6379;
-  if (!host) return null;
-
-  // suporte opcional a senha/db se existirem no objeto
-  const password = conn.password ? encodeURIComponent(conn.password) : null;
-  const db = Number.isFinite(conn.db) ? conn.db : null;
-
-  let auth = "";
-  if (password) auth = `:${password}@`;
-
-  let url = `redis://${auth}${host}:${port}`;
-  if (db != null) url += `/${db}`;
-  return url;
-}
-
-const REDIS_URL =
-  (process.env.REDIS_URL && process.env.REDIS_URL.trim()) ||
-  buildRedisUrlFromConnection(connection);
-
+// ===== ✅ Redis/BullMQ connection (ÚNICA fonte de verdade: REDIS_URL) =====
+const REDIS_URL = (process.env.REDIS_URL || "").trim();
 if (!REDIS_URL) {
   throw new Error(
-    "REDIS_URL não definido e não foi possível inferir pelo connection. Defina REDIS_URL (ex: redis://redis-fila:6379)."
+    "REDIS_URL não definido. Ex: redis://default:SENHA@redis-fila:6379/0"
   );
 }
 
-const redis = new IORedis(REDIS_URL);
-redis.on("error", (e) => console.error("❌ Redis error:", e.message));
-redis.on("connect", () => console.log("✅ Redis (status) conectado via", REDIS_URL));
+const connection = new IORedis(REDIS_URL, {
+  maxRetriesPerRequest: null, // obrigatório pro BullMQ
+  enableReadyCheck: true,
+});
+
+connection.on("error", (e) => console.error("❌ Redis error:", e.message));
+connection.on("connect", () => console.log("✅ Redis conectado via", REDIS_URL));
+
+const redis = connection; // usamos o mesmo IORedis pra status
+const queue = new Queue("disparos", { connection });
 
 // ===== Utils =====
 function isHttpUrl(u) {
@@ -386,13 +368,12 @@ const allowedByType = {
   audio: [".mp3", ".m4a", ".wav", ".ogg"],
   voice: [".ogg"],
   video_note: [".mp4"],
-  document: [], // deixa livre (PDF/ZIP/etc). Se quiser travar, coloque lista.
+  document: [], // livre
 };
 
 // ===== 9) Retenção de jobs (BullMQ) =====
-// Ajuste fino via env (opcional). Defaults seguros.
-const RETAIN_COMPLETED = Number(process.env.RETAIN_COMPLETED || 2000); // últimos 2000 concluídos
-const RETAIN_FAILED = Number(process.env.RETAIN_FAILED || 5000); // últimos 5000 falhados
+const RETAIN_COMPLETED = Number(process.env.RETAIN_COMPLETED || 2000);
+const RETAIN_FAILED = Number(process.env.RETAIN_FAILED || 5000);
 
 function jobRetentionOptions() {
   const completed =
@@ -404,16 +385,6 @@ function jobRetentionOptions() {
     removeOnComplete: { count: completed },
     removeOnFail: { count: failed },
   };
-}
-
-// ===== NOVO: 1) Idempotência (bloqueia disparo duplicado) =====
-const IDEM_TTL_SECONDS = Number(process.env.IDEM_TTL_SECONDS || 3600); // 1h
-
-async function acquireIdempotency(botToken, idempotencyKey) {
-  const k = `idem:${botToken}:${idempotencyKey}`;
-  // SET NX EX
-  const ok = await redis.set(k, "1", "NX", "EX", IDEM_TTL_SECONDS);
-  return !!ok;
 }
 
 // ===== ROUTE =====
@@ -437,9 +408,6 @@ app.post(
       const idColumnRaw = (req.body.idColumn || "chatId").trim();
       const idColumn = normalizeKey(idColumnRaw) || "chatid";
 
-      // ✅ idempotência (simples) — opção 1
-      const idempotencyKey = (req.body.idempotencyKey || "").trim();
-
       let buttons = [];
       try {
         buttons = JSON.parse(req.body.buttons || "[]");
@@ -451,22 +419,6 @@ app.post(
       if (!botToken) return res.status(400).json({ ok: false, error: "botToken é obrigatório." });
       if (!type) return res.status(400).json({ ok: false, error: "type é obrigatório." });
 
-      // ✅ exige idempotencyKey
-      if (!idempotencyKey) {
-        return res.status(400).json({ ok: false, error: "idempotencyKey é obrigatório." });
-      }
-
-      // ✅ bloqueia request duplicada (não retorna campaignId, como você pediu)
-      const firstTime = await acquireIdempotency(botToken, idempotencyKey);
-      if (!firstTime) {
-        return res.status(409).json({
-          ok: false,
-          error: "disparo_duplicado",
-          detail: "Esse disparo já foi processado (idempotencyKey repetida).",
-        });
-      }
-
-      // ✅ valida type permitido
       if (!ALLOWED_TYPES.has(type)) {
         return res.status(400).json({
           ok: false,
@@ -480,12 +432,12 @@ app.post(
       }
 
       if (type === "text" && !String(captionTemplate).trim()) {
-        return res
-          .status(400)
-          .json({ ok: false, error: "Para text, caption (mensagem) é obrigatório." });
+        return res.status(400).json({
+          ok: false,
+          error: "Para text, caption (mensagem) é obrigatório.",
+        });
       }
 
-      // ✅ fileUrl sanity
       if (fileUrl && fileUrl.length > 2000) {
         return res.status(400).json({ ok: false, error: "fileUrl muito longa." });
       }
@@ -508,7 +460,6 @@ app.post(
         }
       }
 
-      // ✅ valida extensão do upload por type (quando aplicável)
       if (type !== "text" && mediaFile) {
         const ext = path.extname(mediaFile.originalname || "").toLowerCase();
         const list = allowedByType[type] || [];
