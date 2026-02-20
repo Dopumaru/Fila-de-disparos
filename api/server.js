@@ -2,14 +2,17 @@
 require("dotenv").config();
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
 const { Queue } = require("bullmq");
 const connection = require("../redis");
+const IORedis = require("ioredis");
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 app.set("trust proxy", 1);
 
 // ===== FRONT (public) =====
@@ -51,7 +54,6 @@ if (!UPLOAD_DIR) {
 
 console.log("📁 Upload dir:", UPLOAD_DIR);
 
-// ✅ Servir uploads por HTTP (worker pega por URL)
 app.use(
   "/uploads",
   express.static(UPLOAD_DIR, {
@@ -78,7 +80,15 @@ const upload = multer({
   },
 });
 
+// ===== Queue + Redis (campaign) =====
 const queue = new Queue("disparos", { connection });
+
+// IMPORTANT: usamos um redis “normal” pra status de campanha
+// se connection for instância do ioredis, reaproveita, senão cria
+const statusRedis =
+  connection && typeof connection.get === "function"
+    ? connection
+    : new IORedis(connection);
 
 // ===== Utils =====
 function isHttpUrl(u) {
@@ -102,7 +112,7 @@ function applyTemplate(template, rowObj) {
   });
 }
 
-// ===== CSV (sem libs) =====
+// ===== CSV (robusto) =====
 function detectDelimiter(text) {
   const firstLine =
     String(text || "")
@@ -115,7 +125,6 @@ function detectDelimiter(text) {
 }
 
 function parseCsvRows(text) {
-  // remove BOM (UTF-8 BOM) e normaliza quebras
   const src = String(text || "")
     .replace(/^\uFEFF/, "")
     .replace(/\r\n/g, "\n")
@@ -125,7 +134,7 @@ function parseCsvRows(text) {
 
   const lines = src
     .split("\n")
-    .map((l) => l.replace(/\uFEFF/g, "")) // reforço anti-bom
+    .map((l) => l.replace(/\uFEFF/g, ""))
     .map((l) => l.trimEnd())
     .filter((l) => l.trim().length > 0);
 
@@ -164,23 +173,14 @@ function parseCsvRows(text) {
   return rows;
 }
 
-/**
- * Constrói items:
- * - Se tiver header + dados: items = [{col0, col1, ... , <headers normalizados>...}]
- * - Se for lista simples (só IDs): items = [{col0: "id"}...]
- */
 function buildRowObjectsFromCsv(text) {
   const rows = parseCsvRows(text);
   if (!rows.length) return { headers: [], items: [] };
 
-  // caso lista simples: 1 coluna e (a) 1 linha OU (b) várias linhas sem header
-  // Vamos detectar se a primeira linha parece header:
-  // - se tem letras (a-z) -> provavelmente header
-  // - se é só número/-,_ etc -> provavelmente dado
   const firstCell = String(rows[0]?.[0] ?? "").trim();
   const looksLikeHeader = /[a-zA-Z]/.test(firstCell);
 
-  // Se não parecer header, tratamos TUDO como dados (lista simples)
+  // lista simples (sem header)
   if (!looksLikeHeader) {
     const items = rows
       .map((r) => String(r?.[0] ?? "").trim())
@@ -189,7 +189,7 @@ function buildRowObjectsFromCsv(text) {
     return { headers: ["col0"], items };
   }
 
-  // modo normal (header + linhas)
+  // header + dados
   const headersRaw = rows[0] || [];
   const headers = headersRaw.map((h, idx) => normalizeKey(h) || `col${idx}`);
 
@@ -200,7 +200,6 @@ function buildRowObjectsFromCsv(text) {
     for (let c = 0; c < headers.length; c++) {
       const key = headers[c] || `col${c}`;
       obj[key] = (r[c] ?? "").toString().trim();
-      // também mantém colunas por índice (col0, col1...) pra facilitar
       obj[`col${c}`] = (r[c] ?? "").toString().trim();
     }
     items.push(obj);
@@ -248,10 +247,103 @@ function buildOptionsFromButtons(buttons, botUsername) {
   return { reply_markup: { inline_keyboard } };
 }
 
-// ✅ opcional: limpeza automática depois de X minutos (evita encher disco)
+// ===== Campaign helpers =====
+function newCampaignId() {
+  return "c_" + crypto.randomBytes(10).toString("hex");
+}
+
+function campaignKey(id) {
+  return `campaign:${id}`;
+}
+
+async function initCampaign(id, meta, total) {
+  const key = campaignKey(id);
+  const payload = {
+    id,
+    paused: "0",
+    createdAt: String(Date.now()),
+    total: String(total || 0),
+    sent: "0",
+    failed: "0",
+    meta: JSON.stringify(meta || {}),
+  };
+  await statusRedis.hset(key, payload);
+  // mantém por 24h (ajuste)
+  await statusRedis.expire(key, Number(process.env.CAMPAIGN_TTL_SECONDS || 86400));
+}
+
+async function getCampaign(id) {
+  const key = campaignKey(id);
+  const h = await statusRedis.hgetall(key);
+  if (!h || !h.id) return null;
+
+  const total = Number(h.total || 0);
+  const sent = Number(h.sent || 0);
+  const failed = Number(h.failed || 0);
+  const done = sent + failed;
+  const pct = total > 0 ? Math.floor((done / total) * 100) : 0;
+
+  let meta = {};
+  try { meta = JSON.parse(h.meta || "{}"); } catch {}
+
+  return {
+    id: h.id,
+    paused: h.paused === "1",
+    meta,
+    counts: { total, sent, failed, done, pct },
+  };
+}
+
+async function setCampaignPaused(id, paused) {
+  const key = campaignKey(id);
+  await statusRedis.hset(key, { paused: paused ? "1" : "0" });
+}
+
+async function isCampaignPaused(id) {
+  const key = campaignKey(id);
+  const v = await statusRedis.hget(key, "paused");
+  return v === "1";
+}
+
+// ===== Campaign routes =====
+app.get("/campaign/:id", async (req, res) => {
+  try {
+    const c = await getCampaign(req.params.id);
+    if (!c) return res.status(404).json({ ok: false, error: "Campaign não encontrada." });
+    return res.json({ ok: true, campaign: c });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+app.post("/campaign/:id/pause", async (req, res) => {
+  try {
+    const c = await getCampaign(req.params.id);
+    if (!c) return res.status(404).json({ ok: false, error: "Campaign não encontrada." });
+    await setCampaignPaused(req.params.id, true);
+    const out = await getCampaign(req.params.id);
+    return res.json({ ok: true, campaign: out });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+app.post("/campaign/:id/resume", async (req, res) => {
+  try {
+    const c = await getCampaign(req.params.id);
+    if (!c) return res.status(404).json({ ok: false, error: "Campaign não encontrada." });
+    await setCampaignPaused(req.params.id, false);
+    const out = await getCampaign(req.params.id);
+    return res.json({ ok: true, campaign: out });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// ✅ opcional: limpeza automática depois de X minutos
 function scheduleDelete(filePath) {
   const minutes = Number(process.env.UPLOAD_TTL_MINUTES || 180);
-  if (!minutes || minutes <= 0) return; // desliga se 0
+  if (!minutes || minutes <= 0) return;
   setTimeout(() => {
     try {
       if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
@@ -259,7 +351,7 @@ function scheduleDelete(filePath) {
   }, minutes * 60 * 1000);
 }
 
-// ===== ROUTE =====
+// ===== ROUTE /disparar =====
 app.post(
   "/disparar",
   upload.fields([
@@ -273,9 +365,14 @@ app.post(
       const botToken = (req.body.botToken || "").trim();
       const type = (req.body.type || "").trim();
       const captionTemplate = req.body.caption ?? "";
-      const limitMax = Number(req.body.limitMax || 1);
-      const limitMs = Number(req.body.limitMs || 1100);
+      let limitMax = Number(req.body.limitMax || 1);
+      let limitMs = Number(req.body.limitMs || 1000);
       const fileUrl = (req.body.fileUrl || "").trim();
+
+      // 🔒 trava anti-ban no server
+      limitMax = Math.min(25, Math.max(1, limitMax));
+      const allowedMs = new Set([1000, 2000, 3000]);
+      if (!allowedMs.has(limitMs)) limitMs = 2000;
 
       let buttons = [];
       try {
@@ -335,9 +432,6 @@ app.post(
       const { items } = buildRowObjectsFromCsv(csvText);
       if (!items.length) return res.status(400).json({ ok: false, error: "CSV vazio ou inválido." });
 
-      // agora sempre usa a primeira coluna do CSV:
-      // - no modo header: col0 vem do item.col0 (que a gente preencheu)
-      // - no modo lista simples: item.col0 já é o id
       let leads = [];
       for (const row of items) {
         const chatId = String(row?.col0 || "").trim();
@@ -356,6 +450,15 @@ app.post(
       const seen = new Set();
       leads = leads.filter((l) => (seen.has(l.chatId) ? false : (seen.add(l.chatId), true)));
 
+      // ✅ cria campanha e salva status
+      const campaignId = newCampaignId();
+      const meta = {
+        type,
+        buttons: buttons.length,
+        rate: { max: limitMax, ms: limitMs },
+      };
+      await initCampaign(campaignId, meta, leads.length);
+
       let total = 0;
       for (const lead of leads) {
         const finalCaption = applyTemplate(captionTemplate, lead.vars);
@@ -363,6 +466,7 @@ app.post(
         const jobData =
           type === "text"
             ? {
+                campaignId,
                 chatId: lead.chatId,
                 botToken,
                 limit: { max: limitMax, ms: limitMs },
@@ -370,6 +474,7 @@ app.post(
                 payload: { text: finalCaption, options },
               }
             : {
+                campaignId,
                 chatId: lead.chatId,
                 botToken,
                 limit: { max: limitMax, ms: limitMs },
@@ -389,12 +494,14 @@ app.post(
 
       return res.json({
         ok: true,
+        campaignId,
         total,
         buttons: buttons.length,
         source: "csv",
         unique: leads.length,
         media: type === "text" ? null : fileUrl ? "url" : "upload-url",
         mediaSource: type === "text" ? null : mediaSource,
+        rate: { max: limitMax, ms: limitMs },
       });
     } catch (err) {
       console.error("❌ /disparar erro:", err.message);
