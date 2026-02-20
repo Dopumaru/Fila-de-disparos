@@ -11,6 +11,9 @@ function campaignResumeUrl(id) {
   return `/campaign/${encodeURIComponent(id)}/resume`;
 }
 
+const ALLOWED_INTERVALS = new Set([1000, 2000, 3000]);
+const MAX_RATE_MAX = 25;
+
 const state = {
   tokens: [],
   selectedTokenId: null,
@@ -140,11 +143,6 @@ function getCsvFile() {
   const el = document.getElementById("csvFile");
   return el?.files?.[0] || null;
 }
-function getIdColumn() {
-  const el = document.getElementById("idColumn");
-  const v = (el?.value || "").trim();
-  return v || "chatId";
-}
 function validateCsvFile(csv) {
   if (!csv) return "Envie um CSV de leads.";
   const name = (csv.name || "").toLowerCase();
@@ -176,7 +174,6 @@ function setCampaignVisible(flag) {
 }
 
 function renderCampaign(c) {
-  // c = { id, paused, meta, counts }
   state.lastCampaign = c;
 
   const idEl = document.getElementById("campaignId");
@@ -224,7 +221,6 @@ function renderCampaign(c) {
     btnPause.dataset.paused = c.paused ? "1" : "0";
   }
 
-  // ✅ finalizou => para polling + devolutiva
   if (finished) {
     stopCampaignPolling();
     setStatus("ok", `Finalizada. Enviados: ${sent} | Falhas: ${failed} | Total: ${total}`);
@@ -255,7 +251,6 @@ function startCampaignPolling(campaignId) {
       const c = await fetchCampaignOnce(campaignId);
       if (c) renderCampaign(c);
     } catch (e) {
-      // se der 404 ou rede cair, não mata o painel
       setStatus("warn", "Não consegui ler o status da campanha (rede/API).");
       appendDebug(`\n\n[warn] Falha ao ler campaign: ${e?.message || String(e)}`);
     }
@@ -335,7 +330,6 @@ document.getElementById("btnRemoveToken").addEventListener("click", () => {
   renderTokens();
 });
 
-// botão pausa/retoma (se existir no HTML)
 const btnPauseResume = document.getElementById("btnPauseResume");
 if (btnPauseResume) {
   btnPauseResume.addEventListener("click", async () => {
@@ -350,13 +344,12 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
   const mensagemTemplate = document.getElementById("mensagem").value || "";
 
   const limMax = Number(document.getElementById("limitMax").value || 1);
-  const limMs = Number(document.getElementById("limitMs").value || 1100);
+  const limMs = Number(document.getElementById("limitMs").value || 1000);
 
   const file = document.getElementById("arquivo")?.files?.[0] || null;
   const fileUrl = (document.getElementById("fileUrl")?.value || "").trim();
 
   const csv = getCsvFile();
-  const idColumn = getIdColumn();
   const tokenObj = selectedToken();
 
   clearDebug();
@@ -366,14 +359,16 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
   const csvErr = validateCsvFile(csv);
   if (csvErr) return setStatus("err", csvErr);
 
-  if (!idColumn.trim()) return setStatus("err", 'Preencha "Coluna do ID" (ex: chatId).');
-
   if (tipo === "text" && !mensagemTemplate.trim()) {
     return setStatus("err", "Mensagem obrigatória para texto.");
   }
 
-  if (!(limMax >= 1) || !(limMs >= 200)) {
-    return setStatus("err", "Limite inválido. Use max >= 1 e intervalo >= 200ms.");
+  if (!(limMax >= 1) || limMax > MAX_RATE_MAX) {
+    return setStatus("err", `Limite inválido. Use max entre 1 e ${MAX_RATE_MAX}.`);
+  }
+
+  if (!ALLOWED_INTERVALS.has(limMs)) {
+    return setStatus("err", "Intervalo inválido. Use apenas 1s, 2s ou 3s.");
   }
 
   // mídia: exige URL ou upload (e não deixa os dois)
@@ -403,12 +398,10 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
   form.append("type", tipo);
   form.append("caption", mensagemTemplate);
   form.append("csv", csv);
-  form.append("idColumn", idColumn);
   form.append("limitMax", String(limMax));
   form.append("limitMs", String(limMs));
   form.append("buttons", JSON.stringify(buttons));
 
-  // Se tiver URL, manda URL e NÃO manda upload (URL tem prioridade)
   if (tipo !== "text") {
     if (fileUrl) form.append("fileUrl", fileUrl);
     else if (file) form.append("file", file);
@@ -424,35 +417,15 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
   setCampaignVisible(false);
 
   appendDebug(
-    "POST " +
-      API_URL +
-      "\n" +
-      "Bot: " +
-      (tokenObj.label || "Bot") +
-      "\n" +
-      "CSV: " +
-      csv.name +
-      "\n" +
-      "Coluna ID: " +
-      idColumn +
-      "\n" +
-      "Tipo: " +
-      tipo +
-      "\n" +
-      "Botões: " +
-      (buttons.length || 0) +
-      "\n" +
-      "Rate: " +
-      limMax +
-      " a cada " +
-      limMs +
-      "ms\n" +
+    "POST " + API_URL + "\n" +
+      "Bot: " + (tokenObj.label || "Bot") + "\n" +
+      "CSV: " + csv.name + "\n" +
+      "Tipo: " + tipo + "\n" +
+      "Botões: " + (buttons.length || 0) + "\n" +
+      "Rate: " + limMax + " a cada " + (limMs / 1000) + "s\n" +
+      "Dica: Para campanhas grandes, use 1 msg a cada 2–3s.\n" +
       (tipo !== "text"
-        ? fileUrl
-          ? "URL: " + fileUrl + "\n"
-          : file
-          ? "Upload: " + file.name + "\n"
-          : ""
+        ? (fileUrl ? "URL: " + fileUrl + "\n" : (file ? "Upload: " + file.name + "\n" : ""))
         : "")
   );
 
