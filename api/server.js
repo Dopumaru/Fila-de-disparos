@@ -395,14 +395,25 @@ const RETAIN_COMPLETED = Number(process.env.RETAIN_COMPLETED || 2000); // últim
 const RETAIN_FAILED = Number(process.env.RETAIN_FAILED || 5000); // últimos 5000 falhados
 
 function jobRetentionOptions() {
-  // BullMQ aceita count/age; aqui usamos count (mais garantido)
-  const completed = Number.isFinite(RETAIN_COMPLETED) && RETAIN_COMPLETED > 0 ? RETAIN_COMPLETED : 2000;
-  const failed = Number.isFinite(RETAIN_FAILED) && RETAIN_FAILED > 0 ? RETAIN_FAILED : 5000;
+  const completed =
+    Number.isFinite(RETAIN_COMPLETED) && RETAIN_COMPLETED > 0 ? RETAIN_COMPLETED : 2000;
+  const failed =
+    Number.isFinite(RETAIN_FAILED) && RETAIN_FAILED > 0 ? RETAIN_FAILED : 5000;
 
   return {
     removeOnComplete: { count: completed },
     removeOnFail: { count: failed },
   };
+}
+
+// ===== NOVO: 1) Idempotência (bloqueia disparo duplicado) =====
+const IDEM_TTL_SECONDS = Number(process.env.IDEM_TTL_SECONDS || 3600); // 1h
+
+async function acquireIdempotency(botToken, idempotencyKey) {
+  const k = `idem:${botToken}:${idempotencyKey}`;
+  // SET NX EX
+  const ok = await redis.set(k, "1", "NX", "EX", IDEM_TTL_SECONDS);
+  return !!ok;
 }
 
 // ===== ROUTE =====
@@ -426,6 +437,9 @@ app.post(
       const idColumnRaw = (req.body.idColumn || "chatId").trim();
       const idColumn = normalizeKey(idColumnRaw) || "chatid";
 
+      // ✅ idempotência (simples) — opção 1
+      const idempotencyKey = (req.body.idempotencyKey || "").trim();
+
       let buttons = [];
       try {
         buttons = JSON.parse(req.body.buttons || "[]");
@@ -436,6 +450,21 @@ app.post(
       // ===== validações base =====
       if (!botToken) return res.status(400).json({ ok: false, error: "botToken é obrigatório." });
       if (!type) return res.status(400).json({ ok: false, error: "type é obrigatório." });
+
+      // ✅ exige idempotencyKey
+      if (!idempotencyKey) {
+        return res.status(400).json({ ok: false, error: "idempotencyKey é obrigatório." });
+      }
+
+      // ✅ bloqueia request duplicada (não retorna campaignId, como você pediu)
+      const firstTime = await acquireIdempotency(botToken, idempotencyKey);
+      if (!firstTime) {
+        return res.status(409).json({
+          ok: false,
+          error: "disparo_duplicado",
+          detail: "Esse disparo já foi processado (idempotencyKey repetida).",
+        });
+      }
 
       // ✅ valida type permitido
       if (!ALLOWED_TYPES.has(type)) {
@@ -510,7 +539,6 @@ app.post(
         const PORT = process.env.PORT || 3000;
         const internalHost = (process.env.API_INTERNAL_HOST || "api-disparos").trim();
 
-        // aviso útil (não quebra)
         if (!process.env.API_INTERNAL_HOST) {
           console.warn("⚠️ API_INTERNAL_HOST não definido. Worker pode não conseguir acessar /uploads.");
         }
@@ -525,7 +553,6 @@ app.post(
       const { headers, items } = buildRowObjectsFromCsv(csvText);
       if (!items.length) return res.status(400).json({ ok: false, error: "CSV vazio ou inválido." });
 
-      // ✅ valida se existe alguma coluna “ID” conhecida no header
       const possibleIdCols = new Set([idColumn, "chatid", "chat_id", "id", "col0"]);
       const hasAnyIdCol = headers.some((h) => possibleIdCols.has(h));
       if (!hasAnyIdCol) {
@@ -604,7 +631,6 @@ app.post(
                 },
               };
 
-        // ✅ Passo 9: retenção de jobs
         await queue.add("envio", jobData, retention);
         total++;
       }
