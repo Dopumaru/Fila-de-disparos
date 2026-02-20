@@ -59,13 +59,9 @@
         <option value="audio">Áudio</option>
         <option value="document">Documento</option>
       </select>
-      <div class="hint">
-        Dica: texto aguenta bem mais volume que vídeo/áudio. Para mídia, use limites menores.
-      </div>
     </div>
   </div>
 
-  <!-- BLOCO DE MÍDIA -->
   <div id="mediaBlock" class="mediaBox">
     <label>Arquivo (Upload)</label>
     <input id="arquivo" type="file" />
@@ -74,13 +70,12 @@
     <label>OU URL do Arquivo</label>
     <input id="fileUrl" placeholder="https://..." />
     <div class="hint">
-      ⚠️ Preencha <b>URL</b> OU selecione <b>Upload</b> (não os dois).<br>
-      Se usar URL, não ocupa espaço no servidor.
+      ⚠️ Preencha <b>URL</b> OU selecione <b>Upload</b> (não os dois).
     </div>
   </div>
 
   <label>Mensagem / Legenda (suporta {variáveis})</label>
-  <textarea id="mensagem" placeholder="Ex: Olá {nome}, vi sua cidade {cidade}!"></textarea>
+  <textarea id="mensagem"></textarea>
 
   <hr>
 
@@ -95,117 +90,31 @@
     </div>
   </div>
 
-  <!-- LIMITES (max 25) + AVISO POR TIPO -->
+  <!-- LIMITES AJUSTADOS PARA 25 -->
   <div class="row">
     <div>
       <label>Limite por intervalo</label>
       <input id="limitMax" type="number" value="1" min="1" max="25" step="1" />
       <div class="hint">
-        Máximo permitido no painel: <b>25</b>. Agressividade muda por tipo (texto vs mídia).
+        Máximo permitido no painel: <b>25</b>.<br>
+        ⚠️ Valores acima de 10/s podem gerar <b>429 Too Many Requests</b>.
       </div>
     </div>
     <div>
       <label>Intervalo (ms)</label>
       <input id="limitMs" type="number" value="1000" min="200" max="60000" step="50" />
       <div class="hint">
-        1000ms = ~1 segundo. Ex: 25/1000ms = 25 envios/s.
+        1000ms = ~1 msg/s.<br>
+        Exemplo agressivo: 25 / 1000ms = 25 msg/s.
       </div>
     </div>
   </div>
 
-  <div id="rateInfo" class="hint" style="margin-top:8px;">
-    Taxa atual: <b id="rateNow">0</b> envios/s
-  </div>
-
-  <div id="rateWarn" class="hint warn" style="display:none; margin-top:8px;"></div>
-
-  <hr>
-
-  <!-- ✅ BLOCO DE BOTÕES (até 4) -->
-  <div class="box" id="buttonsBlock">
-    <label>Botões do Telegram (opcional — até 4)</label>
-    <div class="hint">
-      Tipo <b>URL</b>: abre um link.<br/>
-      Tipo <b>START</b>: cria link https://t.me/SEU_BOT?start=PARAM
-    </div>
-
-    <div class="row">
-      <div><label>Botão 1 - Texto</label><input id="b1Text" placeholder="Ex: Ver oferta" /></div>
-      <div style="max-width: 180px;"><label>Tipo</label>
-        <select id="b1Type">
-          <option value="none">Nenhum</option>
-          <option value="url">URL</option>
-          <option value="start">START</option>
-        </select>
-      </div>
-      <div><label>Destino (URL ou PARAM)</label><input id="b1Value" placeholder="URL: https://... | START: quero_orcamento" /></div>
-    </div>
-
-    <div class="row">
-      <div><label>Botão 2 - Texto</label><input id="b2Text" placeholder="Ex: Falar no Telegram" /></div>
-      <div style="max-width: 180px;"><label>Tipo</label>
-        <select id="b2Type">
-          <option value="none">Nenhum</option>
-          <option value="url">URL</option>
-          <option value="start">START</option>
-        </select>
-      </div>
-      <div><label>Destino (URL ou PARAM)</label><input id="b2Value" placeholder="URL: https://... | START: quero_falar" /></div>
-    </div>
-
-    <div class="row">
-      <div><label>Botão 3 - Texto</label><input id="b3Text" placeholder="Ex: Instagram" /></div>
-      <div style="max-width: 180px;"><label>Tipo</label>
-        <select id="b3Type">
-          <option value="none">Nenhum</option>
-          <option value="url">URL</option>
-          <option value="start">START</option>
-        </select>
-      </div>
-      <div><label>Destino (URL ou PARAM)</label><input id="b3Value" placeholder="URL: https://... | START: insta" /></div>
-    </div>
-
-    <div class="row">
-      <div><label>Botão 4 - Texto</label><input id="b4Text" placeholder="Ex: Suporte" /></div>
-      <div style="max-width: 180px;"><label>Tipo</label>
-        <select id="b4Type">
-          <option value="none">Nenhum</option>
-          <option value="url">URL</option>
-          <option value="start">START</option>
-        </select>
-      </div>
-      <div><label>Destino (URL ou PARAM)</label><input id="b4Value" placeholder="URL: https://... | START: suporte" /></div>
-    </div>
+  <div id="rateWarn" class="hint warn" style="display:none; margin-top:8px;">
+    ⚠️ Configuração agressiva detectada. Alto risco de 429 (flood control).
   </div>
 
   <button id="btnEnviar" type="button">Enviar campanha</button>
-
-  <!-- ✅ NOVO: PAINEL DE STATUS DA CAMPANHA + PAUSE/RESUME -->
-  <div class="box" id="campaignBox" style="display:none;">
-    <h3 style="margin:0 0 10px;">Campanha</h3>
-    <div id="campaignMeta" class="muted"></div>
-
-    <div style="margin-top:10px;">
-      <div class="pill" id="stTotal">Total: 0</div>
-      <div class="pill" id="stSent">Enviados: 0</div>
-      <div class="pill" id="stFailed">Falhas: 0</div>
-      <div class="pill" id="stPending">Pendentes: 0</div>
-    </div>
-
-    <div style="margin-top:12px;">
-      <div style="height:10px;background:#222;border-radius:999px;overflow:hidden;">
-        <div id="bar" style="height:10px;width:0%;background:#4caf50;"></div>
-      </div>
-      <div class="muted" id="stProg" style="margin-top:6px;">0%</div>
-    </div>
-
-    <div class="row" style="margin-top:12px;">
-      <div><button id="btnPause" type="button">Pausar fila</button></div>
-      <div><button id="btnResume" type="button">Retomar fila</button></div>
-    </div>
-
-    <div class="muted" id="queuePausedInfo" style="margin-top:6px;"></div>
-  </div>
 
   <p id="status"></p>
   <pre id="debug"></pre>
@@ -217,36 +126,15 @@
     function refreshUI() {
       mediaBlock.style.display = (tipo.value === "text") ? "none" : "block";
     }
-
     tipo.addEventListener("change", refreshUI);
     refreshUI();
   </script>
 
-  <!-- ✅ CLAMP + AVISO "AGRESSIVO" POR TIPO -->
+  <!-- VALIDAÇÃO DE TAXA -->
   <script>
     const limitMaxEl = document.getElementById("limitMax");
     const limitMsEl = document.getElementById("limitMs");
     const rateWarnEl = document.getElementById("rateWarn");
-    const rateNowEl = document.getElementById("rateNow");
-    const tipoEl = document.getElementById("tipo");
-
-    const LIMIT_MAX_MIN = 1;
-    const LIMIT_MAX_MAX = 25;
-    const LIMIT_MS_MIN = 200;
-    const LIMIT_MS_MAX = 60000;
-
-    // thresholds por tipo (envios/s)
-    // - warn: acima disso começa risco real de 429
-    // - danger: acima disso é MUITO provável dar 429 especialmente com mídia
-    const TH = {
-      text:       { warn: 15, danger: 25, rec: "Texto costuma aguentar mais. Comece em 10–15/s e suba aos poucos." },
-      photo:      { warn: 8,  danger: 12, rec: "Foto é mais pesada. Recomendo 3–8/s." },
-      document:   { warn: 5,  danger: 8,  rec: "Documento pesa. Recomendo 1–5/s." },
-      audio:      { warn: 4,  danger: 7,  rec: "Áudio pesa. Recomendo 1–4/s." },
-      voice:      { warn: 4,  danger: 7,  rec: "Voz (OGG) pesa. Recomendo 1–4/s." },
-      video:      { warn: 2,  danger: 5,  rec: "Vídeo é o pior caso. Recomendo 1–2/s (com backoff dá pra tentar 3–5/s)." },
-      video_note: { warn: 2,  danger: 5,  rec: "Vídeo redondo é pesado. Recomendo 1–2/s." },
-    };
 
     function clampInt(v, min, max, fallback) {
       const n = Number(v);
@@ -254,52 +142,31 @@
       return Math.min(max, Math.max(min, Math.trunc(n)));
     }
 
-    function clampMs(v, min, max, fallback) {
+    function clampMs(v) {
       const n = Number(v);
-      if (!Number.isFinite(n)) return fallback;
-      return Math.min(max, Math.max(min, Math.round(n)));
+      if (!Number.isFinite(n)) return 1000;
+      return Math.min(60000, Math.max(200, Math.round(n)));
     }
 
-    function formatRate(x) {
-      if (!Number.isFinite(x)) return "0";
-      if (x < 10) return x.toFixed(2);
-      return x.toFixed(1);
-    }
-
-    function refreshRateUI() {
-      const max = clampInt(limitMaxEl.value, LIMIT_MAX_MIN, LIMIT_MAX_MAX, 1);
-      const ms = clampMs(limitMsEl.value, LIMIT_MS_MIN, LIMIT_MS_MAX, 1000);
+    function refreshRateWarn() {
+      const max = clampInt(limitMaxEl.value, 1, 25, 1);
+      const ms = clampMs(limitMsEl.value);
 
       limitMaxEl.value = String(max);
       limitMsEl.value = String(ms);
 
       const perSecond = (max / ms) * 1000;
-      rateNowEl.textContent = formatRate(perSecond);
 
-      const t = String(tipoEl.value || "text");
-      const th = TH[t] || TH.text;
-
-      if (perSecond >= th.danger) {
+      if (perSecond > 10) {
         rateWarnEl.style.display = "block";
-        rateWarnEl.innerHTML =
-          `⚠️ <b>MUITO agressivo</b> para <b>${t}</b>: <b>${formatRate(perSecond)}</b>/s. ` +
-          `Alta chance de <b>429</b> e falhas. ${th.rec}`;
-      } else if (perSecond >= th.warn) {
-        rateWarnEl.style.display = "block";
-        rateWarnEl.innerHTML =
-          `⚠️ <b>Agressivo</b> para <b>${t}</b>: <b>${formatRate(perSecond)}</b>/s. ` +
-          `Pode gerar <b>429</b>. ${th.rec}`;
       } else {
         rateWarnEl.style.display = "none";
-        rateWarnEl.textContent = "";
       }
     }
 
-    limitMaxEl.addEventListener("input", refreshRateUI);
-    limitMsEl.addEventListener("input", refreshRateUI);
-    tipoEl.addEventListener("change", refreshRateUI);
-
-    refreshRateUI();
+    limitMaxEl.addEventListener("input", refreshRateWarn);
+    limitMsEl.addEventListener("input", refreshRateWarn);
+    refreshRateWarn();
   </script>
 
   <script src="./app.js"></script>
