@@ -1,10 +1,26 @@
 const API_URL = "/disparar";
 
+// ===== Campaign API =====
+function campaignStatusUrl(id) {
+  return `/campaign/${encodeURIComponent(id)}`;
+}
+function campaignPauseUrl(id) {
+  return `/campaign/${encodeURIComponent(id)}/pause`;
+}
+function campaignResumeUrl(id) {
+  return `/campaign/${encodeURIComponent(id)}/resume`;
+}
+
 const state = {
   tokens: [],
   selectedTokenId: null,
   isSending: false,
   isValidating: false,
+
+  // campaign
+  campaignId: null,
+  campaignPollTimer: null,
+  lastCampaign: null,
 };
 
 function uid() {
@@ -21,6 +37,7 @@ function tokenExists(token) {
 
 function setStatus(type, msg) {
   const el = document.getElementById("status");
+  if (!el) return;
   el.className = type;
   el.textContent = msg || "";
 }
@@ -45,6 +62,7 @@ function setValidating(flag) {
 
 function renderTokens() {
   const area = document.getElementById("tokensArea");
+  if (!area) return;
   area.innerHTML = "";
 
   if (state.tokens.length === 0) {
@@ -150,6 +168,115 @@ function isHttpUrl(u) {
   return /^https?:\/\//i.test(String(u || "").trim());
 }
 
+// ===== Campaign UI helpers =====
+function setCampaignVisible(flag) {
+  const box = document.getElementById("campaignBox");
+  if (!box) return;
+  box.style.display = flag ? "block" : "none";
+}
+
+function renderCampaign(c) {
+  // c = { id, paused, meta, counts }
+  state.lastCampaign = c;
+
+  const idEl = document.getElementById("campaignId");
+  const badgeEl = document.getElementById("campaignPausedBadge");
+  const pctEl = document.getElementById("campaignPct");
+  const sentEl = document.getElementById("campaignSent");
+  const failEl = document.getElementById("campaignFailed");
+  const totalEl = document.getElementById("campaignTotal");
+  const barEl = document.getElementById("campaignBar");
+  const btnPause = document.getElementById("btnPauseResume");
+
+  if (idEl) idEl.textContent = c.id || "-";
+  if (badgeEl) {
+    badgeEl.textContent = c.paused ? "PAUSADA" : "RODANDO";
+    badgeEl.className = "pill " + (c.paused ? "warn" : "ok");
+  }
+
+  const pct = c.counts?.pct ?? 0;
+  const sent = c.counts?.sent ?? 0;
+  const failed = c.counts?.failed ?? 0;
+  const total = c.counts?.total ?? 0;
+
+  if (pctEl) pctEl.textContent = `${pct}%`;
+  if (sentEl) sentEl.textContent = String(sent);
+  if (failEl) failEl.textContent = String(failed);
+  if (totalEl) totalEl.textContent = String(total);
+
+  if (barEl) barEl.style.width = `${Math.min(100, Math.max(0, pct))}%`;
+
+  if (btnPause) {
+    btnPause.disabled = !c.id;
+    btnPause.textContent = c.paused ? "Retomar" : "Pausar";
+    btnPause.dataset.paused = c.paused ? "1" : "0";
+  }
+
+  // Auto-stop polling when finished
+  const done = (c.counts?.done ?? (sent + failed)) || 0;
+  if (total > 0 && done >= total) {
+    stopCampaignPolling();
+  }
+}
+
+function stopCampaignPolling() {
+  if (state.campaignPollTimer) {
+    clearInterval(state.campaignPollTimer);
+    state.campaignPollTimer = null;
+  }
+}
+
+async function fetchCampaignOnce(campaignId) {
+  const res = await fetch(campaignStatusUrl(campaignId));
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+  return data?.campaign;
+}
+
+function startCampaignPolling(campaignId) {
+  stopCampaignPolling();
+  state.campaignId = campaignId;
+  setCampaignVisible(true);
+
+  const tick = async () => {
+    try {
+      const c = await fetchCampaignOnce(campaignId);
+      if (c) renderCampaign(c);
+    } catch (e) {
+      // se der 404 ou rede cair, não mata o painel, só mostra aviso no debug
+      appendDebug(`\n\n[warn] Falha ao ler campaign: ${e?.message || String(e)}`);
+    }
+  };
+
+  tick();
+  state.campaignPollTimer = setInterval(tick, 1200);
+}
+
+async function pauseOrResumeCurrentCampaign() {
+  const c = state.lastCampaign;
+  if (!c?.id) return;
+
+  const paused = !!c.paused;
+  const url = paused ? campaignResumeUrl(c.id) : campaignPauseUrl(c.id);
+
+  const btn = document.getElementById("btnPauseResume");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = paused ? "Retomando..." : "Pausando...";
+  }
+
+  try {
+    const res = await fetch(url, { method: "POST" });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+    if (data?.campaign) renderCampaign(data.campaign);
+  } catch (e) {
+    setStatus("err", "Erro ao pausar/retomar: " + (e?.message || String(e)));
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 // ===== EVENTOS =====
 document.getElementById("btnAddToken").addEventListener("click", async () => {
   const token = document.getElementById("tokenInput").value.trim();
@@ -187,6 +314,14 @@ document.getElementById("btnRemoveToken").addEventListener("click", () => {
   setStatus("ok", "Token removido.");
   renderTokens();
 });
+
+// botão pausa/retoma (se existir no HTML)
+const btnPauseResume = document.getElementById("btnPauseResume");
+if (btnPauseResume) {
+  btnPauseResume.addEventListener("click", async () => {
+    await pauseOrResumeCurrentCampaign();
+  });
+}
 
 document.getElementById("btnEnviar").addEventListener("click", async () => {
   if (state.isSending) return;
@@ -262,16 +397,42 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
   setSending(true);
   setStatus("", "Enfileirando...");
 
+  // reset campaign UI
+  state.campaignId = null;
+  state.lastCampaign = null;
+  stopCampaignPolling();
+  setCampaignVisible(false);
+
   appendDebug(
-    "POST " + API_URL + "\n" +
-      "Bot: " + (tokenObj.label || "Bot") + "\n" +
-      "CSV: " + csv.name + "\n" +
-      "Coluna ID: " + idColumn + "\n" +
-      "Tipo: " + tipo + "\n" +
-      "Botões: " + (buttons.length || 0) + "\n" +
-      "Rate: " + limMax + " a cada " + limMs + "ms\n" +
+    "POST " +
+      API_URL +
+      "\n" +
+      "Bot: " +
+      (tokenObj.label || "Bot") +
+      "\n" +
+      "CSV: " +
+      csv.name +
+      "\n" +
+      "Coluna ID: " +
+      idColumn +
+      "\n" +
+      "Tipo: " +
+      tipo +
+      "\n" +
+      "Botões: " +
+      (buttons.length || 0) +
+      "\n" +
+      "Rate: " +
+      limMax +
+      " a cada " +
+      limMs +
+      "ms\n" +
       (tipo !== "text"
-        ? (fileUrl ? "URL: " + fileUrl + "\n" : (file ? "Upload: " + file.name + "\n" : ""))
+        ? fileUrl
+          ? "URL: " + fileUrl + "\n"
+          : file
+          ? "Upload: " + file.name + "\n"
+          : ""
         : "")
   );
 
@@ -291,9 +452,11 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
         (data?.unique ? ` (únicos: ${data.unique})` : "")
     );
 
-    // se for upload, a API devolve campaignId
     if (data?.campaignId) {
-      appendDebug("\n\ncampaignId: " + data.campaignId + "\n(arquivo será apagado automaticamente no fim da campanha)");
+      appendDebug("\n\ncampaignId: " + data.campaignId);
+      startCampaignPolling(data.campaignId);
+    } else {
+      appendDebug("\n\n[warn] API não retornou campaignId (sem progresso).");
     }
 
     appendDebug("\n\nResposta:\n" + JSON.stringify(data, null, 2));
