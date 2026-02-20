@@ -159,6 +159,65 @@
 
   <hr>
 
+  <!-- ✅ BLOCO DE BOTÕES (até 4) -->
+  <div class="box" id="buttonsBlock">
+    <label>Botões do Telegram (opcional — até 4)</label>
+    <div class="hint">
+      Tipo <b>URL</b>: abre um link.<br/>
+      Tipo <b>START</b>: cria link https://t.me/SEU_BOT?start=PARAM
+    </div>
+
+    <div class="row">
+      <div><label>Botão 1 - Texto</label><input id="b1Text" placeholder="Ex: Ver oferta" /></div>
+      <div style="max-width: 180px;"><label>Tipo</label>
+        <select id="b1Type">
+          <option value="none">Nenhum</option>
+          <option value="url">URL</option>
+          <option value="start">START</option>
+        </select>
+      </div>
+      <div><label>Destino (URL ou PARAM)</label><input id="b1Value" placeholder="URL: https://... | START: quero_orcamento" /></div>
+    </div>
+
+    <div class="row">
+      <div><label>Botão 2 - Texto</label><input id="b2Text" placeholder="Ex: Falar no Telegram" /></div>
+      <div style="max-width: 180px;"><label>Tipo</label>
+        <select id="b2Type">
+          <option value="none">Nenhum</option>
+          <option value="url">URL</option>
+          <option value="start">START</option>
+        </select>
+      </div>
+      <div><label>Destino (URL ou PARAM)</label><input id="b2Value" placeholder="URL: https://... | START: quero_falar" /></div>
+    </div>
+
+    <div class="row">
+      <div><label>Botão 3 - Texto</label><input id="b3Text" placeholder="Ex: Instagram" /></div>
+      <div style="max-width: 180px;"><label>Tipo</label>
+        <select id="b3Type">
+          <option value="none">Nenhum</option>
+          <option value="url">URL</option>
+          <option value="start">START</option>
+        </select>
+      </div>
+      <div><label>Destino (URL ou PARAM)</label><input id="b3Value" placeholder="URL: https://... | START: insta" /></div>
+    </div>
+
+    <div class="row">
+      <div><label>Botão 4 - Texto</label><input id="b4Text" placeholder="Ex: Suporte" /></div>
+      <div style="max-width: 180px;"><label>Tipo</label>
+        <select id="b4Type">
+          <option value="none">Nenhum</option>
+          <option value="url">URL</option>
+          <option value="start">START</option>
+        </select>
+      </div>
+      <div><label>Destino (URL ou PARAM)</label><input id="b4Value" placeholder="URL: https://... | START: suporte" /></div>
+    </div>
+  </div>
+
+  <hr>
+
   <div class="box" id="campaignBox" style="display:none;">
     <div class="campaignLine">
       <div>
