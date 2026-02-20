@@ -27,7 +27,6 @@
     .mediaBox { background:#fafafa; padding:14px; border-radius:10px; border:1px solid #eee; margin-top:10px; }
     .box { background:#fafafa; padding:14px; border-radius:10px; border:1px solid #eee; margin-top:10px; }
 
-    /* ===== Campaign progress UI (novo) ===== */
     .progressWrap {
       width: 100%;
       height: 12px;
@@ -63,6 +62,17 @@
       padding: 8px 10px;
       font-size: 12px;
     }
+    .banHint {
+      background:#fff;
+      border:1px solid #eee;
+      border-radius:10px;
+      padding:10px;
+      margin-top:10px;
+      font-size:12px;
+      color:#444;
+      line-height: 1.35;
+    }
+    .banHint b { color:#000; }
   </style>
 </head>
 <body>
@@ -99,7 +109,6 @@
     </div>
   </div>
 
-  <!-- BLOCO DE MÍDIA -->
   <div id="mediaBlock" class="mediaBox">
     <label>Arquivo (Upload)</label>
     <input id="arquivo" type="file" />
@@ -118,88 +127,38 @@
 
   <hr>
 
-  <label>CSV de leads (obrigatório)</label>
-  <div class="row">
-    <div>
-      <input id="csvFile" type="file" accept=".csv,text/csv" />
-    </div>
-    <div style="max-width:220px;">
-      <label>Coluna do ID</label>
-      <input id="idColumn" value="chatId" />
-    </div>
+  <label>CSV de leads (primeira coluna deve conter os IDs)</label>
+  <input id="csvFile" type="file" accept=".csv,text/csv" />
+  <div class="hint">
+    ⚠️ A primeira coluna do CSV (coluna A) será usada automaticamente como ID.
   </div>
 
   <div class="row">
     <div>
-      <label>Limite por intervalo</label>
-      <input id="limitMax" type="number" value="1" min="1" />
+      <label>Limite por intervalo (máx 25)</label>
+      <select id="limitMax"></select>
+      <div class="hint">Recomendado: <b>1</b> (mais seguro). Evite valores altos.</div>
     </div>
     <div>
-      <label>Intervalo (ms)</label>
-      <input id="limitMs" type="number" value="1100" min="200" />
+      <label>Intervalo</label>
+      <select id="limitMs">
+        <option value="1000">1 segundo</option>
+        <option value="2000">2 segundos</option>
+        <option value="3000">3 segundos</option>
+      </select>
+      <div class="hint">Mais seguro: <b>2s</b> ou <b>3s</b>, principalmente em campanhas longas.</div>
     </div>
+  </div>
+
+  <div class="banHint">
+    <b>Dicas anti-ban (práticas):</b><br>
+    • Prefira <b>1 msg a cada 2–3s</b> em listas grandes.<br>
+    • Evite spam em grupos / usuários que não interagiram com o bot.<br>
+    • Se começar erro 429 (Too Many Requests), aumente o intervalo e pause a campanha.
   </div>
 
   <hr>
 
-  <!-- ✅ BLOCO DE BOTÕES (até 4) -->
-  <div class="box" id="buttonsBlock">
-    <label>Botões do Telegram (opcional — até 4)</label>
-    <div class="hint">
-      Tipo <b>URL</b>: abre um link.<br/>
-      Tipo <b>START</b>: cria link https://t.me/SEU_BOT?start=PARAM
-    </div>
-
-    <div class="row">
-      <div><label>Botão 1 - Texto</label><input id="b1Text" placeholder="Ex: Ver oferta" /></div>
-      <div style="max-width: 180px;"><label>Tipo</label>
-        <select id="b1Type">
-          <option value="none">Nenhum</option>
-          <option value="url">URL</option>
-          <option value="start">START</option>
-        </select>
-      </div>
-      <div><label>Destino (URL ou PARAM)</label><input id="b1Value" placeholder="URL: https://... | START: quero_orcamento" /></div>
-    </div>
-
-    <div class="row">
-      <div><label>Botão 2 - Texto</label><input id="b2Text" placeholder="Ex: Falar no Telegram" /></div>
-      <div style="max-width: 180px;"><label>Tipo</label>
-        <select id="b2Type">
-          <option value="none">Nenhum</option>
-          <option value="url">URL</option>
-          <option value="start">START</option>
-        </select>
-      </div>
-      <div><label>Destino (URL ou PARAM)</label><input id="b2Value" placeholder="URL: https://... | START: quero_falar" /></div>
-    </div>
-
-    <div class="row">
-      <div><label>Botão 3 - Texto</label><input id="b3Text" placeholder="Ex: Instagram" /></div>
-      <div style="max-width: 180px;"><label>Tipo</label>
-        <select id="b3Type">
-          <option value="none">Nenhum</option>
-          <option value="url">URL</option>
-          <option value="start">START</option>
-        </select>
-      </div>
-      <div><label>Destino (URL ou PARAM)</label><input id="b3Value" placeholder="URL: https://... | START: insta" /></div>
-    </div>
-
-    <div class="row">
-      <div><label>Botão 4 - Texto</label><input id="b4Text" placeholder="Ex: Suporte" /></div>
-      <div style="max-width: 180px;"><label>Tipo</label>
-        <select id="b4Type">
-          <option value="none">Nenhum</option>
-          <option value="url">URL</option>
-          <option value="start">START</option>
-        </select>
-      </div>
-      <div><label>Destino (URL ou PARAM)</label><input id="b4Value" placeholder="URL: https://... | START: suporte" /></div>
-    </div>
-  </div>
-
-  <!-- ✅ BLOCO DE CAMPANHA (novo) -->
   <div class="box" id="campaignBox" style="display:none;">
     <div class="campaignLine">
       <div>
@@ -211,7 +170,7 @@
       </div>
     </div>
 
-    <div class="progressWrap" title="Progresso">
+    <div class="progressWrap">
       <div id="campaignBar" class="progressBar"></div>
     </div>
 
@@ -225,7 +184,6 @@
     <div class="row" style="margin-top:10px;">
       <div>
         <button id="btnPauseResume" type="button">Pausar</button>
-        <div class="hint">Pausa/retoma sem travar o worker (jobs ficam adiados enquanto pausado).</div>
       </div>
     </div>
   </div>
@@ -236,6 +194,16 @@
   <pre id="debug"></pre>
 
   <script>
+    // popula limitMax 1..25
+    const limitMaxEl = document.getElementById("limitMax");
+    for (let i = 1; i <= 25; i++) {
+      const opt = document.createElement("option");
+      opt.value = String(i);
+      opt.textContent = String(i);
+      if (i === 1) opt.selected = true;
+      limitMaxEl.appendChild(opt);
+    }
+
     const tipo = document.getElementById("tipo");
     const mediaBlock = document.getElementById("mediaBlock");
 
