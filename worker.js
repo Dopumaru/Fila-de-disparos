@@ -14,25 +14,33 @@ if (!DEFAULT_TOKEN) {
   console.warn("⚠️ TELEGRAM_BOT_TOKEN não definido (ok se você sempre mandar botToken no job).");
 }
 
-// ===== Campaign helpers (Redis keys) =====
-function cKey(id, suffix) {
-  return `campaign:${id}:${suffix}`;
+// ===== Campaign helpers (ALINHADO com o server.js) =====
+// server usa: key = campaign:<id> (hash) com campos: paused, sent, failed, total...
+function campaignKey(id) {
+  return `campaign:${id}`;
 }
 
 async function isCampaignPaused(campaignId) {
   if (!campaignId) return false;
-  const v = await connection.get(cKey(campaignId, "paused"));
+  const v = await connection.hget(campaignKey(campaignId), "paused");
   return String(v || "0") === "1";
 }
 
 async function incCampaignSent(campaignId) {
   if (!campaignId) return;
-  await connection.hincrby(cKey(campaignId, "counts"), "sent", 1);
+  await connection.hincrby(campaignKey(campaignId), "sent", 1);
 }
 
 async function incCampaignFailed(campaignId) {
   if (!campaignId) return;
-  await connection.hincrby(cKey(campaignId, "counts"), "failed", 1);
+  await connection.hincrby(campaignKey(campaignId), "failed", 1);
+}
+
+// Evita contar "failed" múltiplas vezes se houver retries
+function shouldCountFinalFailure(job) {
+  const maxAttempts = Number(job?.opts?.attempts ?? 1);
+  const attemptIndex = Number(job?.attemptsMade ?? 0) + 1; // tentativa atual (1-based)
+  return attemptIndex >= maxAttempts;
 }
 
 // cache de bots por token
@@ -80,7 +88,6 @@ async function downloadUrlToTmp(url) {
   const r = await fetch(u);
   if (!r.ok) throw new Error(`Falha ao baixar arquivo (${r.status})`);
 
-  // stream web -> node
   const body = r.body;
   if (!body) throw new Error("Resposta sem body ao baixar arquivo");
 
@@ -99,18 +106,15 @@ async function resolveTelegramInput(file) {
   if (!file) throw new Error("payload.file não foi enviado");
   if (typeof file !== "string") throw new Error("payload.file deve ser string");
 
-  // URL -> baixar e virar stream
   if (isHttpUrl(file)) {
     const tmpPath = await downloadUrlToTmp(file);
     return { input: fs.createReadStream(tmpPath), cleanupPath: tmpPath };
   }
 
-  // path local -> stream
   if (fs.existsSync(file)) {
     return { input: fs.createReadStream(file), cleanupPath: null };
   }
 
-  // file_id do Telegram
   return { input: file, cleanupPath: null };
 }
 
@@ -147,11 +151,10 @@ const worker = new Worker(
     const campaignId = job.data?.campaignId || null;
 
     try {
-      // ✅ pausa por campanha (não trava o worker)
+      // ✅ pausa por campanha: re-enfileira o job como delayed e sai sem erro
       if (campaignId) {
         const paused = await isCampaignPaused(campaignId);
         if (paused) {
-          // joga o job pra frente e sai sem erro
           const delayMs = Math.max(500, PAUSE_RETRY_MS);
           await job.moveToDelayed(Date.now() + delayMs);
           console.log("⏸️ Campaign pausada. Job adiado:", job.id, "campaignId:", campaignId);
@@ -196,21 +199,30 @@ const worker = new Worker(
         case "audio": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendAudio(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
+          await bot.sendAudio(chatId, input, {
+            caption: payload?.caption,
+            ...(payload?.options || {}),
+          });
           break;
         }
 
         case "video": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendVideo(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
+          await bot.sendVideo(chatId, input, {
+            caption: payload?.caption,
+            ...(payload?.options || {}),
+          });
           break;
         }
 
         case "voice": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendVoice(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
+          await bot.sendVoice(chatId, input, {
+            caption: payload?.caption,
+            ...(payload?.options || {}),
+          });
           break;
         }
 
@@ -224,14 +236,20 @@ const worker = new Worker(
         case "photo": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendPhoto(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
+          await bot.sendPhoto(chatId, input, {
+            caption: payload?.caption,
+            ...(payload?.options || {}),
+          });
           break;
         }
 
         case "document": {
           const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
           tmpToCleanup = cleanupPath;
-          await bot.sendDocument(chatId, input, { caption: payload?.caption, ...(payload?.options || {}) });
+          await bot.sendDocument(chatId, input, {
+            caption: payload?.caption,
+            ...(payload?.options || {}),
+          });
           break;
         }
 
@@ -245,12 +263,13 @@ const worker = new Worker(
       console.error("❌ Telegram erro:", err.message);
       if (err.response?.body) console.error("Detalhe:", err.response.body);
 
-      // ✅ marca failed no progresso (somente erro real)
-      await incCampaignFailed(campaignId);
+      // ✅ só conta failed na última tentativa (evita double count com retry)
+      if (shouldCountFinalFailure(job)) {
+        await incCampaignFailed(campaignId);
+      }
 
       throw err;
     } finally {
-      // limpa o arquivo temp baixado pelo worker
       if (tmpToCleanup) safeUnlink(tmpToCleanup);
     }
   },
