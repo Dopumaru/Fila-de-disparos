@@ -189,17 +189,29 @@ function renderCampaign(c) {
   const btnPause = document.getElementById("btnPauseResume");
 
   if (idEl) idEl.textContent = c.id || "-";
+
+  const pct = Number(c.counts?.pct ?? 0);
+  const sent = Number(c.counts?.sent ?? 0);
+  const failed = Number(c.counts?.failed ?? 0);
+  const total = Number(c.counts?.total ?? 0);
+
+  const done = Number(c.counts?.done ?? (sent + failed));
+  const finished = total > 0 && done >= total;
+
   if (badgeEl) {
-    badgeEl.textContent = c.paused ? "PAUSADA" : "RODANDO";
-    badgeEl.className = "pill " + (c.paused ? "warn" : "ok");
+    if (finished) {
+      badgeEl.textContent = "FINALIZADA";
+      badgeEl.className = "pill ok";
+    } else if (c.paused) {
+      badgeEl.textContent = "PAUSADA";
+      badgeEl.className = "pill warn";
+    } else {
+      badgeEl.textContent = "RODANDO";
+      badgeEl.className = "pill ok";
+    }
   }
 
-  const pct = c.counts?.pct ?? 0;
-  const sent = c.counts?.sent ?? 0;
-  const failed = c.counts?.failed ?? 0;
-  const total = c.counts?.total ?? 0;
-
-  if (pctEl) pctEl.textContent = `${pct}%`;
+  if (pctEl) pctEl.textContent = `${Math.min(100, Math.max(0, pct))}%`;
   if (sentEl) sentEl.textContent = String(sent);
   if (failEl) failEl.textContent = String(failed);
   if (totalEl) totalEl.textContent = String(total);
@@ -207,15 +219,15 @@ function renderCampaign(c) {
   if (barEl) barEl.style.width = `${Math.min(100, Math.max(0, pct))}%`;
 
   if (btnPause) {
-    btnPause.disabled = !c.id;
+    btnPause.disabled = !c.id || finished;
     btnPause.textContent = c.paused ? "Retomar" : "Pausar";
     btnPause.dataset.paused = c.paused ? "1" : "0";
   }
 
-  // Auto-stop polling when finished
-  const done = (c.counts?.done ?? (sent + failed)) || 0;
-  if (total > 0 && done >= total) {
+  // ✅ finalizou => para polling + devolutiva
+  if (finished) {
     stopCampaignPolling();
+    setStatus("ok", `Finalizada. Enviados: ${sent} | Falhas: ${failed} | Total: ${total}`);
   }
 }
 
@@ -243,7 +255,8 @@ function startCampaignPolling(campaignId) {
       const c = await fetchCampaignOnce(campaignId);
       if (c) renderCampaign(c);
     } catch (e) {
-      // se der 404 ou rede cair, não mata o painel, só mostra aviso no debug
+      // se der 404 ou rede cair, não mata o painel
+      setStatus("warn", "Não consegui ler o status da campanha (rede/API).");
       appendDebug(`\n\n[warn] Falha ao ler campaign: ${e?.message || String(e)}`);
     }
   };
@@ -255,6 +268,13 @@ function startCampaignPolling(campaignId) {
 async function pauseOrResumeCurrentCampaign() {
   const c = state.lastCampaign;
   if (!c?.id) return;
+
+  const sent = Number(c.counts?.sent ?? 0);
+  const failed = Number(c.counts?.failed ?? 0);
+  const total = Number(c.counts?.total ?? 0);
+  const done = Number(c.counts?.done ?? (sent + failed));
+  const finished = total > 0 && done >= total;
+  if (finished) return;
 
   const paused = !!c.paused;
   const url = paused ? campaignResumeUrl(c.id) : campaignPauseUrl(c.id);
