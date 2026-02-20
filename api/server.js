@@ -2,17 +2,15 @@
 require("dotenv").config();
 const path = require("path");
 const fs = require("fs");
-const crypto = require("crypto");
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
+const crypto = require("crypto");
 const { Queue } = require("bullmq");
 const connection = require("../redis");
-const IORedis = require("ioredis");
 
 const app = express();
 app.use(cors());
-app.use(express.json());
 app.set("trust proxy", 1);
 
 // ===== FRONT (public) =====
@@ -54,6 +52,7 @@ if (!UPLOAD_DIR) {
 
 console.log("📁 Upload dir:", UPLOAD_DIR);
 
+// ✅ Servir uploads por HTTP (worker pega por URL)
 app.use(
   "/uploads",
   express.static(UPLOAD_DIR, {
@@ -80,15 +79,7 @@ const upload = multer({
   },
 });
 
-// ===== Queue + Redis (campaign) =====
 const queue = new Queue("disparos", { connection });
-
-// IMPORTANT: usamos um redis “normal” pra status de campanha
-// se connection for instância do ioredis, reaproveita, senão cria
-const statusRedis =
-  connection && typeof connection.get === "function"
-    ? connection
-    : new IORedis(connection);
 
 // ===== Utils =====
 function isHttpUrl(u) {
@@ -112,7 +103,7 @@ function applyTemplate(template, rowObj) {
   });
 }
 
-// ===== CSV (robusto) =====
+// ===== CSV (sem libs) =====
 function detectDelimiter(text) {
   const firstLine =
     String(text || "")
@@ -125,17 +116,12 @@ function detectDelimiter(text) {
 }
 
 function parseCsvRows(text) {
-  const src = String(text || "")
-    .replace(/^\uFEFF/, "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n");
-
+  const src = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   const delim = detectDelimiter(src);
 
   const lines = src
     .split("\n")
-    .map((l) => l.replace(/\uFEFF/g, ""))
-    .map((l) => l.trimEnd())
+    .map((l) => l.replace(/\uFEFF/g, "")) // remove BOM
     .filter((l) => l.trim().length > 0);
 
   const rows = [];
@@ -177,19 +163,6 @@ function buildRowObjectsFromCsv(text) {
   const rows = parseCsvRows(text);
   if (!rows.length) return { headers: [], items: [] };
 
-  const firstCell = String(rows[0]?.[0] ?? "").trim();
-  const looksLikeHeader = /[a-zA-Z]/.test(firstCell);
-
-  // lista simples (sem header)
-  if (!looksLikeHeader) {
-    const items = rows
-      .map((r) => String(r?.[0] ?? "").trim())
-      .filter((v) => v.length > 0)
-      .map((v) => ({ col0: v }));
-    return { headers: ["col0"], items };
-  }
-
-  // header + dados
   const headersRaw = rows[0] || [];
   const headers = headersRaw.map((h, idx) => normalizeKey(h) || `col${idx}`);
 
@@ -200,7 +173,6 @@ function buildRowObjectsFromCsv(text) {
     for (let c = 0; c < headers.length; c++) {
       const key = headers[c] || `col${c}`;
       obj[key] = (r[c] ?? "").toString().trim();
-      obj[`col${c}`] = (r[c] ?? "").toString().trim();
     }
     items.push(obj);
   }
@@ -247,103 +219,10 @@ function buildOptionsFromButtons(buttons, botUsername) {
   return { reply_markup: { inline_keyboard } };
 }
 
-// ===== Campaign helpers =====
-function newCampaignId() {
-  return "c_" + crypto.randomBytes(10).toString("hex");
-}
-
-function campaignKey(id) {
-  return `campaign:${id}`;
-}
-
-async function initCampaign(id, meta, total) {
-  const key = campaignKey(id);
-  const payload = {
-    id,
-    paused: "0",
-    createdAt: String(Date.now()),
-    total: String(total || 0),
-    sent: "0",
-    failed: "0",
-    meta: JSON.stringify(meta || {}),
-  };
-  await statusRedis.hset(key, payload);
-  // mantém por 24h (ajuste)
-  await statusRedis.expire(key, Number(process.env.CAMPAIGN_TTL_SECONDS || 86400));
-}
-
-async function getCampaign(id) {
-  const key = campaignKey(id);
-  const h = await statusRedis.hgetall(key);
-  if (!h || !h.id) return null;
-
-  const total = Number(h.total || 0);
-  const sent = Number(h.sent || 0);
-  const failed = Number(h.failed || 0);
-  const done = sent + failed;
-  const pct = total > 0 ? Math.floor((done / total) * 100) : 0;
-
-  let meta = {};
-  try { meta = JSON.parse(h.meta || "{}"); } catch {}
-
-  return {
-    id: h.id,
-    paused: h.paused === "1",
-    meta,
-    counts: { total, sent, failed, done, pct },
-  };
-}
-
-async function setCampaignPaused(id, paused) {
-  const key = campaignKey(id);
-  await statusRedis.hset(key, { paused: paused ? "1" : "0" });
-}
-
-async function isCampaignPaused(id) {
-  const key = campaignKey(id);
-  const v = await statusRedis.hget(key, "paused");
-  return v === "1";
-}
-
-// ===== Campaign routes =====
-app.get("/campaign/:id", async (req, res) => {
-  try {
-    const c = await getCampaign(req.params.id);
-    if (!c) return res.status(404).json({ ok: false, error: "Campaign não encontrada." });
-    return res.json({ ok: true, campaign: c });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
-
-app.post("/campaign/:id/pause", async (req, res) => {
-  try {
-    const c = await getCampaign(req.params.id);
-    if (!c) return res.status(404).json({ ok: false, error: "Campaign não encontrada." });
-    await setCampaignPaused(req.params.id, true);
-    const out = await getCampaign(req.params.id);
-    return res.json({ ok: true, campaign: out });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
-
-app.post("/campaign/:id/resume", async (req, res) => {
-  try {
-    const c = await getCampaign(req.params.id);
-    if (!c) return res.status(404).json({ ok: false, error: "Campaign não encontrada." });
-    await setCampaignPaused(req.params.id, false);
-    const out = await getCampaign(req.params.id);
-    return res.json({ ok: true, campaign: out });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
-
-// ✅ opcional: limpeza automática depois de X minutos
+// ✅ opcional: limpeza automática depois de X minutos (evita encher disco)
 function scheduleDelete(filePath) {
   const minutes = Number(process.env.UPLOAD_TTL_MINUTES || 180);
-  if (!minutes || minutes <= 0) return;
+  if (!minutes || minutes <= 0) return; // desliga se 0
   setTimeout(() => {
     try {
       if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
@@ -351,7 +230,103 @@ function scheduleDelete(filePath) {
   }, minutes * 60 * 1000);
 }
 
-// ===== ROUTE /disparar =====
+// ===== Campaign (Redis) =====
+function newCampaignId() {
+  return "c_" + crypto.randomBytes(8).toString("hex");
+}
+function campaignKey(id) {
+  return `campaign:${id}`;
+}
+
+async function createCampaign({ id, total, rate, meta }) {
+  const key = campaignKey(id);
+  const payload = {
+    id,
+    paused: "0",
+    total: String(total ?? 0),
+    sent: "0",
+    failed: "0",
+    rateMax: String(rate?.max ?? ""),
+    rateMs: String(rate?.ms ?? ""),
+    meta: meta ? JSON.stringify(meta) : "",
+    createdAt: String(Date.now()),
+  };
+  await connection.hset(key, payload);
+
+  // TTL opcional (ex: 7 dias)
+  const ttl = Number(process.env.CAMPAIGN_TTL_SECONDS || 0);
+  if (ttl > 0) {
+    await connection.expire(key, ttl);
+  }
+}
+
+async function readCampaign(id) {
+  const key = campaignKey(id);
+  const data = await connection.hgetall(key);
+  if (!data || !data.id) return null;
+
+  const total = Number(data.total || 0);
+  const sent = Number(data.sent || 0);
+  const failed = Number(data.failed || 0);
+  const done = sent + failed;
+  const pct = total > 0 ? Math.floor((done / total) * 100) : 0;
+
+  let meta = null;
+  try {
+    meta = data.meta ? JSON.parse(data.meta) : null;
+  } catch {
+    meta = null;
+  }
+
+  return {
+    id: data.id,
+    paused: String(data.paused || "0") === "1",
+    meta,
+    counts: { total, sent, failed, done, pct },
+  };
+}
+
+async function setCampaignPaused(id, paused) {
+  const key = campaignKey(id);
+  const exists = await connection.exists(key);
+  if (!exists) return null;
+  await connection.hset(key, { paused: paused ? "1" : "0" });
+  return readCampaign(id);
+}
+
+// Status
+app.get("/campaign/:id", async (req, res) => {
+  try {
+    const c = await readCampaign(req.params.id);
+    if (!c) return res.status(404).json({ ok: false, error: "Campaign não encontrada" });
+    return res.json({ ok: true, campaign: c });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// Pause/Resume
+app.post("/campaign/:id/pause", async (req, res) => {
+  try {
+    const c = await setCampaignPaused(req.params.id, true);
+    if (!c) return res.status(404).json({ ok: false, error: "Campaign não encontrada" });
+    return res.json({ ok: true, campaign: c });
+  } catch {
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+app.post("/campaign/:id/resume", async (req, res) => {
+  try {
+    const c = await setCampaignPaused(req.params.id, false);
+    if (!c) return res.status(404).json({ ok: false, error: "Campaign não encontrada" });
+    return res.json({ ok: true, campaign: c });
+  } catch {
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// ===== ROUTE =====
 app.post(
   "/disparar",
   upload.fields([
@@ -369,10 +344,16 @@ app.post(
       let limitMs = Number(req.body.limitMs || 1000);
       const fileUrl = (req.body.fileUrl || "").trim();
 
-      // 🔒 trava anti-ban no server
-      limitMax = Math.min(25, Math.max(1, limitMax));
+      // ===== trava rate no server (anti-ban + segurança) =====
+      // max até 25
+      limitMax = Math.max(1, Math.min(25, limitMax));
+
+      // ms só pode ser 1000/2000/3000
       const allowedMs = new Set([1000, 2000, 3000]);
-      if (!allowedMs.has(limitMs)) limitMs = 2000;
+      if (!allowedMs.has(limitMs)) limitMs = 1000;
+
+      const idColumnRaw = (req.body.idColumn || "chatId").trim();
+      const idColumn = normalizeKey(idColumnRaw) || "chatid";
 
       let buttons = [];
       try {
@@ -385,7 +366,9 @@ app.post(
       if (!type) return res.status(400).json({ ok: false, error: "type é obrigatório." });
 
       if (type === "text" && !String(captionTemplate).trim()) {
-        return res.status(400).json({ ok: false, error: "Para text, caption (mensagem) é obrigatório." });
+        return res
+          .status(400)
+          .json({ ok: false, error: "Para text, caption (mensagem) é obrigatório." });
       }
 
       const mediaFile = req.files?.file?.[0] || null;
@@ -402,7 +385,9 @@ app.post(
           });
         }
         if (fileUrl && !isHttpUrl(fileUrl)) {
-          return res.status(400).json({ ok: false, error: "fileUrl inválida (precisa http/https)." });
+          return res
+            .status(400)
+            .json({ ok: false, error: "fileUrl inválida (precisa http/https)." });
         }
       }
 
@@ -415,7 +400,9 @@ app.post(
 
       const options = buildOptionsFromButtons(buttons, botUsername);
 
-      // Fonte da mídia
+      // ✅ Fonte da mídia:
+      // - se veio fileUrl, usa ela
+      // - se veio upload, transforma em URL /uploads/arquivo.ext (worker baixa por URL)
       const isUpload = !!mediaFile && !fileUrl;
       let mediaSource = fileUrl || null;
 
@@ -424,6 +411,7 @@ app.post(
         const internalHost = (process.env.API_INTERNAL_HOST || "api-disparos").trim();
         const filename = path.basename(mediaFile.path);
         mediaSource = `http://${internalHost}:${PORT}/uploads/${encodeURIComponent(filename)}`;
+
         scheduleDelete(mediaFile.path);
       }
 
@@ -434,7 +422,12 @@ app.post(
 
       let leads = [];
       for (const row of items) {
-        const chatId = String(row?.col0 || "").trim();
+        // tenta por coluna configurada, depois fallbacks comuns, depois col0
+        let chatId = String(row[idColumn] || "").trim();
+        if (!chatId) chatId = String(row["chatid"] || "").trim();
+        if (!chatId) chatId = String(row["chat_id"] || "").trim();
+        if (!chatId) chatId = String(row["id"] || "").trim();
+        if (!chatId) chatId = String(row["col0"] || "").trim();
         if (!chatId) continue;
         leads.push({ chatId, vars: row });
       }
@@ -442,7 +435,7 @@ app.post(
       if (!leads.length) {
         return res.status(400).json({
           ok: false,
-          error: `Não encontrei IDs na primeira coluna do CSV (coluna A / col0).`,
+          error: `Não encontrei IDs no CSV. Verifique a coluna "${idColumnRaw}" (ex: chatId) ou coloque o ID na primeira coluna.`,
         });
       }
 
@@ -450,47 +443,67 @@ app.post(
       const seen = new Set();
       leads = leads.filter((l) => (seen.has(l.chatId) ? false : (seen.add(l.chatId), true)));
 
-      // ✅ cria campanha e salva status
+      // ===== cria campanha =====
       const campaignId = newCampaignId();
-      const meta = {
-        type,
-        buttons: buttons.length,
+      await createCampaign({
+        id: campaignId,
+        total: leads.length,
         rate: { max: limitMax, ms: limitMs },
-      };
-      await initCampaign(campaignId, meta, leads.length);
+        meta: {
+          type,
+          buttons: buttons.length,
+          idColumn: idColumnRaw,
+          media: type === "text" ? null : fileUrl ? "url" : "upload-url",
+        },
+      });
+
+      // ===== Enfileirar em LOTE (addBulk) =====
+      const CHUNK = Math.max(100, Math.min(2000, Number(process.env.BULK_CHUNK || 1000)));
 
       let total = 0;
-      for (const lead of leads) {
-        const finalCaption = applyTemplate(captionTemplate, lead.vars);
+      for (let i = 0; i < leads.length; i += CHUNK) {
+        const slice = leads.slice(i, i + CHUNK);
 
-        const jobData =
-          type === "text"
-            ? {
-                campaignId,
-                chatId: lead.chatId,
-                botToken,
-                limit: { max: limitMax, ms: limitMs },
-                type: "text",
-                payload: { text: finalCaption, options },
-              }
-            : {
-                campaignId,
-                chatId: lead.chatId,
-                botToken,
-                limit: { max: limitMax, ms: limitMs },
-                type,
-                payload: {
-                  file: mediaSource,
-                  caption: finalCaption || "",
-                  options,
-                },
-              };
+        const jobs = slice.map((lead) => {
+          const finalCaption = applyTemplate(captionTemplate, lead.vars);
 
-        await queue.add("envio", jobData);
-        total++;
+          const jobData =
+            type === "text"
+              ? {
+                  campaignId,
+                  chatId: lead.chatId,
+                  botToken,
+                  limit: { max: limitMax, ms: limitMs },
+                  type: "text",
+                  payload: { text: finalCaption, options },
+                }
+              : {
+                  campaignId,
+                  chatId: lead.chatId,
+                  botToken,
+                  limit: { max: limitMax, ms: limitMs },
+                  type,
+                  payload: {
+                    file: mediaSource, // ✅ URL
+                    caption: finalCaption || "",
+                    options,
+                  },
+                };
+
+          return { name: "envio", data: jobData };
+        });
+
+        await queue.addBulk(jobs);
+        total += jobs.length;
+
+        // micro pausa pra não travar event loop/redis sob carga alta
+        await new Promise((r) => setTimeout(r, 5));
       }
 
-      try { if (csvPathToDelete) fs.unlinkSync(csvPathToDelete); } catch {}
+      // apaga CSV upload
+      try {
+        if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
+      } catch {}
 
       return res.json({
         ok: true,
@@ -502,10 +515,13 @@ app.post(
         media: type === "text" ? null : fileUrl ? "url" : "upload-url",
         mediaSource: type === "text" ? null : mediaSource,
         rate: { max: limitMax, ms: limitMs },
+        hint: "Para evitar ban: prefira 1 msg a cada 2–3s em campanhas grandes, e evite picos (max alto) por longos períodos.",
       });
     } catch (err) {
       console.error("❌ /disparar erro:", err.message);
-      try { if (csvPathToDelete) fs.unlinkSync(csvPathToDelete); } catch {}
+      try {
+        if (csvPathToDelete) fs.unlinkSync(csvPathToDelete);
+      } catch {}
       return res.status(500).json({ ok: false, error: "Erro interno" });
     }
   }
