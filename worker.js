@@ -14,8 +14,7 @@ if (!DEFAULT_TOKEN) {
   console.warn("⚠️ TELEGRAM_BOT_TOKEN não definido (ok se você sempre mandar botToken no job).");
 }
 
-// ===== Campaign helpers (ALINHADO com o server.js) =====
-// server usa: key = campaign:<id> (hash) com campos: paused, sent, failed, total...
+// ===== Campaign helpers =====
 function campaignKey(id) {
   return `campaign:${id}`;
 }
@@ -36,18 +35,29 @@ async function incCampaignFailed(campaignId) {
   await connection.hincrby(campaignKey(campaignId), "failed", 1);
 }
 
-// Evita contar "failed" múltiplas vezes se houver retries
 function shouldCountFinalFailure(job) {
   const maxAttempts = Number(job?.opts?.attempts ?? 1);
-  const attemptIndex = Number(job?.attemptsMade ?? 0) + 1; // tentativa atual (1-based)
+  const attemptIndex = Number(job?.attemptsMade ?? 0) + 1;
   return attemptIndex >= maxAttempts;
 }
 
-// cache de bots por token
+// ===== Controle de log de pausa (ANTI-SPAM) =====
+const pauseLogControl = new Map();
+function logPausedThrottled(campaignId) {
+  const now = Date.now();
+  const last = pauseLogControl.get(campaignId) || 0;
+
+  if (now - last > 10000) {
+    console.log(`⏸️ Campaign ${campaignId} pausada. Aguardando retomar...`);
+    pauseLogControl.set(campaignId, now);
+  }
+}
+
+// ===== Cache de bots =====
 const botCache = new Map();
 function getBot(token) {
   const t = token || DEFAULT_TOKEN;
-  if (!t) throw new Error("Nenhum token disponível (botToken do job ou TELEGRAM_BOT_TOKEN no env)");
+  if (!t) throw new Error("Nenhum token disponível");
   if (botCache.has(t)) return botCache.get(t);
   const bot = new TelegramBot(t, { polling: false });
   botCache.set(t, bot);
@@ -71,12 +81,9 @@ function safeUnlink(p) {
   } catch {}
 }
 
-// baixa URL (inclusive interna do docker) -> salva em /tmp -> retorna caminho
 async function downloadUrlToTmp(url) {
   const u = String(url || "").trim();
   const urlObj = new URL(u);
-
-  // tenta manter extensão
   let ext = path.extname(urlObj.pathname || "");
   if (!ext) ext = ".bin";
 
@@ -87,21 +94,14 @@ async function downloadUrlToTmp(url) {
 
   const r = await fetch(u);
   if (!r.ok) throw new Error(`Falha ao baixar arquivo (${r.status})`);
-
   const body = r.body;
-  if (!body) throw new Error("Resposta sem body ao baixar arquivo");
+  if (!body) throw new Error("Resposta sem body");
 
   const nodeStream = Readable.fromWeb(body);
   await pipeline(nodeStream, fs.createWriteStream(tmpPath));
   return tmpPath;
 }
 
-/**
- * Resolve input do Telegram:
- * - URL: baixa pra /tmp e manda como ReadStream (garante funcionar com url interna)
- * - path local existente: ReadStream
- * - senão: assume file_id do Telegram
- */
 async function resolveTelegramInput(file) {
   if (!file) throw new Error("payload.file não foi enviado");
   if (typeof file !== "string") throw new Error("payload.file deve ser string");
@@ -118,7 +118,7 @@ async function resolveTelegramInput(file) {
   return { input: file, cleanupPath: null };
 }
 
-// rate limit por token
+// ===== Rate limit =====
 const tokenWindows = new Map();
 async function waitForRateLimit(token, max, ms) {
   const key = token || DEFAULT_TOKEN || "no-token";
@@ -142,8 +142,7 @@ async function waitForRateLimit(token, max, ms) {
   }
 }
 
-const PAUSE_RETRY_MS = Number(process.env.CAMPAIGN_PAUSE_RETRY_MS || 2000);
-
+// ===== WORKER =====
 const worker = new Worker(
   "disparos",
   async (job) => {
@@ -151,119 +150,81 @@ const worker = new Worker(
     const campaignId = job.data?.campaignId || null;
 
     try {
-      // ✅ pausa por campanha: re-enfileira o job como delayed e sai sem erro
+      // 🔥 PAUSA CORRIGIDA
       if (campaignId) {
         const paused = await isCampaignPaused(campaignId);
         if (paused) {
-          const delayMs = Math.max(500, PAUSE_RETRY_MS);
-          await job.moveToDelayed(Date.now() + delayMs);
-          console.log("⏸️ Campaign pausada. Job adiado:", job.id, "campaignId:", campaignId);
-          return;
+          logPausedThrottled(campaignId);
+          throw new Error("CAMPAIGN_PAUSED");
         }
       }
 
-      console.log("Recebi job:", job.id, {
-        campaignId: campaignId || undefined,
-        chatId: job.data?.chatId,
-        type: job.data?.type,
-        token: maskToken(job.data?.botToken),
-      });
-
       const { chatId } = job.data || {};
-      if (!chatId) throw new Error("chatId ausente no job");
+      if (!chatId) throw new Error("chatId ausente");
 
       const lim = job.data?.limit || { max: 1, ms: 1100 };
-      await waitForRateLimit(job.data?.botToken, lim.max, lim.ms ?? lim.duration ?? lim.limitMs);
+      await waitForRateLimit(job.data?.botToken, lim.max, lim.ms);
 
       const bot = getBot(job.data?.botToken);
 
-      // legado
       if (job.data?.mensagem && !job.data?.type) {
         await bot.sendMessage(chatId, job.data.mensagem);
         await incCampaignSent(campaignId);
-        console.log("✅ Enviado (texto legado)!");
         return;
       }
 
       const { type, payload } = job.data || {};
-      if (!type) throw new Error("type ausente no job");
+      if (!type) throw new Error("type ausente");
 
       switch (type) {
-        case "text": {
-          const text = payload?.text ?? payload?.mensagem;
-          if (!text) throw new Error("payload.text ausente");
-          await bot.sendMessage(chatId, text, payload?.options);
+        case "text":
+          await bot.sendMessage(chatId, payload?.text ?? payload?.mensagem, payload?.options);
           break;
-        }
 
-        case "audio": {
-          const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
-          tmpToCleanup = cleanupPath;
-          await bot.sendAudio(chatId, input, {
-            caption: payload?.caption,
-            ...(payload?.options || {}),
-          });
+        case "audio":
+          var r = await resolveTelegramInput(payload?.file);
+          tmpToCleanup = r.cleanupPath;
+          await bot.sendAudio(chatId, r.input, payload?.options);
           break;
-        }
 
-        case "video": {
-          const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
-          tmpToCleanup = cleanupPath;
-          await bot.sendVideo(chatId, input, {
-            caption: payload?.caption,
-            ...(payload?.options || {}),
-          });
+        case "video":
+          var r = await resolveTelegramInput(payload?.file);
+          tmpToCleanup = r.cleanupPath;
+          await bot.sendVideo(chatId, r.input, payload?.options);
           break;
-        }
 
-        case "voice": {
-          const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
-          tmpToCleanup = cleanupPath;
-          await bot.sendVoice(chatId, input, {
-            caption: payload?.caption,
-            ...(payload?.options || {}),
-          });
+        case "voice":
+          var r = await resolveTelegramInput(payload?.file);
+          tmpToCleanup = r.cleanupPath;
+          await bot.sendVoice(chatId, r.input, payload?.options);
           break;
-        }
 
-        case "video_note": {
-          const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
-          tmpToCleanup = cleanupPath;
-          await bot.sendVideoNote(chatId, input, { ...(payload?.options || {}) });
+        case "photo":
+          var r = await resolveTelegramInput(payload?.file);
+          tmpToCleanup = r.cleanupPath;
+          await bot.sendPhoto(chatId, r.input, payload?.options);
           break;
-        }
 
-        case "photo": {
-          const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
-          tmpToCleanup = cleanupPath;
-          await bot.sendPhoto(chatId, input, {
-            caption: payload?.caption,
-            ...(payload?.options || {}),
-          });
+        case "document":
+          var r = await resolveTelegramInput(payload?.file);
+          tmpToCleanup = r.cleanupPath;
+          await bot.sendDocument(chatId, r.input, payload?.options);
           break;
-        }
-
-        case "document": {
-          const { input, cleanupPath } = await resolveTelegramInput(payload?.file);
-          tmpToCleanup = cleanupPath;
-          await bot.sendDocument(chatId, input, {
-            caption: payload?.caption,
-            ...(payload?.options || {}),
-          });
-          break;
-        }
 
         default:
           throw new Error(`type inválido: ${type}`);
       }
 
       await incCampaignSent(campaignId);
-      console.log("✅ Enviado!");
-    } catch (err) {
-      console.error("❌ Telegram erro:", err.message);
-      if (err.response?.body) console.error("Detalhe:", err.response.body);
 
-      // ✅ só conta failed na última tentativa (evita double count com retry)
+    } catch (err) {
+
+      if (err.message === "CAMPAIGN_PAUSED") {
+        throw err; // retry natural
+      }
+
+      console.error("❌ Telegram erro:", err.message);
+
       if (shouldCountFinalFailure(job)) {
         await incCampaignFailed(campaignId);
       }
@@ -275,13 +236,17 @@ const worker = new Worker(
   },
   {
     connection,
-
-    // ✅ evita Redis crescer infinito com campanhas grandes
-    // mantém só os últimos N jobs no histórico
     removeOnComplete: { count: 1000 },
     removeOnFail: { count: 5000 },
   }
 );
 
-worker.on("failed", (job, err) => console.error("❌ Job falhou:", job?.id, err.message));
-worker.on("error", (err) => console.error("❌ Worker error:", err.message));
+worker.on("failed", (job, err) => {
+  if (err.message !== "CAMPAIGN_PAUSED") {
+    console.error("❌ Job falhou:", job?.id, err.message);
+  }
+});
+
+worker.on("error", (err) =>
+  console.error("❌ Worker error:", err.message)
+);
