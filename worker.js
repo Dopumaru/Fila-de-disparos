@@ -14,7 +14,7 @@ if (!DEFAULT_TOKEN) {
   console.warn("⚠️ TELEGRAM_BOT_TOKEN não definido (ok se você sempre mandar botToken no job).");
 }
 
-// ===== Campaign helpers =====
+// ================== CAMPAIGN ==================
 function campaignKey(id) {
   return `campaign:${id}`;
 }
@@ -41,7 +41,7 @@ function shouldCountFinalFailure(job) {
   return attemptIndex >= maxAttempts;
 }
 
-// ===== Controle de log de pausa (ANTI-SPAM) =====
+// ================== LOG PAUSA (ANTI-SPAM) ==================
 const pauseLogControl = new Map();
 function logPausedThrottled(campaignId) {
   const now = Date.now();
@@ -53,24 +53,21 @@ function logPausedThrottled(campaignId) {
   }
 }
 
-// ===== Cache de bots =====
+// ================== BOT CACHE ==================
 const botCache = new Map();
+
 function getBot(token) {
   const t = token || DEFAULT_TOKEN;
   if (!t) throw new Error("Nenhum token disponível");
+
   if (botCache.has(t)) return botCache.get(t);
+
   const bot = new TelegramBot(t, { polling: false });
   botCache.set(t, bot);
   return bot;
 }
 
-function maskToken(t) {
-  if (!t) return "";
-  const s = String(t);
-  if (s.length <= 10) return "***";
-  return s.slice(0, 4) + "..." + s.slice(-4);
-}
-
+// ================== FILE HELPERS ==================
 function isHttpUrl(u) {
   return /^https?:\/\//i.test(String(u || "").trim());
 }
@@ -94,10 +91,9 @@ async function downloadUrlToTmp(url) {
 
   const r = await fetch(u);
   if (!r.ok) throw new Error(`Falha ao baixar arquivo (${r.status})`);
-  const body = r.body;
-  if (!body) throw new Error("Resposta sem body");
+  if (!r.body) throw new Error("Resposta sem body");
 
-  const nodeStream = Readable.fromWeb(body);
+  const nodeStream = Readable.fromWeb(r.body);
   await pipeline(nodeStream, fs.createWriteStream(tmpPath));
   return tmpPath;
 }
@@ -115,11 +111,12 @@ async function resolveTelegramInput(file) {
     return { input: fs.createReadStream(file), cleanupPath: null };
   }
 
-  return { input: file, cleanupPath: null };
+  return { input: file, cleanupPath: null }; // file_id
 }
 
-// ===== Rate limit =====
+// ================== RATE LIMIT ==================
 const tokenWindows = new Map();
+
 async function waitForRateLimit(token, max, ms) {
   const key = token || DEFAULT_TOKEN || "no-token";
   const safeMax = Math.max(1, Number(max) || 1);
@@ -142,7 +139,7 @@ async function waitForRateLimit(token, max, ms) {
   }
 }
 
-// ===== WORKER =====
+// ================== WORKER ==================
 const worker = new Worker(
   "disparos",
   async (job) => {
@@ -150,7 +147,7 @@ const worker = new Worker(
     const campaignId = job.data?.campaignId || null;
 
     try {
-      // 🔥 PAUSA CORRIGIDA
+      // ===== PAUSA =====
       if (campaignId) {
         const paused = await isCampaignPaused(campaignId);
         if (paused) {
@@ -167,58 +164,63 @@ const worker = new Worker(
 
       const bot = getBot(job.data?.botToken);
 
-      if (job.data?.mensagem && !job.data?.type) {
-        await bot.sendMessage(chatId, job.data.mensagem);
-        await incCampaignSent(campaignId);
-        return;
-      }
-
       const { type, payload } = job.data || {};
       if (!type) throw new Error("type ausente");
 
       switch (type) {
-        case "text":
-          await bot.sendMessage(chatId, payload?.text ?? payload?.mensagem, payload?.options);
-          break;
+        case "text": {
+          const text = String(payload?.text ?? payload?.mensagem ?? "").trim();
 
-        case "audio":
-          var r = await resolveTelegramInput(payload?.file);
+          if (!text) {
+            console.warn("⚠️ Texto vazio ignorado. Job:", job.id);
+            return;
+          }
+
+          await bot.sendMessage(chatId, text, payload?.options);
+          break;
+        }
+
+        case "audio": {
+          const r = await resolveTelegramInput(payload?.file);
           tmpToCleanup = r.cleanupPath;
           await bot.sendAudio(chatId, r.input, payload?.options);
           break;
+        }
 
-        case "video":
-          var r = await resolveTelegramInput(payload?.file);
+        case "video": {
+          const r = await resolveTelegramInput(payload?.file);
           tmpToCleanup = r.cleanupPath;
           await bot.sendVideo(chatId, r.input, payload?.options);
           break;
+        }
 
-        case "voice":
-          var r = await resolveTelegramInput(payload?.file);
+        case "voice": {
+          const r = await resolveTelegramInput(payload?.file);
           tmpToCleanup = r.cleanupPath;
           await bot.sendVoice(chatId, r.input, payload?.options);
           break;
+        }
 
-        case "photo":
-          var r = await resolveTelegramInput(payload?.file);
+        case "photo": {
+          const r = await resolveTelegramInput(payload?.file);
           tmpToCleanup = r.cleanupPath;
           await bot.sendPhoto(chatId, r.input, payload?.options);
           break;
+        }
 
-        case "document":
-          var r = await resolveTelegramInput(payload?.file);
+        case "document": {
+          const r = await resolveTelegramInput(payload?.file);
           tmpToCleanup = r.cleanupPath;
           await bot.sendDocument(chatId, r.input, payload?.options);
           break;
+        }
 
         default:
           throw new Error(`type inválido: ${type}`);
       }
 
       await incCampaignSent(campaignId);
-
     } catch (err) {
-
       if (err.message === "CAMPAIGN_PAUSED") {
         throw err; // retry natural
       }
