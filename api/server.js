@@ -464,45 +464,46 @@ app.post(
       for (let i = 0; i < leads.length; i += CHUNK) {
         const slice = leads.slice(i, i + CHUNK);
 
-        const jobs = slice.map((lead) => {
-          const finalCaption = applyTemplate(captionTemplate, lead.vars);
+       const jobs = slice.map((lead) => {
+  const finalCaption = applyTemplate(captionTemplate, lead.vars);
 
-          const jobData =
-            type === "text"
-              ? {
-                  campaignId,
-                  chatId: lead.chatId,
-                  botToken,
-                  limit: { max: limitMax, ms: limitMs },
-                  type: "text",
-                  payload: { text: finalCaption, options },
-                }
-              : {
-                  campaignId,
-                  chatId: lead.chatId,
-                  botToken,
-                  limit: { max: limitMax, ms: limitMs },
-                  type,
-                  payload: {
-                    file: mediaSource, // ✅ URL
-                    caption: finalCaption || "",
-                    options,
-                  },
-                };
+  const jobData =
+    type === "text"
+      ? {
+          campaignId,
+          chatId: lead.chatId,
+          botToken,
+          limit: { max: limitMax, ms: limitMs },
+          type: "text",
+          payload: { text: finalCaption, options },
+        }
+      : {
+          campaignId,
+          chatId: lead.chatId,
+          botToken,
+          limit: { max: limitMax, ms: limitMs },
+          type,
+          payload: {
+            file: mediaSource,
+            caption: finalCaption || "",
+            options,
+          },
+        };
 
-               return {
-               name: "envio",
-               data: jobData,
-               opts: {
-              attempts: 999999,
-              backoff: { type: "fixed", delay: 3000 },
-              removeOnComplete: { count: 1000 },
-              removeOnFail: { count: 5000 },
-              },
-              };
+  return {
+    name: "envio",
+    data: jobData,
+    opts: {
+      attempts: 999999,
+      backoff: { type: "fixed", delay: 3000 },
+      removeOnComplete: { count: 1000 },
+      removeOnFail: { count: 5000 },
+    },
+  };
+}); // 🔥 FALTAVA ISSO AQUI
 
-        await queue.addBulk(jobs);
-        total += jobs.length;
+await queue.addBulk(jobs);
+total += jobs.length; 
 
         // micro pausa pra não travar event loop/redis sob carga alta
         await new Promise((r) => setTimeout(r, 5));
