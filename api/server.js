@@ -83,11 +83,11 @@ const queue = new Queue("disparos", { connection });
 
 // ===== Utils =====
 function isHttpUrl(u) {
-  return /^https?:\/\//i.test(String(u || "").trim());
+   /^https?:\/\//i.test(String(u || "").trim());
 }
 
 function normalizeKey(k) {
-  return String(k || "")
+   String(k || "")
     .trim()
     .toLowerCase()
     .replace(/\s+/g, "")
@@ -96,10 +96,10 @@ function normalizeKey(k) {
 
 function applyTemplate(template, rowObj) {
   const t = String(template || "");
-  return t.replace(/\{(\w+)\}/g, (_, key) => {
+   t.replace(/\{(\w+)\}/g, (_, key) => {
     const k = normalizeKey(key);
     const v = rowObj?.[k];
-    return v == null ? "" : String(v);
+     v == null ? "" : String(v);
   });
 }
 
@@ -490,8 +490,16 @@ app.post(
                   },
                 };
 
-          return { name: "envio", data: jobData };
-        });
+               return {
+               name: "envio",
+               data: jobData,
+               opts: {
+              attempts: 999999,
+              backoff: { type: "fixed", delay: 3000 },
+              removeOnComplete: { count: 1000 },
+              removeOnFail: { count: 5000 },
+              },
+              };
 
         await queue.addBulk(jobs);
         total += jobs.length;
