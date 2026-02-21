@@ -273,7 +273,14 @@ const worker = new Worker(
       if (tmpToCleanup) safeUnlink(tmpToCleanup);
     }
   },
-  { connection }
+  {
+    connection,
+
+    // ✅ evita Redis crescer infinito com campanhas grandes
+    // mantém só os últimos N jobs no histórico
+    removeOnComplete: { count: 1000 },
+    removeOnFail: { count: 5000 },
+  }
 );
 
 worker.on("failed", (job, err) => console.error("❌ Job falhou:", job?.id, err.message));
