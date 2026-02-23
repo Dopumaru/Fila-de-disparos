@@ -61,7 +61,6 @@ const upload = multer({
 // ===== Queue =====
 const QUEUE_NAME = process.env.QUEUE_NAME || "disparos";
 
-// Limites pra não lotar Redis em disparos grandes (26k+)
 const REMOVE_COMPLETE_COUNT = Number(process.env.REMOVE_COMPLETE_COUNT) || 2000;
 const REMOVE_FAIL_COUNT = Number(process.env.REMOVE_FAIL_COUNT) || 5000;
 
@@ -110,7 +109,6 @@ async function getCampaignMeta(id) {
   return data || {};
 }
 
-// Parse simples (CSV): primeira coluna = id
 function parseCsvFirstColumnAsIds(csvText) {
   const lines = String(csvText || "")
     .split(/\r?\n/)
@@ -119,7 +117,6 @@ function parseCsvFirstColumnAsIds(csvText) {
 
   if (lines.length === 0) return [];
 
-  // se primeira linha parece header (tem letras), pula
   const firstCell = lines[0].split(",")[0].trim();
   const startIdx = /[a-zA-Z]/.test(firstCell) ? 1 : 0;
 
@@ -136,7 +133,6 @@ function toInt(n, def) {
   return Number.isFinite(v) ? v : def;
 }
 
-// Base URL pública (para o navegador/Telegram). Worker também consegue baixar via pública.
 function getPublicBaseUrl(req) {
   const envBase = String(process.env.PUBLIC_BASE_URL || "").trim();
   if (envBase) return envBase.replace(/\/+$/, "");
@@ -150,8 +146,26 @@ function clampRps(n) {
   return Math.max(1, Math.min(30, toInt(n, 10)));
 }
 
+function parseButtons(raw) {
+  if (!raw) return [];
+  try {
+    const v = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (!Array.isArray(v)) return [];
+    return v
+      .map((b) => ({
+        text: String(b?.text || "").trim(),
+        type: String(b?.type || "").trim().toLowerCase(), // url | start
+        value: String(b?.value || "").trim(),
+      }))
+      .filter((b) => b.text && b.value && (b.type === "url" || b.type === "start"))
+      .slice(0, 4);
+  } catch {
+    return [];
+  }
+}
+
 // =====================================================================================
-// ✅ ROTA NOVA (JSON): /campaign
+// JSON: /campaign
 // =====================================================================================
 app.post("/campaign", async (req, res) => {
   try {
@@ -165,6 +179,7 @@ app.post("/campaign", async (req, res) => {
       fileType,
       caption,
       campaignId,
+      buttons,
     } = req.body || {};
 
     if (!Array.isArray(leads) || leads.length === 0) {
@@ -187,14 +202,14 @@ app.post("/campaign", async (req, res) => {
       failed: "0",
       canceledCount: "0",
       createdAt: new Date().toISOString(),
-      ratePerSecond: String(rps), // ⚠️ usado pelo worker (throttle dinâmico)
+      ratePerSecond: String(rps),
     });
 
     const idCol = normalizeKey(chatIdColumn);
+    const btns = parseButtons(buttons);
 
     const jobs = leads.map((row, idx) => {
-      const chatId =
-        row?.[idCol] ?? row?.[chatIdColumn] ?? row?.id ?? row?.chat_id;
+      const chatId = row?.[idCol] ?? row?.[chatIdColumn] ?? row?.id ?? row?.chat_id;
 
       const textFinal = applyTemplate(message, row);
       const captionFinal = applyTemplate(caption, row);
@@ -209,9 +224,9 @@ app.post("/campaign", async (req, res) => {
           fileUrl,
           fileType,
           caption: captionFinal,
+          buttons: btns,
         },
         opts: {
-          // Mantemos delay (bom pra fila gigante), mas amanhã o worker vai fazer throttle real.
           delay: idx * baseDelayMs,
           attempts: 6,
           backoff: { type: "exponential", delay: 2000 },
@@ -236,7 +251,7 @@ app.post("/campaign", async (req, res) => {
 });
 
 // =====================================================================================
-// ✅ COMPAT COM TEU PAINEL: /disparar (multipart/form-data + CSV upload + arquivo opcional)
+// multipart: /disparar
 // =====================================================================================
 app.post(
   "/disparar",
@@ -246,7 +261,6 @@ app.post(
   ]),
   async (req, res) => {
     try {
-      // Token vindo do painel
       const botToken =
         req.body.botToken ||
         req.body.token ||
@@ -254,7 +268,6 @@ app.post(
         req.body.bot_token ||
         process.env.TELEGRAM_BOT_TOKEN;
 
-      // Mensagem (texto)
       const message =
         req.body.message ||
         req.body.mensagem ||
@@ -267,13 +280,10 @@ app.post(
         req.body.caption ||
         "";
 
-      // Tipo do envio
       const tipo = String(req.body.tipo || req.body.type || "text").toLowerCase();
 
-      // Rate do painel
       const limit = toInt(req.body.limit || req.body.rate || req.body.limitMax || 1, 1);
       const intervalSec = toInt(req.body.intervalSec || req.body.interval || req.body.intervalS || 1, 1);
-
       const ratePerSecond = clampRps(Math.floor(limit / Math.max(1, intervalSec)) || 1);
 
       if (!botToken) {
@@ -288,21 +298,16 @@ app.post(
         return res.status(400).json({ ok: false, error: "CSV não enviado (campo 'csv')." });
       }
 
-      // lê CSV e remove do disco
       const csvText = fs.readFileSync(csvFile.path, "utf8");
-      try {
-        fs.unlinkSync(csvFile.path);
-      } catch {}
+      try { fs.unlinkSync(csvFile.path); } catch {}
 
       const leads = parseCsvFirstColumnAsIds(csvText);
       if (leads.length === 0) {
         return res.status(400).json({ ok: false, error: "Nenhum ID válido no CSV." });
       }
 
-      // Arquivo opcional vindo do painel
       const mediaFile = req.files?.file?.[0];
 
-      // Caption opcional
       const caption =
         req.body.caption ||
         req.body.legenda ||
@@ -310,7 +315,6 @@ app.post(
         req.body.caption_text ||
         "";
 
-      // Se for texto puro, precisa de message
       const hasMedia = !!mediaFile;
       if (!hasMedia && !String(message || "").trim()) {
         return res.status(400).json({
@@ -329,17 +333,18 @@ app.post(
         failed: "0",
         canceledCount: "0",
         createdAt: new Date().toISOString(),
-        ratePerSecond: String(ratePerSecond), // ⚠️ usado pelo worker (throttle dinâmico)
+        ratePerSecond: String(ratePerSecond),
       });
 
       const baseDelayMs = Math.floor(1000 / ratePerSecond);
 
-      // Monta fileUrl se tiver upload
       let fileUrl;
       if (mediaFile?.filename) {
         const base = getPublicBaseUrl(req);
         fileUrl = `${base}/uploads/${mediaFile.filename}`;
       }
+
+      const btns = parseButtons(req.body.buttons);
 
       const jobs = leads.map((row, idx) => ({
         name: "send",
@@ -351,6 +356,7 @@ app.post(
           fileUrl: fileUrl || undefined,
           fileType: tipo === "text" ? undefined : tipo,
           caption: caption || undefined,
+          buttons: btns,
         },
         opts: {
           delay: idx * baseDelayMs,
@@ -370,6 +376,7 @@ app.post(
         ratePerSecond,
         usedFileUrl: !!fileUrl,
         receivedFileFields: Object.keys(req.files || {}),
+        buttons: btns.length,
       });
     } catch (e) {
       console.error("❌ /disparar erro:", e);
@@ -379,7 +386,7 @@ app.post(
 );
 
 // =====================================================================================
-// Campaign status/pause/resume/cancel + ✅ set rate
+// status/pause/resume/rate/cancel
 // =====================================================================================
 app.get("/campaign/:id", async (req, res) => {
   try {
@@ -397,10 +404,7 @@ app.get("/campaign/:id", async (req, res) => {
 app.post("/campaign/:id/pause", async (req, res) => {
   try {
     const id = req.params.id;
-    await redis.hset(campaignKey(id), {
-      paused: "1",
-      pausedAt: new Date().toISOString(),
-    });
+    await redis.hset(campaignKey(id), { paused: "1", pausedAt: new Date().toISOString() });
     return res.json({ ok: true, campaignId: id, paused: true });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
@@ -410,17 +414,13 @@ app.post("/campaign/:id/pause", async (req, res) => {
 app.post("/campaign/:id/resume", async (req, res) => {
   try {
     const id = req.params.id;
-    await redis.hset(campaignKey(id), {
-      paused: "0",
-      resumedAt: new Date().toISOString(),
-    });
+    await redis.hset(campaignKey(id), { paused: "0", resumedAt: new Date().toISOString() });
     return res.json({ ok: true, campaignId: id, paused: false });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
-// ✅ NEW: muda velocidade (ratePerSecond) em tempo real (o worker vai usar isso)
 app.post("/campaign/:id/rate", async (req, res) => {
   try {
     const id = req.params.id;
@@ -428,27 +428,17 @@ app.post("/campaign/:id/rate", async (req, res) => {
     if (!meta || Object.keys(meta).length === 0) {
       return res.status(404).json({ ok: false, error: "Campaign não encontrada." });
     }
-
-    // se já cancelou, não deixa mexer
     if (String(meta.canceled || "0") === "1") {
       return res.status(400).json({ ok: false, error: "Campaign já está cancelada." });
     }
 
     const raw =
-      req.body?.ratePerSecond ??
-      req.body?.rate ??
-      req.body?.rps ??
-      req.query?.ratePerSecond ??
-      req.query?.rate ??
-      req.query?.rps;
+      req.body?.ratePerSecond ?? req.body?.rate ?? req.body?.rps ??
+      req.query?.ratePerSecond ?? req.query?.rate ?? req.query?.rps;
 
     const rps = clampRps(raw);
 
-    await redis.hset(campaignKey(id), {
-      ratePerSecond: String(rps),
-      rateUpdatedAt: new Date().toISOString(),
-    });
-
+    await redis.hset(campaignKey(id), { ratePerSecond: String(rps), rateUpdatedAt: new Date().toISOString() });
     return res.json({ ok: true, campaignId: id, ratePerSecond: rps });
   } catch (e) {
     console.error("❌ /campaign/:id/rate erro:", e);
@@ -456,19 +446,16 @@ app.post("/campaign/:id/rate", async (req, res) => {
   }
 });
 
-// ✅ CANCEL REAL (B): mata tudo e impede envios futuros
 app.post("/campaign/:id/cancel", async (req, res) => {
   try {
     const id = req.params.id;
 
-    // marca cancelado e despausa (pra não ficar preso no loop)
     await redis.hset(campaignKey(id), {
       canceled: "1",
       canceledAt: new Date().toISOString(),
       paused: "0",
     });
 
-    // remove jobs pendentes (waiting/delayed/paused)
     const states = ["waiting", "delayed", "paused"];
     let removed = 0;
 
@@ -476,20 +463,12 @@ app.post("/campaign/:id/cancel", async (req, res) => {
       const jobs = await queue.getJobs([st], 0, 100000);
       for (const job of jobs) {
         if (job?.data?.campaignId === id) {
-          try {
-            await job.remove();
-            removed++;
-          } catch {}
+          try { await job.remove(); removed++; } catch {}
         }
       }
     }
 
-    return res.json({
-      ok: true,
-      campaignId: id,
-      canceled: true,
-      removedPendingJobs: removed,
-    });
+    return res.json({ ok: true, campaignId: id, canceled: true, removedPendingJobs: removed });
   } catch (e) {
     console.error("❌ /campaign/:id/cancel erro:", e);
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
@@ -497,7 +476,7 @@ app.post("/campaign/:id/cancel", async (req, res) => {
 });
 
 // =====================================================================================
-// Erros do Multer (ex: Unexpected field)
+// Multer errors
 // =====================================================================================
 app.use((err, req, res, next) => {
   if (err && err.name === "MulterError") {
