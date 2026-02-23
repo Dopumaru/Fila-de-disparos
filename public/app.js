@@ -10,6 +10,9 @@ function campaignPauseUrl(id) {
 function campaignResumeUrl(id) {
   return `/campaign/${encodeURIComponent(id)}/resume`;
 }
+function campaignCancelUrl(id) {
+  return `/campaign/${encodeURIComponent(id)}/cancel`;
+}
 
 const ALLOWED_INTERVALS = new Set([1000, 2000, 3000]);
 const MAX_RATE_MAX = 25;
@@ -173,6 +176,44 @@ function setCampaignVisible(flag) {
   box.style.display = flag ? "block" : "none";
 }
 
+function stopCampaignPolling() {
+  if (state.campaignPollTimer) {
+    clearInterval(state.campaignPollTimer);
+    state.campaignPollTimer = null;
+  }
+}
+
+async function fetchCampaignOnce(campaignId) {
+  const res = await fetch(campaignStatusUrl(campaignId));
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+
+  // seu server retorna { ok:true, campaignId, ...meta }
+  // e o antigo (se existia) retornava { campaign: {...} }
+  // então a gente aceita os 2 formatos:
+  if (data?.campaign) return data.campaign;
+
+  // Normaliza meta para um formato esperado pelo renderCampaign
+  // meta vem como strings do Redis, então converte números básicos
+  const meta = data || {};
+  const total = Number(meta.total || 0);
+  const sent = Number(meta.sent || 0);
+  const failed = Number(meta.failed || 0);
+  const canceled = Number(meta.canceled || 0);
+
+  const done = sent + failed + canceled;
+  const pct = total > 0 ? Math.floor((done / total) * 100) : 0;
+
+  return {
+    id: data?.campaignId || campaignId,
+    paused: String(meta.paused || "0") === "1",
+    canceledFlag: String(meta.canceled || "0") === "1" || String(meta.canceledFlag || "0") === "1",
+    canceled: String(meta.canceled || "0") === "1", // se você usa canceled como flag
+    counts: { total, sent, failed, canceled, done, pct },
+    raw: meta,
+  };
+}
+
 function renderCampaign(c) {
   state.lastCampaign = c;
 
@@ -184,6 +225,7 @@ function renderCampaign(c) {
   const totalEl = document.getElementById("campaignTotal");
   const barEl = document.getElementById("campaignBar");
   const btnPause = document.getElementById("btnPauseResume");
+  const btnCancel = document.getElementById("btnCancelCampaign");
 
   if (idEl) idEl.textContent = c.id || "-";
 
@@ -191,12 +233,22 @@ function renderCampaign(c) {
   const sent = Number(c.counts?.sent ?? 0);
   const failed = Number(c.counts?.failed ?? 0);
   const total = Number(c.counts?.total ?? 0);
+  const canceledCount = Number(c.counts?.canceled ?? 0);
 
-  const done = Number(c.counts?.done ?? (sent + failed));
+  const done = Number(c.counts?.done ?? (sent + failed + canceledCount));
   const finished = total > 0 && done >= total;
 
+  // flag de cancel (pode vir como c.canceled boolean)
+  const isCanceled =
+    !!c.canceled ||
+    !!c.canceledFlag ||
+    String(c.raw?.canceled || "0") === "1";
+
   if (badgeEl) {
-    if (finished) {
+    if (isCanceled) {
+      badgeEl.textContent = "CANCELADA";
+      badgeEl.className = "pill err";
+    } else if (finished) {
       badgeEl.textContent = "FINALIZADA";
       badgeEl.className = "pill ok";
     } else if (c.paused) {
@@ -216,29 +268,26 @@ function renderCampaign(c) {
   if (barEl) barEl.style.width = `${Math.min(100, Math.max(0, pct))}%`;
 
   if (btnPause) {
-    btnPause.disabled = !c.id || finished;
+    btnPause.disabled = !c.id || finished || isCanceled;
     btnPause.textContent = c.paused ? "Retomar" : "Pausar";
     btnPause.dataset.paused = c.paused ? "1" : "0";
   }
 
-  if (finished) {
+  if (btnCancel) {
+    btnCancel.disabled = !c.id || finished || isCanceled;
+    btnCancel.textContent = isCanceled ? "Cancelada" : "Cancelar campanha";
+  }
+
+  if (isCanceled) {
+    stopCampaignPolling();
+    setStatus(
+      "warn",
+      `Campanha cancelada. Enviados: ${sent} | Falhas: ${failed} | Cancelados: ${canceledCount} | Total: ${total}`
+    );
+  } else if (finished) {
     stopCampaignPolling();
     setStatus("ok", `Finalizada. Enviados: ${sent} | Falhas: ${failed} | Total: ${total}`);
   }
-}
-
-function stopCampaignPolling() {
-  if (state.campaignPollTimer) {
-    clearInterval(state.campaignPollTimer);
-    state.campaignPollTimer = null;
-  }
-}
-
-async function fetchCampaignOnce(campaignId) {
-  const res = await fetch(campaignStatusUrl(campaignId));
-  const data = await res.json().catch(() => null);
-  if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
-  return data?.campaign;
 }
 
 function startCampaignPolling(campaignId) {
@@ -264,10 +313,19 @@ async function pauseOrResumeCurrentCampaign() {
   const c = state.lastCampaign;
   if (!c?.id) return;
 
+  // se cancelada, não faz nada
+  const isCanceled =
+    !!c.canceled ||
+    !!c.canceledFlag ||
+    String(c.raw?.canceled || "0") === "1";
+  if (isCanceled) return;
+
   const sent = Number(c.counts?.sent ?? 0);
   const failed = Number(c.counts?.failed ?? 0);
   const total = Number(c.counts?.total ?? 0);
-  const done = Number(c.counts?.done ?? (sent + failed));
+  const canceledCount = Number(c.counts?.canceled ?? 0);
+
+  const done = Number(c.counts?.done ?? (sent + failed + canceledCount));
   const finished = total > 0 && done >= total;
   if (finished) return;
 
@@ -284,11 +342,54 @@ async function pauseOrResumeCurrentCampaign() {
     const res = await fetch(url, { method: "POST" });
     const data = await res.json().catch(() => null);
     if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
-    if (data?.campaign) renderCampaign(data.campaign);
+
+    // suporta ambos formatos
+    const campaign = data?.campaign || (await fetchCampaignOnce(c.id));
+    if (campaign) renderCampaign(campaign);
   } catch (e) {
     setStatus("err", "Erro ao pausar/retomar: " + (e?.message || String(e)));
   } finally {
     if (btn) btn.disabled = false;
+  }
+}
+
+async function cancelCurrentCampaign() {
+  const c = state.lastCampaign;
+  if (!c?.id) return;
+
+  const isCanceled =
+    !!c.canceled ||
+    !!c.canceledFlag ||
+    String(c.raw?.canceled || "0") === "1";
+  if (isCanceled) return;
+
+  const ok = confirm("Cancelar campanha? Isso vai parar e remover o restante da fila (não dá pra retomar).");
+  if (!ok) return;
+
+  const btnCancel = document.getElementById("btnCancelCampaign");
+  const btnPause = document.getElementById("btnPauseResume");
+  if (btnCancel) {
+    btnCancel.disabled = true;
+    btnCancel.textContent = "Cancelando...";
+  }
+  if (btnPause) btnPause.disabled = true;
+
+  try {
+    const res = await fetch(campaignCancelUrl(c.id), { method: "POST" });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+
+    appendDebug("\n\nCancel:\n" + JSON.stringify(data, null, 2));
+    // atualiza status novamente
+    const latest = await fetchCampaignOnce(c.id);
+    if (latest) renderCampaign(latest);
+  } catch (e) {
+    setStatus("err", "Erro ao cancelar: " + (e?.message || String(e)));
+    if (btnCancel) {
+      btnCancel.disabled = false;
+      btnCancel.textContent = "Cancelar campanha";
+    }
+    if (btnPause) btnPause.disabled = false;
   }
 }
 
@@ -334,6 +435,13 @@ const btnPauseResume = document.getElementById("btnPauseResume");
 if (btnPauseResume) {
   btnPauseResume.addEventListener("click", async () => {
     await pauseOrResumeCurrentCampaign();
+  });
+}
+
+const btnCancelCampaign = document.getElementById("btnCancelCampaign");
+if (btnCancelCampaign) {
+  btnCancelCampaign.addEventListener("click", async () => {
+    await cancelCurrentCampaign();
   });
 }
 
@@ -394,12 +502,22 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
   if (btnErr) return setStatus("err", btnErr);
 
   const form = new FormData();
+
+  // ==== compat (envia os dois nomes) ====
   form.append("botToken", tokenObj.token);
   form.append("type", tipo);
   form.append("caption", mensagemTemplate);
   form.append("csv", csv);
+
+  // antigo/front: limitMax + limitMs
   form.append("limitMax", String(limMax));
   form.append("limitMs", String(limMs));
+
+  // novo/server: limit + interval (+ intervalSec)
+  form.append("limit", String(limMax));
+  form.append("interval", String(Math.floor(limMs / 1000)));
+  form.append("intervalSec", String(Math.floor(limMs / 1000)));
+
   form.append("buttons", JSON.stringify(buttons));
 
   if (tipo !== "text") {
