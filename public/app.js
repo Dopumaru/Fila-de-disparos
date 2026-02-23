@@ -193,6 +193,20 @@ function isHttpUrl(u) {
   return /^https?:\/\//i.test(String(u || "").trim());
 }
 
+// ✅ file_id do Telegram: não é URL. Pode conter letras/números/underscore/hífen.
+// Ex comuns: "BAACAgQAAxkBA..." / "AgACAgQAAxkBA..." / "CQACAgQAA..." etc.
+function isTelegramFileId(s) {
+  const v = String(s || "").trim();
+  if (!v) return false;
+  if (isHttpUrl(v)) return false;
+  // evita coisas muito curtas ou com espaços
+  if (v.length < 10) return false;
+  if (/\s/.test(v)) return false;
+  // geralmente começa com letras e tem só chars "seguros"
+  if (!/^[A-Za-z0-9_-]+$/.test(v)) return false;
+  return true;
+}
+
 // ===== Campaign UI helpers =====
 function setCampaignVisible(flag) {
   const box = document.getElementById("campaignBox");
@@ -213,27 +227,19 @@ async function fetchCampaignOnce(campaignId) {
 
   if (!res.ok) {
     const msg = data?.error || `HTTP ${res.status}`;
-    // Se expirou / não existe mais, limpa persist e para.
     if (res.status === 404) {
       clearLastCampaignId();
     }
     throw new Error(msg);
   }
 
-  // seu server retorna { ok:true, campaignId, ...meta }
-  // e o antigo (se existia) retornava { campaign: {...} }
-  // então a gente aceita os 2 formatos:
   if (data?.campaign) return data.campaign;
 
-  // Normaliza meta para um formato esperado pelo renderCampaign
-  // meta vem como strings do Redis, então converte números básicos
   const meta = data || {};
   const total = Number(meta.total || 0);
   const sent = Number(meta.sent || 0);
   const failed = Number(meta.failed || 0);
 
-  // Alguns setups usam "canceled" como contador, outros como flag.
-  // Aqui tratamos "canceledCount" como número (se existir) e "canceled" como flag.
   const canceledCount = Number(meta.canceledCount || meta.canceled_total || 0);
 
   const done = sent + failed + canceledCount;
@@ -277,7 +283,6 @@ function renderCampaign(c) {
   const done = Number(c.counts?.done ?? (sent + failed + canceledCount));
   const finished = total > 0 && done >= total;
 
-  // flag de cancel (pode vir como c.canceled boolean)
   const isCanceled =
     !!c.canceled ||
     !!c.canceledFlag ||
@@ -318,7 +323,6 @@ function renderCampaign(c) {
     btnCancel.textContent = isCanceled ? "Cancelada" : "Cancelar campanha";
   }
 
-  // ✅ Limpa persist quando acabou
   if (isCanceled) {
     clearLastCampaignId();
     stopCampaignPolling();
@@ -338,7 +342,6 @@ function startCampaignPolling(campaignId, opts = {}) {
   state.campaignId = campaignId;
   setCampaignVisible(true);
 
-  // ✅ persiste pra sobreviver refresh/fechar e abrir
   if (!opts?.skipSave) saveLastCampaignId(campaignId);
 
   const tick = async () => {
@@ -346,7 +349,6 @@ function startCampaignPolling(campaignId, opts = {}) {
       const c = await fetchCampaignOnce(campaignId);
       if (c) renderCampaign(c);
     } catch (e) {
-      // Se 404, já limpamos o localStorage no fetchCampaignOnce
       if (String(e?.message || "").toLowerCase().includes("campaign não encontrada")) {
         clearLastCampaignId();
       }
@@ -363,7 +365,6 @@ async function pauseOrResumeCurrentCampaign() {
   const c = state.lastCampaign;
   if (!c?.id) return;
 
-  // se cancelada, não faz nada
   const isCanceled =
     !!c.canceled ||
     !!c.canceledFlag ||
@@ -393,7 +394,6 @@ async function pauseOrResumeCurrentCampaign() {
     const data = await res.json().catch(() => null);
     if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
 
-    // suporta ambos formatos
     const campaign = data?.campaign || (await fetchCampaignOnce(c.id));
     if (campaign) renderCampaign(campaign);
   } catch (e) {
@@ -431,7 +431,6 @@ async function cancelCurrentCampaign() {
 
     appendDebug("\n\nCancel:\n" + JSON.stringify(data, null, 2));
 
-    // após cancelar, limpa persist e puxa status final
     clearLastCampaignId();
     const latest = await fetchCampaignOnce(c.id);
     if (latest) renderCampaign(latest);
@@ -531,21 +530,24 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
     return setStatus("err", "Intervalo inválido. Use apenas 1s, 2s ou 3s.");
   }
 
-  // mídia: exige URL ou upload (e não deixa os dois)
+  // mídia: exige URL/file_id ou upload (e não deixa os dois)
   if (tipo !== "text") {
-    const hasUrl = !!fileUrl;
+    const hasRef = !!fileUrl; // URL ou file_id
     const hasUpload = !!file;
 
-    if (hasUrl && !isHttpUrl(fileUrl)) {
-      return setStatus("err", "A URL do arquivo deve começar com http:// ou https://");
+    if (hasRef && !(isHttpUrl(fileUrl) || isTelegramFileId(fileUrl))) {
+      return setStatus(
+        "err",
+        "Informe uma URL (http/https) OU um file_id do Telegram (sem espaços)."
+      );
     }
 
-    if (hasUrl && hasUpload) {
-      return setStatus("err", "Escolha apenas UM: URL do arquivo OU Upload.");
+    if (hasRef && hasUpload) {
+      return setStatus("err", "Escolha apenas UM: URL/file_id OU Upload.");
     }
 
-    if (!hasUrl && !hasUpload) {
-      return setStatus("err", "Para mídia/documento: preencha a URL do arquivo OU selecione um arquivo (upload).");
+    if (!hasRef && !hasUpload) {
+      return setStatus("err", "Para mídia/documento: preencha URL/file_id OU selecione um arquivo (upload).");
     }
   }
 
@@ -586,6 +588,13 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
   stopCampaignPolling();
   setCampaignVisible(false);
 
+  const refLabel =
+    tipo !== "text"
+      ? (fileUrl
+          ? (isHttpUrl(fileUrl) ? "URL: " + fileUrl + "\n" : "FileId: " + fileUrl + "\n")
+          : (file ? "Upload: " + file.name + "\n" : ""))
+      : "";
+
   appendDebug(
     "POST " + API_URL + "\n" +
       "Bot: " + (tokenObj.label || "Bot") + "\n" +
@@ -594,9 +603,7 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
       "Botões: " + (buttons.length || 0) + "\n" +
       "Rate: " + limMax + " a cada " + (limMs / 1000) + "s\n" +
       "Dica: Para campanhas grandes, use 1 msg a cada 2–3s.\n" +
-      (tipo !== "text"
-        ? (fileUrl ? "URL: " + fileUrl + "\n" : (file ? "Upload: " + file.name + "\n" : ""))
-        : "")
+      refLabel
   );
 
   try {
@@ -617,7 +624,7 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
 
     if (data?.campaignId) {
       appendDebug("\n\ncampaignId: " + data.campaignId);
-      startCampaignPolling(data.campaignId); // ✅ já salva no localStorage
+      startCampaignPolling(data.campaignId);
     } else {
       appendDebug("\n\n[warn] API não retornou campaignId (sem progresso).");
     }
@@ -638,10 +645,8 @@ renderTokens();
   const last = loadLastCampaignId();
   if (!last) return;
 
-  // Não tenta “adivinhar” token/arquivo etc. Só restaura o monitoramento/controle.
   appendDebug(`\n\n[info] Restaurando última campanha: ${last}`);
   setStatus("warn", "Restaurando monitoramento da última campanha: " + last);
 
-  // startCampaignPolling já vai salvar de novo; aqui não precisa.
   startCampaignPolling(last, { skipSave: true });
 })();
