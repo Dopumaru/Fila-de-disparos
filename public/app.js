@@ -14,6 +14,30 @@ function campaignCancelUrl(id) {
   return `/campaign/${encodeURIComponent(id)}/cancel`;
 }
 
+// ===== Persist (last campaign) =====
+const LAST_CAMPAIGN_KEY = "lastCampaignId_v1";
+
+function saveLastCampaignId(id) {
+  try {
+    if (id) localStorage.setItem(LAST_CAMPAIGN_KEY, String(id));
+  } catch {}
+}
+
+function loadLastCampaignId() {
+  try {
+    const v = localStorage.getItem(LAST_CAMPAIGN_KEY);
+    return v ? String(v) : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearLastCampaignId() {
+  try {
+    localStorage.removeItem(LAST_CAMPAIGN_KEY);
+  } catch {}
+}
+
 const ALLOWED_INTERVALS = new Set([1000, 2000, 3000]);
 const MAX_RATE_MAX = 25;
 
@@ -186,7 +210,15 @@ function stopCampaignPolling() {
 async function fetchCampaignOnce(campaignId) {
   const res = await fetch(campaignStatusUrl(campaignId));
   const data = await res.json().catch(() => null);
-  if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+
+  if (!res.ok) {
+    const msg = data?.error || `HTTP ${res.status}`;
+    // Se expirou / não existe mais, limpa persist e para.
+    if (res.status === 404) {
+      clearLastCampaignId();
+    }
+    throw new Error(msg);
+  }
 
   // seu server retorna { ok:true, campaignId, ...meta }
   // e o antigo (se existia) retornava { campaign: {...} }
@@ -199,17 +231,23 @@ async function fetchCampaignOnce(campaignId) {
   const total = Number(meta.total || 0);
   const sent = Number(meta.sent || 0);
   const failed = Number(meta.failed || 0);
-  const canceled = Number(meta.canceled || 0);
 
-  const done = sent + failed + canceled;
+  // Alguns setups usam "canceled" como contador, outros como flag.
+  // Aqui tratamos "canceledCount" como número (se existir) e "canceled" como flag.
+  const canceledCount = Number(meta.canceledCount || meta.canceled_total || 0);
+
+  const done = sent + failed + canceledCount;
   const pct = total > 0 ? Math.floor((done / total) * 100) : 0;
+
+  const canceledFlag =
+    String(meta.canceled || "0") === "1" ||
+    String(meta.canceledFlag || "0") === "1";
 
   return {
     id: data?.campaignId || campaignId,
     paused: String(meta.paused || "0") === "1",
-    canceledFlag: String(meta.canceled || "0") === "1" || String(meta.canceledFlag || "0") === "1",
-    canceled: String(meta.canceled || "0") === "1", // se você usa canceled como flag
-    counts: { total, sent, failed, canceled, done, pct },
+    canceledFlag,
+    counts: { total, sent, failed, canceled: canceledCount, done, pct },
     raw: meta,
   };
 }
@@ -223,6 +261,7 @@ function renderCampaign(c) {
   const sentEl = document.getElementById("campaignSent");
   const failEl = document.getElementById("campaignFailed");
   const totalEl = document.getElementById("campaignTotal");
+  const canceledEl = document.getElementById("campaignCanceled");
   const barEl = document.getElementById("campaignBar");
   const btnPause = document.getElementById("btnPauseResume");
   const btnCancel = document.getElementById("btnCancelCampaign");
@@ -264,6 +303,7 @@ function renderCampaign(c) {
   if (sentEl) sentEl.textContent = String(sent);
   if (failEl) failEl.textContent = String(failed);
   if (totalEl) totalEl.textContent = String(total);
+  if (canceledEl) canceledEl.textContent = String(canceledCount);
 
   if (barEl) barEl.style.width = `${Math.min(100, Math.max(0, pct))}%`;
 
@@ -278,28 +318,38 @@ function renderCampaign(c) {
     btnCancel.textContent = isCanceled ? "Cancelada" : "Cancelar campanha";
   }
 
+  // ✅ Limpa persist quando acabou
   if (isCanceled) {
+    clearLastCampaignId();
     stopCampaignPolling();
     setStatus(
       "warn",
       `Campanha cancelada. Enviados: ${sent} | Falhas: ${failed} | Cancelados: ${canceledCount} | Total: ${total}`
     );
   } else if (finished) {
+    clearLastCampaignId();
     stopCampaignPolling();
     setStatus("ok", `Finalizada. Enviados: ${sent} | Falhas: ${failed} | Total: ${total}`);
   }
 }
 
-function startCampaignPolling(campaignId) {
+function startCampaignPolling(campaignId, opts = {}) {
   stopCampaignPolling();
   state.campaignId = campaignId;
   setCampaignVisible(true);
+
+  // ✅ persiste pra sobreviver refresh/fechar e abrir
+  if (!opts?.skipSave) saveLastCampaignId(campaignId);
 
   const tick = async () => {
     try {
       const c = await fetchCampaignOnce(campaignId);
       if (c) renderCampaign(c);
     } catch (e) {
+      // Se 404, já limpamos o localStorage no fetchCampaignOnce
+      if (String(e?.message || "").toLowerCase().includes("campaign não encontrada")) {
+        clearLastCampaignId();
+      }
       setStatus("warn", "Não consegui ler o status da campanha (rede/API).");
       appendDebug(`\n\n[warn] Falha ao ler campaign: ${e?.message || String(e)}`);
     }
@@ -380,7 +430,9 @@ async function cancelCurrentCampaign() {
     if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
 
     appendDebug("\n\nCancel:\n" + JSON.stringify(data, null, 2));
-    // atualiza status novamente
+
+    // após cancelar, limpa persist e puxa status final
+    clearLastCampaignId();
     const latest = await fetchCampaignOnce(c.id);
     if (latest) renderCampaign(latest);
   } catch (e) {
@@ -565,7 +617,7 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
 
     if (data?.campaignId) {
       appendDebug("\n\ncampaignId: " + data.campaignId);
-      startCampaignPolling(data.campaignId);
+      startCampaignPolling(data.campaignId); // ✅ já salva no localStorage
     } else {
       appendDebug("\n\n[warn] API não retornou campaignId (sem progresso).");
     }
@@ -580,3 +632,16 @@ document.getElementById("btnEnviar").addEventListener("click", async () => {
 });
 
 renderTokens();
+
+// ✅ restore automático da última campanha (refresh/fechar e abrir)
+(function restoreLastCampaign() {
+  const last = loadLastCampaignId();
+  if (!last) return;
+
+  // Não tenta “adivinhar” token/arquivo etc. Só restaura o monitoramento/controle.
+  appendDebug(`\n\n[info] Restaurando última campanha: ${last}`);
+  setStatus("warn", "Restaurando monitoramento da última campanha: " + last);
+
+  // startCampaignPolling já vai salvar de novo; aqui não precisa.
+  startCampaignPolling(last, { skipSave: true });
+})();
