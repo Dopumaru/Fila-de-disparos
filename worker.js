@@ -35,6 +35,13 @@ async function isCampaignPaused(campaignId) {
   return String(v || "0") === "1";
 }
 
+// ✅ cancel real
+async function isCampaignCanceled(campaignId) {
+  if (!campaignId) return false;
+  const v = await redis.hget(campaignKey(campaignId), "canceled");
+  return String(v || "0") === "1";
+}
+
 async function incCampaign(campaignId, field) {
   if (!campaignId) return;
   await redis.hincrby(campaignKey(campaignId), field, 1);
@@ -79,6 +86,7 @@ const stats = {
   processed: 0,
   sent: 0,
   failed: 0,
+  canceled: 0,
   lastLogAt: 0,
 };
 
@@ -91,7 +99,7 @@ function maybeLogProgress() {
     stats.lastLogAt = now;
     const rps = (stats.processed / elapsed).toFixed(2);
     console.log(
-      `📊 progress: processed=${stats.processed} sent=${stats.sent} failed=${stats.failed} avg=${rps}/s`
+      `📊 progress: processed=${stats.processed} sent=${stats.sent} failed=${stats.failed} canceled=${stats.canceled} avg=${rps}/s`
     );
   }
 }
@@ -99,6 +107,8 @@ function maybeLogProgress() {
 async function waitIfPaused(campaignId) {
   if (!campaignId) return;
   while (await isCampaignPaused(campaignId)) {
+    // ✅ se cancelou enquanto estava pausado, sai imediatamente
+    if (await isCampaignCanceled(campaignId)) return;
     await sleep(1500);
   }
 }
@@ -110,11 +120,9 @@ async function inputFromUrlOrId(fileUrl) {
   if (!s) return null;
 
   if (!/^https?:\/\//i.test(s)) {
-    // file_id do Telegram (ou path local, mas aqui a gente usa URL/file_id)
-    return s;
+    return s; // file_id
   }
 
-  // download do arquivo (URL interna da API) e manda como Buffer
   const r = await fetch(s);
   if (!r.ok) {
     throw new Error(`Falha ao baixar arquivo (${r.status}) ${s}`);
@@ -124,6 +132,13 @@ async function inputFromUrlOrId(fileUrl) {
 }
 
 async function sendTelegram(bot, payload) {
+  const campaignId = payload.campaignId;
+
+  // ✅ trava final: se cancelado, não envia
+  if (campaignId && (await isCampaignCanceled(campaignId))) {
+    return { ok: true, canceled: true };
+  }
+
   const chatId = payload.chatId;
   const text = payload.text;
   const caption = payload.caption;
@@ -139,11 +154,8 @@ async function sendTelegram(bot, payload) {
   }
 
   const input = await inputFromUrlOrId(fileUrl);
-
-  // Se por algum motivo input vier null
   if (!input) throw new Error("fileUrl inválida/vazia");
 
-  // Rotear por tipo
   if (fileType === "photo") return bot.sendPhoto(chatId, input, caption ? { caption } : undefined);
   if (fileType === "video") return bot.sendVideo(chatId, input, caption ? { caption } : undefined);
   if (fileType === "document") return bot.sendDocument(chatId, input, caption ? { caption } : undefined);
@@ -151,7 +163,6 @@ async function sendTelegram(bot, payload) {
   if (fileType === "voice") return bot.sendVoice(chatId, input, caption ? { caption } : undefined);
   if (fileType === "video_note") return bot.sendVideoNote(chatId, input);
 
-  // fallback: manda como documento
   return bot.sendDocument(chatId, input, caption ? { caption } : undefined);
 }
 
@@ -162,12 +173,35 @@ const worker = new Worker(
     const data = job.data || {};
     const campaignId = data.campaignId;
 
+    // ✅ pausa (mas sai se cancelou)
     await waitIfPaused(campaignId);
+
+    // ✅ cancel real: não processa nem envia, mesmo se o worker já pegou o job
+    if (await isCampaignCanceled(campaignId)) {
+      stats.processed++;
+      stats.canceled++;
+      maybeLogProgress();
+
+      await incCampaign(campaignId, "canceled");
+
+      try { job.discard(); } catch {}
+      return { ok: true, canceled: true };
+    }
 
     const bot = getBot(data.botToken);
 
     try {
-      await sendTelegram(bot, data);
+      const r = await sendTelegram(bot, data);
+
+      // se cancelou "no meio" (entre checks), sendTelegram retorna canceled:true
+      if (r && r.canceled) {
+        stats.processed++;
+        stats.canceled++;
+        maybeLogProgress();
+        await incCampaign(campaignId, "canceled");
+        try { job.discard(); } catch {}
+        return { ok: true, canceled: true };
+      }
 
       stats.processed++;
       stats.sent++;
