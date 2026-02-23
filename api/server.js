@@ -319,13 +319,10 @@ app.post(
         req.body.caption_text ||
         "";
 
-      const hasMedia = !!mediaFile;
-      if (!hasMedia && !String(message || "").trim()) {
-        return res.status(400).json({
-          ok: false,
-          error: "Mensagem vazia. Preencha 'Mensagem / Legenda' para tipo Texto.",
-        });
-      }
+      // ✅ aceita upload OU fileUrl/file_id do body (URL http(s) OU file_id)
+       const rawFileUrl = String(req.body.fileUrl || req.body.file_id || "").trim();
+
+ 
 
       const campaignId = genId();
 
