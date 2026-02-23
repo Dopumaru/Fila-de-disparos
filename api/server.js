@@ -54,7 +54,6 @@ app.use("/uploads", express.static(uploadsDirToServe));
 
 // ===== Multer =====
 // IMPORTANT: seu painel manda `csv` e também `file` (mídia).
-// Se usar upload.single("csv"), o multer dá "Unexpected field" quando vier `file`.
 // Então usamos upload.fields([csv, file]).
 const upload = multer({
   dest: uploadsDirToServe,
@@ -71,7 +70,6 @@ const REMOVE_FAIL_COUNT = Number(process.env.REMOVE_FAIL_COUNT) || 5000;
 const queue = new Queue(QUEUE_NAME, {
   connection,
   defaultJobOptions: {
-    // fallback geral (a gente também seta por job)
     removeOnComplete: { count: REMOVE_COMPLETE_COUNT },
     removeOnFail: { count: REMOVE_FAIL_COUNT },
   },
@@ -142,12 +140,9 @@ function toInt(n, def) {
 
 // Base URL pública (para o navegador/Telegram). Worker também consegue baixar via pública.
 function getPublicBaseUrl(req) {
-  // Se você setar PUBLIC_BASE_URL no EasyPanel (recomendado), ele usa isso.
-  // Ex: https://fila-disparos-api-disparos.eh6msh.easypanel.host
   const envBase = String(process.env.PUBLIC_BASE_URL || "").trim();
   if (envBase) return envBase.replace(/\/+$/, "");
 
-  // fallback: usa host atual
   const proto = req.headers["x-forwarded-proto"] || req.protocol || "http";
   const host = req.headers["x-forwarded-host"] || req.get("host");
   return `${proto}://${host}`.replace(/\/+$/, "");
@@ -184,6 +179,7 @@ app.post("/campaign", async (req, res) => {
 
     await setCampaignMeta(id, {
       paused: "0",
+      canceled: "0",
       total: String(leads.length),
       sent: "0",
       failed: "0",
@@ -215,8 +211,6 @@ app.post("/campaign", async (req, res) => {
           delay: idx * baseDelayMs,
           attempts: 6,
           backoff: { type: "exponential", delay: 2000 },
-
-          // ✅ não lota Redis
           removeOnComplete: { count: REMOVE_COMPLETE_COUNT },
           removeOnFail: { count: REMOVE_FAIL_COUNT },
         },
@@ -328,6 +322,7 @@ app.post(
 
       await setCampaignMeta(campaignId, {
         paused: "0",
+        canceled: "0",
         total: String(leads.length),
         sent: "0",
         failed: "0",
@@ -359,8 +354,6 @@ app.post(
           delay: idx * baseDelayMs,
           attempts: 6,
           backoff: { type: "exponential", delay: 2000 },
-
-          // ✅ não lota Redis
           removeOnComplete: { count: REMOVE_COMPLETE_COUNT },
           removeOnFail: { count: REMOVE_FAIL_COUNT },
         },
@@ -384,7 +377,7 @@ app.post(
 );
 
 // =====================================================================================
-// Campaign status/pause/resume
+// Campaign status/pause/resume/cancel
 // =====================================================================================
 app.get("/campaign/:id", async (req, res) => {
   try {
@@ -421,6 +414,47 @@ app.post("/campaign/:id/resume", async (req, res) => {
     });
     return res.json({ ok: true, campaignId: id, paused: false });
   } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// ✅ CANCEL REAL (B): mata tudo e impede envios futuros
+app.post("/campaign/:id/cancel", async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    // marca cancelado e despausa (pra não ficar preso no loop)
+    await redis.hset(campaignKey(id), {
+      canceled: "1",
+      canceledAt: new Date().toISOString(),
+      paused: "0",
+    });
+
+    // remove jobs pendentes (waiting/delayed/paused)
+    const states = ["waiting", "delayed", "paused"];
+    let removed = 0;
+
+    for (const st of states) {
+      // 100k cobre 30k tranquilo
+      const jobs = await queue.getJobs([st], 0, 100000);
+      for (const job of jobs) {
+        if (job?.data?.campaignId === id) {
+          try {
+            await job.remove();
+            removed++;
+          } catch {}
+        }
+      }
+    }
+
+    return res.json({
+      ok: true,
+      campaignId: id,
+      canceled: true,
+      removedPendingJobs: removed,
+    });
+  } catch (e) {
+    console.error("❌ /campaign/:id/cancel erro:", e);
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
