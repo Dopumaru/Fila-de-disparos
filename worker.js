@@ -29,17 +29,28 @@ function campaignKey(id) {
   return `campaign:${id}`;
 }
 
+// =====================
+// Campaign meta helpers
+// =====================
 async function isCampaignPaused(campaignId) {
   if (!campaignId) return false;
   const v = await redis.hget(campaignKey(campaignId), "paused");
   return String(v || "0") === "1";
 }
 
-// ✅ cancel real
 async function isCampaignCanceled(campaignId) {
   if (!campaignId) return false;
   const v = await redis.hget(campaignKey(campaignId), "canceled");
   return String(v || "0") === "1";
+}
+
+// ✅ NEW: pega ratePerSecond atual da campanha (pra mudar em runtime)
+async function getCampaignRps(campaignId) {
+  if (!campaignId) return null;
+  const v = await redis.hget(campaignKey(campaignId), "ratePerSecond");
+  const n = Number(v);
+  if (Number.isFinite(n) && n > 0) return n;
+  return null;
 }
 
 async function incCampaign(campaignId, field, by = 1) {
@@ -63,9 +74,6 @@ function getTelegramDescription(err) {
   return String(body?.description || err?.message || "");
 }
 
-// Extract retry_after (seconds) from Telegram 429.
-// node-telegram-bot-api normalmente traz:
-// err.response.body.parameters.retry_after
 function getRetryAfterSeconds(err) {
   const body = err?.response?.body;
   const p = body?.parameters;
@@ -73,7 +81,6 @@ function getRetryAfterSeconds(err) {
   if (Number.isFinite(ra1) && ra1 > 0) return ra1;
 
   const desc = getTelegramDescription(err);
-  // Ex: "Too Many Requests: retry after 10"
   const m = desc.match(/retry after\s+(\d+)/i);
   if (m) {
     const ra2 = Number(m[1]);
@@ -86,7 +93,6 @@ function is429(err) {
   return getTelegramStatusCode(err) === 429;
 }
 
-// Classifica erro "permanente"
 function isPermanentTelegramError(err) {
   const code = err?.code;
   const statusCode = getTelegramStatusCode(err);
@@ -104,12 +110,12 @@ function isPermanentTelegramError(err) {
       desc.includes("wrong remote file identifier") ||
       desc.includes("file is too big") ||
       desc.includes("bad request")
-    ) return true;
+    )
+      return true;
   }
 
   if (statusCode === 401) return true;
 
-  // rede geralmente NÃO é permanente
   if (code === "ETIMEDOUT" || code === "ECONNRESET") return false;
 
   return false;
@@ -119,8 +125,8 @@ function isRetryableTransient(err) {
   const code = err?.code;
   const sc = getTelegramStatusCode(err);
 
-  if (sc === 429) return true; // rate limit
-  if (sc >= 500 && sc <= 599) return true; // telegram/infra
+  if (sc === 429) return true;
+  if (sc >= 500 && sc <= 599) return true;
   if (code === "ETIMEDOUT" || code === "ECONNRESET") return true;
 
   return false;
@@ -136,13 +142,10 @@ const stats = {
   failed: 0,
   canceled: 0,
 
-  // retries
   retry429: 0,
   retryOther: 0,
 
   lastLogAt: 0,
-
-  // para log resumido de 429
   last429LogAt: 0,
   last429Count: 0,
   last429Sec: 0,
@@ -161,7 +164,6 @@ function maybeLogProgress() {
     );
   }
 
-  // log resumido de 429 (no máximo a cada 10s)
   if (stats.last429Count > 0 && now - stats.last429LogAt > 10000) {
     stats.last429LogAt = now;
     console.warn(
@@ -172,17 +174,68 @@ function maybeLogProgress() {
   }
 }
 
+// =====================
+// Pause / Cancel
+// =====================
 async function waitIfPaused(campaignId) {
   if (!campaignId) return;
   while (await isCampaignPaused(campaignId)) {
-    // ✅ se cancelou enquanto estava pausado, sai imediatamente
     if (await isCampaignCanceled(campaignId)) return;
     await sleep(1500);
   }
 }
 
-// ✅ Se for URL (http/https): baixa e manda como Buffer.
-// ✅ Se não for URL: assume que é file_id do Telegram e manda direto.
+// =====================
+// ✅ NEW: Throttle por campanha (ratePerSecond dinâmico)
+// =====================
+// Estratégia:
+// - Cada campanha tem uma "janela" (bucket) local no worker.
+// - Antes de enviar, calculamos o intervalo mínimo entre envios: 1000/rps.
+// - Se estamos adiantados, dorme o delta.
+// - Como cada worker tem seu próprio bucket, isso limita por worker.
+//   (Se você rodar múltiplos workers em paralelo, o total vai somar.)
+const throttle = new Map(); // campaignId -> { nextAt, rpsCached, lastFetchAt }
+const THROTTLE_RPS_TTL_MS = 1500; // refaz fetch do rps a cada ~1.5s
+
+async function throttleByCampaign(campaignId) {
+  if (!campaignId) return;
+
+  // se pausado/cancelado, nem perde tempo aqui
+  if (await isCampaignCanceled(campaignId)) return;
+  if (await isCampaignPaused(campaignId)) return;
+
+  const now = Date.now();
+  let t = throttle.get(campaignId);
+  if (!t) {
+    t = { nextAt: 0, rpsCached: null, lastFetchAt: 0 };
+    throttle.set(campaignId, t);
+  }
+
+  // atualiza rps (dinâmico) com TTL curto
+  if (!t.rpsCached || now - t.lastFetchAt > THROTTLE_RPS_TTL_MS) {
+    const rps = await getCampaignRps(campaignId);
+    t.rpsCached = Number.isFinite(rps) && rps > 0 ? Math.max(1, Math.min(30, rps)) : 1;
+    t.lastFetchAt = now;
+  }
+
+  const intervalMs = Math.floor(1000 / t.rpsCached);
+
+  // se não setou nextAt ainda, começa agora
+  if (!t.nextAt) t.nextAt = now;
+
+  // espera até a vez
+  const waitMs = t.nextAt - now;
+  if (waitMs > 0) {
+    await sleep(waitMs);
+  }
+
+  // agenda próximo
+  t.nextAt = Math.max(t.nextAt + intervalMs, Date.now() + intervalMs);
+}
+
+// =====================
+// Media helpers
+// =====================
 async function inputFromUrlOrId(fileUrl) {
   const s = String(fileUrl || "").trim();
   if (!s) return null;
@@ -202,7 +255,6 @@ async function inputFromUrlOrId(fileUrl) {
 async function sendTelegram(bot, payload) {
   const campaignId = payload.campaignId;
 
-  // ✅ trava final: se cancelado, não envia
   if (campaignId && (await isCampaignCanceled(campaignId))) {
     return { ok: true, canceled: true };
   }
@@ -215,7 +267,6 @@ async function sendTelegram(bot, payload) {
 
   if (!chatId) throw new Error("chatId ausente");
 
-  // Texto puro
   if (!fileUrl) {
     if (!text) throw new Error("text ausente");
     return bot.sendMessage(chatId, text);
@@ -246,14 +297,29 @@ const worker = new Worker(
     // ✅ pausa (mas sai se cancelou)
     await waitIfPaused(campaignId);
 
-    // ✅ cancel real: não processa nem envia, mesmo se o worker já pegou o job
+    // ✅ cancel real: não processa nem envia
     if (await isCampaignCanceled(campaignId)) {
       stats.processed++;
       stats.canceled++;
       maybeLogProgress();
 
-      await incCampaign(campaignId, "canceled");
+      await incCampaign(campaignId, "canceledCount"); // contador (não flag)
+      try {
+        job.discard();
+      } catch {}
+      return { ok: true, canceled: true };
+    }
 
+    // ✅ throttle dinâmico por campanha (permite trocar rate e retomar)
+    await throttleByCampaign(campaignId);
+
+    // recheck cancel depois do throttle (evita enviar após cancel durante wait)
+    if (await isCampaignCanceled(campaignId)) {
+      stats.processed++;
+      stats.canceled++;
+      maybeLogProgress();
+
+      await incCampaign(campaignId, "canceledCount");
       try {
         job.discard();
       } catch {}
@@ -265,12 +331,11 @@ const worker = new Worker(
     try {
       const r = await sendTelegram(bot, data);
 
-      // se cancelou "no meio" (entre checks), sendTelegram retorna canceled:true
       if (r && r.canceled) {
         stats.processed++;
         stats.canceled++;
         maybeLogProgress();
-        await incCampaign(campaignId, "canceled");
+        await incCampaign(campaignId, "canceledCount");
         try {
           job.discard();
         } catch {}
@@ -284,10 +349,9 @@ const worker = new Worker(
       await incCampaign(campaignId, "sent");
       return { ok: true };
     } catch (err) {
-      // ✅ tratamento especial 429: respeita retry_after e NÃO “flooda” falhas
+      // ✅ 429: respeita retry_after
       if (is429(err)) {
         const ra = getRetryAfterSeconds(err) || 3;
-        // jitterzinho pra não sincronizar tudo
         const jitterMs = Math.floor(Math.random() * 350);
         await sleep(ra * 1000 + jitterMs);
 
@@ -297,14 +361,11 @@ const worker = new Worker(
         stats.last429Sec = ra;
         maybeLogProgress();
 
-        // opcional: contabiliza retries no Redis (não quebra nada se não existir)
         await incCampaign(campaignId, "retry429");
-
-        // rethrow pra BullMQ aplicar attempts/backoff
         throw err;
       }
 
-      // outros transitórios (rede/5xx): também não contam como "failed" definitivo
+      // transient: rede/5xx etc
       if (isRetryableTransient(err) && !isPermanentTelegramError(err)) {
         stats.processed++;
         stats.retryOther++;
@@ -314,7 +375,7 @@ const worker = new Worker(
         throw err;
       }
 
-      // falha “de verdade” (permanente ou não-classificada)
+      // falha definitiva
       stats.processed++;
       stats.failed++;
       maybeLogProgress();
@@ -341,14 +402,9 @@ const worker = new Worker(
 worker.on("ready", () => console.log(`✅ Worker ready | queue=${QUEUE_NAME}`));
 worker.on("error", (err) => console.error("❌ Worker error:", err?.message || err));
 
-// ✅ evita flood de log: não loga 429 por job (a gente já loga resumo a cada ~10s)
 worker.on("failed", (job, err) => {
   const sc = getTelegramStatusCode(err);
-
-  if (sc === 429) {
-    // ignora aqui (resumo sai no maybeLogProgress)
-    return;
-  }
+  if (sc === 429) return;
 
   const id = job?.id;
   const desc = getTelegramDescription(err);
