@@ -133,6 +133,37 @@
     ⚠️ A primeira coluna do CSV (coluna A) será usada automaticamente como ID.
   </div>
 
+  <!-- ===== Teste rápido (gera CSV com 1 ID) ===== -->
+  <div class="box" style="margin-top:10px;">
+    <div style="font-weight:700;">Teste rápido (1 ID)</div>
+    <div class="hint">Gera um CSV com apenas 1 ID pra você testar sem ficar criando arquivo na mão.</div>
+
+    <div class="row">
+      <div>
+        <label>ID de teste</label>
+        <input id="singleIdInput" placeholder="Ex: 1532301009" />
+      </div>
+      <div style="max-width:260px;">
+        <button id="btnGenSingleCsv" type="button">Gerar CSV do ID</button>
+      </div>
+    </div>
+
+    <div class="hint">
+      O arquivo também será baixado automaticamente (por segurança). Em navegadores modernos ele já seleciona no input do CSV.
+    </div>
+  </div>
+
+  <!-- ===== Estimativa ===== -->
+  <div class="box" id="estimateBox" style="margin-top:10px;">
+    <div style="font-weight:700;">Estimativa</div>
+    <div class="hint">Baseado no CSV + Rate (limit/intervalo). Pode variar por retries/429/erros.</div>
+    <div style="margin-top:8px;">
+      <span class="pill">Total: <b id="estimateTotal">0</b></span>
+      <span class="pill">Velocidade: <b id="estimateRps">1</b> msg/s</span>
+      <span class="pill">Tempo: <b id="estimateTime">00:00:00</b></span>
+    </div>
+  </div>
+
   <div class="row">
     <div>
       <label>Limite por intervalo (máx 25)</label>
@@ -272,6 +303,126 @@
 
     tipo.addEventListener("change", refreshUI);
     refreshUI();
+
+    // ===== Estimativa + Teste rápido =====
+    function formatHHMMSS(totalSeconds) {
+      totalSeconds = Math.max(0, Math.floor(totalSeconds || 0));
+      const h = String(Math.floor(totalSeconds / 3600)).padStart(2, "0");
+      const m = String(Math.floor((totalSeconds % 3600) / 60)).padStart(2, "0");
+      const s = String(totalSeconds % 60).padStart(2, "0");
+      return `${h}:${m}:${s}`;
+    }
+
+    function calcRps(limit, intervalMs) {
+      const l = Math.max(1, Number(limit) || 1);
+      const ms = Math.max(1000, Number(intervalMs) || 1000);
+      // rps = limit / (intervalMs/1000)
+      const rps = Math.max(1, Math.floor(l / (ms / 1000)));
+      return rps;
+    }
+
+    function countIdsFromCsvText(csvText) {
+      const lines = String(csvText || "")
+        .split(/\r?\n/)
+        .map(l => l.trim())
+        .filter(Boolean);
+
+      if (!lines.length) return 0;
+
+      const firstCell = (lines[0].split(",")[0] || "").trim();
+      const startIdx = /[a-zA-Z]/.test(firstCell) ? 1 : 0;
+
+      let count = 0;
+      for (let i = startIdx; i < lines.length; i++) {
+        const id = (lines[i].split(",")[0] || "").trim();
+        if (id) count++;
+      }
+      return count;
+    }
+
+    async function updateEstimateFromCsvFile(file) {
+      const totalEl = document.getElementById("estimateTotal");
+      const rpsEl = document.getElementById("estimateRps");
+      const timeEl = document.getElementById("estimateTime");
+
+      const rps = calcRps(limitMaxEl.value, document.getElementById("limitMs").value);
+      rpsEl.textContent = String(rps);
+
+      if (!file) {
+        totalEl.textContent = "0";
+        timeEl.textContent = "00:00:00";
+        return;
+      }
+
+      const text = await file.text();
+      const total = countIdsFromCsvText(text);
+
+      totalEl.textContent = String(total);
+      const seconds = total > 0 ? Math.ceil(total / rps) : 0;
+      timeEl.textContent = formatHHMMSS(seconds);
+    }
+
+    const csvInput = document.getElementById("csvFile");
+    const limitMsEl = document.getElementById("limitMs");
+
+    if (csvInput) {
+      csvInput.addEventListener("change", () => {
+        const f = csvInput.files && csvInput.files[0];
+        updateEstimateFromCsvFile(f);
+      });
+    }
+    if (limitMaxEl) {
+      limitMaxEl.addEventListener("change", () => {
+        const f = csvInput?.files?.[0];
+        updateEstimateFromCsvFile(f);
+      });
+    }
+    if (limitMsEl) {
+      limitMsEl.addEventListener("change", () => {
+        const f = csvInput?.files?.[0];
+        updateEstimateFromCsvFile(f);
+      });
+    }
+
+    // Teste rápido: gerar CSV do ID
+    const singleIdInput = document.getElementById("singleIdInput");
+    const btnGenSingleCsv = document.getElementById("btnGenSingleCsv");
+
+    if (btnGenSingleCsv && singleIdInput) {
+      btnGenSingleCsv.addEventListener("click", async () => {
+        const id = String(singleIdInput.value || "").trim();
+        if (!id) {
+          alert("Cola um ID primeiro.");
+          return;
+        }
+
+        const csvContent = `id\n${id}\n`;
+        const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8" });
+        const file = new File([blob], `teste_${id}.csv`, { type: "text/csv" });
+
+        // tenta setar no input do CSV (browsers modernos)
+        if (csvInput) {
+          try {
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            csvInput.files = dt.files;
+            await updateEstimateFromCsvFile(file);
+          } catch (e) {
+            // se não deixar setar, ao menos baixa o arquivo
+          }
+        }
+
+        // baixa o arquivo (pra garantir)
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `teste_${id}.csv`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      });
+    }
   </script>
 
   <script src="./app.js"></script>
