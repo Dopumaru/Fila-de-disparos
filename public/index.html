@@ -114,11 +114,12 @@
     <input id="arquivo" type="file" />
     <div class="hint">Use upload para arquivos menores.</div>
 
-    <label>OU URL do Arquivo</label>
-    <input id="fileUrl" placeholder="https://..." />
+    <label>OU URL do Arquivo / File ID</label>
+    <input id="fileUrl" placeholder="https://...  ou  file_id do Telegram (ex: BAACAgQAAxkBA...)" />
     <div class="hint">
-      ⚠️ Preencha <b>URL</b> OU selecione <b>Upload</b> (não os dois).<br>
-      Se usar URL, não ocupa espaço no servidor.
+      ⚠️ Preencha <b>URL/file_id</b> OU selecione <b>Upload</b> (não os dois).<br>
+      • Se usar <b>URL</b>, não ocupa espaço no servidor (o worker baixa do link).<br>
+      • Se usar <b>file_id</b>, é o mais rápido/leve (Telegram reutiliza o arquivo).
     </div>
   </div>
 
