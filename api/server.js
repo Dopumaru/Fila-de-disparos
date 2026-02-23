@@ -12,7 +12,7 @@ const { redis, connection } = require("../redis");
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "4mb" })); // json de config (não manda arquivo aqui)
+app.use(express.json({ limit: "8mb" })); // configs em JSON
 app.set("trust proxy", 1);
 
 // ===== FRONT (public) =====
@@ -50,90 +50,7 @@ if (!UPLOAD_DIR) {
 
 const upload = multer({
   dest: UPLOAD_DIR || DEFAULT_UPLOAD_DIR,
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB (ajuste se precisar)
-});
-
-// ===== Compat: rota /disparar (front antigo) =====
-app.post("/disparar", upload.single("csv"), async (req, res) => {
-  try {
-    // Campos que costumam vir do form do front
-    const botToken = req.body.botToken || req.body.token || process.env.TELEGRAM_BOT_TOKEN;
-    const message = req.body.message || req.body.text || "";
-    const tipo = (req.body.tipo || req.body.type || "text").toLowerCase(); // text/photo/video/document/audio/voice/video_note
-    const fileUrl = req.body.fileUrl || req.body.file_url || "";
-    const caption = req.body.caption || "";
-
-    // Rate do teu front: "limite por intervalo" e "intervalo"
-    const limit = Number(req.body.limit || req.body.rate || 1);         // ex: 1
-    const intervalSec = Number(req.body.intervalSec || req.body.interval || 1); // ex: 1 segundo
-    const ratePerSecond = Math.max(1, Math.min(30, Math.floor(limit / Math.max(1, intervalSec)) || 1));
-
-    if (!botToken) return res.status(400).json({ ok: false, error: "botToken ausente (env TELEGRAM_BOT_TOKEN ou body.botToken)" });
-    if (!req.file?.path) return res.status(400).json({ ok: false, error: "CSV não enviado (campo 'csv')" });
-
-    const csvText = fs.readFileSync(req.file.path, "utf8");
-    try { fs.unlinkSync(req.file.path); } catch {}
-
-    // Parse simples: primeira coluna é ID
-    const lines = csvText
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .filter(Boolean);
-
-    if (lines.length === 0) return res.status(400).json({ ok: false, error: "CSV vazio" });
-
-    // Se primeira linha tiver letras, trata como header
-    const first = lines[0].split(",")[0].trim();
-    const startIdx = /[a-zA-Z]/.test(first) ? 1 : 0;
-
-    const leads = [];
-    for (let i = startIdx; i < lines.length; i++) {
-      const id = lines[i].split(",")[0].trim();
-      if (id) leads.push({ id });
-    }
-
-    if (leads.length === 0) return res.status(400).json({ ok: false, error: "Nenhum ID válido no CSV" });
-
-    // Reaproveita lógica de /campaign (mesmo formato)
-    const id = genId();
-    await setCampaignMeta(id, {
-      paused: "0",
-      total: String(leads.length),
-      sent: "0",
-      failed: "0",
-      createdAt: new Date().toISOString(),
-      ratePerSecond: String(ratePerSecond),
-    });
-
-    const baseDelayMs = Math.floor(1000 / ratePerSecond);
-
-    const jobs = leads.map((row, idx) => ({
-      name: "send",
-      data: {
-        campaignId: id,
-        botToken,
-        chatId: row.id,
-        text: message,
-        fileUrl: fileUrl || undefined,
-        fileType: tipo === "text" ? undefined : tipo,
-        caption: caption || undefined,
-      },
-      opts: {
-        delay: idx * baseDelayMs,
-        attempts: 6,
-        backoff: { type: "exponential", delay: 2000 },
-        removeOnComplete: true,
-        removeOnFail: false,
-      },
-    }));
-
-    await queue.addBulk(jobs);
-
-    return res.json({ ok: true, campaignId: id, total: leads.length, ratePerSecond });
-  } catch (e) {
-    console.error("❌ /disparar erro:", e);
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
+  limits: { fileSize: 60 * 1024 * 1024 }, // 60MB
 });
 
 // ===== Queue =====
@@ -179,7 +96,7 @@ function genId() {
 async function setCampaignMeta(id, meta) {
   const key = campaignKey(id);
   await redis.hset(key, meta);
-  await redis.expire(key, 60 * 60 * 24 * 7); // 7 dias (ajuste)
+  await redis.expire(key, 60 * 60 * 24 * 7); // 7 dias
 }
 
 async function getCampaignMeta(id) {
@@ -188,9 +105,29 @@ async function getCampaignMeta(id) {
   return data || {};
 }
 
-// ===== Rotas Campaign =====
+// Parse simples (CSV): primeira coluna = id
+function parseCsvFirstColumnAsIds(csvText) {
+  const lines = String(csvText || "")
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
 
-// cria/enfileira (JSON) — mantém compatível com o front
+  if (lines.length === 0) return [];
+
+  const firstCell = lines[0].split(",")[0].trim();
+  const startIdx = /[a-zA-Z]/.test(firstCell) ? 1 : 0;
+
+  const out = [];
+  for (let i = startIdx; i < lines.length; i++) {
+    const id = lines[i].split(",")[0].trim();
+    if (id) out.push({ id });
+  }
+  return out;
+}
+
+// =====================================================================================
+// ✅ ROTA NOVA (JSON): /campaign
+// =====================================================================================
 app.post("/campaign", async (req, res) => {
   try {
     const {
@@ -200,7 +137,7 @@ app.post("/campaign", async (req, res) => {
       ratePerSecond = 10,
       message,
       fileUrl,
-      fileType, // "photo" | "video" | "document" | "audio" | "voice" | "video_note"
+      fileType,
       caption,
       campaignId,
     } = req.body || {};
@@ -208,39 +145,32 @@ app.post("/campaign", async (req, res) => {
     if (!Array.isArray(leads) || leads.length === 0) {
       return res.status(400).json({ ok: false, error: "Leads vazio." });
     }
-
     if (!botToken) {
       return res.status(400).json({ ok: false, error: "botToken ausente." });
     }
 
     const id = campaignId || genId();
-    const key = campaignKey(id);
 
-    // salva meta/status inicial
+    const rps = Math.max(1, Math.min(30, Number(ratePerSecond) || 10));
+    const baseDelayMs = Math.floor(1000 / rps);
+
     await setCampaignMeta(id, {
       paused: "0",
       total: String(leads.length),
       sent: "0",
       failed: "0",
       createdAt: new Date().toISOString(),
-      ratePerSecond: String(ratePerSecond || 10),
+      ratePerSecond: String(rps),
     });
-
-    // enqueue em bulk (muito mais leve que add 26k vezes)
-    // throttle via delay (ratePerSecond) – espalha jobs no tempo
-    const rps = Math.max(1, Math.min(30, Number(ratePerSecond) || 10));
-    const baseDelayMs = Math.floor(1000 / rps);
 
     const idCol = normalizeKey(chatIdColumn);
 
     const jobs = leads.map((row, idx) => {
-      const chatId = row?.[idCol] ?? row?.[chatIdColumn] ?? row?.id ?? row?.chat_id;
+      const chatId =
+        row?.[idCol] ?? row?.[chatIdColumn] ?? row?.id ?? row?.chat_id;
 
-      // template aplicado no texto/caption
       const textFinal = applyTemplate(message, row);
       const captionFinal = applyTemplate(caption, row);
-
-      const delay = idx * baseDelayMs;
 
       return {
         name: "send",
@@ -254,8 +184,7 @@ app.post("/campaign", async (req, res) => {
           caption: captionFinal,
         },
         opts: {
-          delay,
-          // NÃO coloca 999999. Isso vira inferno em erro permanente.
+          delay: idx * baseDelayMs,
           attempts: 6,
           backoff: { type: "exponential", delay: 2000 },
           removeOnComplete: true,
@@ -266,14 +195,149 @@ app.post("/campaign", async (req, res) => {
 
     await queue.addBulk(jobs);
 
-    return res.json({ ok: true, campaignId: id, total: leads.length, ratePerSecond: rps });
+    return res.json({
+      ok: true,
+      campaignId: id,
+      total: leads.length,
+      ratePerSecond: rps,
+    });
   } catch (e) {
     console.error("❌ /campaign erro:", e);
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
-// status
+// =====================================================================================
+// ✅ COMPAT COM TEU PAINEL: /disparar (multipart/form-data + CSV upload)
+// =====================================================================================
+app.post("/disparar", upload.single("csv"), async (req, res) => {
+  try {
+    // Token vindo do painel (tem que ser o token real do BotFather)
+    const botToken =
+      req.body.botToken ||
+      req.body.token ||
+      req.body.bot ||
+      req.body.bot_token ||
+      process.env.TELEGRAM_BOT_TOKEN;
+
+    // ✅ Aqui está o fix do "text ausente": aceita vários nomes que o front pode enviar
+    const message =
+      req.body.message ||
+      req.body.mensagem ||
+      req.body.msg ||
+      req.body.text ||
+      req.body.texto ||
+      req.body.messageText ||
+      req.body.message_text ||
+      req.body.legenda ||
+      req.body.caption || // caso painel use o mesmo campo
+      "";
+
+    // Tipo do envio
+    const tipo = String(req.body.tipo || req.body.type || "text").toLowerCase();
+
+    // Arquivo (se existir)
+    const fileUrl =
+      req.body.fileUrl || req.body.file_url || req.body.arquivoUrl || "";
+
+    const caption =
+      req.body.caption ||
+      req.body.legenda ||
+      req.body.captionText ||
+      req.body.caption_text ||
+      "";
+
+    // Rate do painel: "limit" por intervalo e intervalo em segundos
+    const limit = Number(req.body.limit || req.body.rate || 1);
+    const intervalSec = Number(req.body.intervalSec || req.body.interval || 1);
+
+    // Se for 1 a cada 1s => 1 rps
+    // Se for 2 a cada 1s => 2 rps
+    const ratePerSecond = Math.max(
+      1,
+      Math.min(30, Math.floor(limit / Math.max(1, intervalSec)) || 1)
+    );
+
+    if (!botToken) {
+      return res.status(400).json({
+        ok: false,
+        error: "botToken ausente (env TELEGRAM_BOT_TOKEN ou body botToken/token/bot).",
+      });
+    }
+
+    if (!req.file?.path) {
+      return res.status(400).json({ ok: false, error: "CSV não enviado (campo 'csv')." });
+    }
+
+    const csvText = fs.readFileSync(req.file.path, "utf8");
+    try {
+      fs.unlinkSync(req.file.path);
+    } catch {}
+
+    const leads = parseCsvFirstColumnAsIds(csvText);
+
+    if (leads.length === 0) {
+      return res.status(400).json({ ok: false, error: "Nenhum ID válido no CSV." });
+    }
+
+    // Se for envio de texto puro, precisa ter message
+    if (!fileUrl && !String(message || "").trim()) {
+      return res.status(400).json({
+        ok: false,
+        error: "Mensagem vazia. Preencha 'Mensagem / Legenda' para tipo Texto.",
+      });
+    }
+
+    const campaignId = genId();
+
+    await setCampaignMeta(campaignId, {
+      paused: "0",
+      total: String(leads.length),
+      sent: "0",
+      failed: "0",
+      createdAt: new Date().toISOString(),
+      ratePerSecond: String(ratePerSecond),
+    });
+
+    const baseDelayMs = Math.floor(1000 / ratePerSecond);
+
+    const jobs = leads.map((row, idx) => ({
+      name: "send",
+      data: {
+        campaignId,
+        botToken,
+        chatId: row.id,
+        text: message, // ✅ sempre cai aqui (fix do worker)
+        fileUrl: fileUrl || undefined,
+        fileType: tipo === "text" ? undefined : tipo,
+        caption: caption || undefined,
+      },
+      opts: {
+        delay: idx * baseDelayMs,
+        attempts: 6,
+        backoff: { type: "exponential", delay: 2000 },
+        removeOnComplete: true,
+        removeOnFail: false,
+      },
+    }));
+
+    await queue.addBulk(jobs);
+
+    return res.json({
+      ok: true,
+      campaignId,
+      total: leads.length,
+      ratePerSecond,
+    });
+  } catch (e) {
+    console.error("❌ /disparar erro:", e);
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// =====================================================================================
+// Campaign status/pause/resume
+// =====================================================================================
 app.get("/campaign/:id", async (req, res) => {
   try {
     const id = req.params.id;
@@ -287,7 +351,6 @@ app.get("/campaign/:id", async (req, res) => {
   }
 });
 
-// pause
 app.post("/campaign/:id/pause", async (req, res) => {
   try {
     const id = req.params.id;
@@ -298,7 +361,6 @@ app.post("/campaign/:id/pause", async (req, res) => {
   }
 });
 
-// resume
 app.post("/campaign/:id/resume", async (req, res) => {
   try {
     const id = req.params.id;
