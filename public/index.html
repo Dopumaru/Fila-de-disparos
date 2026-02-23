@@ -268,6 +268,7 @@
       <div class="stat">Progresso: <b id="campaignPct">0%</b></div>
       <div class="stat">Enviados: <b id="campaignSent">0</b></div>
       <div class="stat">Falhas: <b id="campaignFailed">0</b></div>
+      <div class="stat">Cancelados: <b id="campaignCanceled">0</b></div>
       <div class="stat">Total: <b id="campaignTotal">0</b></div>
     </div>
 
@@ -275,6 +276,15 @@
       <div>
         <button id="btnPauseResume" type="button">Pausar</button>
       </div>
+      <div>
+        <button id="btnCancelCampaign" type="button" style="background:#b00020;color:#fff;">
+          Cancelar campanha
+        </button>
+      </div>
+    </div>
+
+    <div class="hint" style="margin-top:8px;">
+      Cancelar é definitivo: remove o restante da fila e impede envios futuros (mesmo jobs já pegos pelo worker).
     </div>
   </div>
 
