@@ -53,6 +53,89 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 }, // 50MB (ajuste se precisar)
 });
 
+// ===== Compat: rota /disparar (front antigo) =====
+app.post("/disparar", upload.single("csv"), async (req, res) => {
+  try {
+    // Campos que costumam vir do form do front
+    const botToken = req.body.botToken || req.body.token || process.env.TELEGRAM_BOT_TOKEN;
+    const message = req.body.message || req.body.text || "";
+    const tipo = (req.body.tipo || req.body.type || "text").toLowerCase(); // text/photo/video/document/audio/voice/video_note
+    const fileUrl = req.body.fileUrl || req.body.file_url || "";
+    const caption = req.body.caption || "";
+
+    // Rate do teu front: "limite por intervalo" e "intervalo"
+    const limit = Number(req.body.limit || req.body.rate || 1);         // ex: 1
+    const intervalSec = Number(req.body.intervalSec || req.body.interval || 1); // ex: 1 segundo
+    const ratePerSecond = Math.max(1, Math.min(30, Math.floor(limit / Math.max(1, intervalSec)) || 1));
+
+    if (!botToken) return res.status(400).json({ ok: false, error: "botToken ausente (env TELEGRAM_BOT_TOKEN ou body.botToken)" });
+    if (!req.file?.path) return res.status(400).json({ ok: false, error: "CSV não enviado (campo 'csv')" });
+
+    const csvText = fs.readFileSync(req.file.path, "utf8");
+    try { fs.unlinkSync(req.file.path); } catch {}
+
+    // Parse simples: primeira coluna é ID
+    const lines = csvText
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+    if (lines.length === 0) return res.status(400).json({ ok: false, error: "CSV vazio" });
+
+    // Se primeira linha tiver letras, trata como header
+    const first = lines[0].split(",")[0].trim();
+    const startIdx = /[a-zA-Z]/.test(first) ? 1 : 0;
+
+    const leads = [];
+    for (let i = startIdx; i < lines.length; i++) {
+      const id = lines[i].split(",")[0].trim();
+      if (id) leads.push({ id });
+    }
+
+    if (leads.length === 0) return res.status(400).json({ ok: false, error: "Nenhum ID válido no CSV" });
+
+    // Reaproveita lógica de /campaign (mesmo formato)
+    const id = genId();
+    await setCampaignMeta(id, {
+      paused: "0",
+      total: String(leads.length),
+      sent: "0",
+      failed: "0",
+      createdAt: new Date().toISOString(),
+      ratePerSecond: String(ratePerSecond),
+    });
+
+    const baseDelayMs = Math.floor(1000 / ratePerSecond);
+
+    const jobs = leads.map((row, idx) => ({
+      name: "send",
+      data: {
+        campaignId: id,
+        botToken,
+        chatId: row.id,
+        text: message,
+        fileUrl: fileUrl || undefined,
+        fileType: tipo === "text" ? undefined : tipo,
+        caption: caption || undefined,
+      },
+      opts: {
+        delay: idx * baseDelayMs,
+        attempts: 6,
+        backoff: { type: "exponential", delay: 2000 },
+        removeOnComplete: true,
+        removeOnFail: false,
+      },
+    }));
+
+    await queue.addBulk(jobs);
+
+    return res.json({ ok: true, campaignId: id, total: leads.length, ratePerSecond });
+  } catch (e) {
+    console.error("❌ /disparar erro:", e);
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
 // ===== Queue =====
 const QUEUE_NAME = process.env.QUEUE_NAME || "disparos";
 
