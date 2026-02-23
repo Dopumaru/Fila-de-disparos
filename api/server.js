@@ -53,8 +53,6 @@ const uploadsDirToServe = UPLOAD_DIR || DEFAULT_UPLOAD_DIR;
 app.use("/uploads", express.static(uploadsDirToServe));
 
 // ===== Multer =====
-// IMPORTANT: seu painel manda `csv` e também `file` (mídia).
-// Então usamos upload.fields([csv, file]).
 const upload = multer({
   dest: uploadsDirToServe,
   limits: { fileSize: 60 * 1024 * 1024 }, // 60MB
@@ -148,6 +146,10 @@ function getPublicBaseUrl(req) {
   return `${proto}://${host}`.replace(/\/+$/, "");
 }
 
+function clampRps(n) {
+  return Math.max(1, Math.min(30, toInt(n, 10)));
+}
+
 // =====================================================================================
 // ✅ ROTA NOVA (JSON): /campaign
 // =====================================================================================
@@ -174,7 +176,7 @@ app.post("/campaign", async (req, res) => {
 
     const id = campaignId || genId();
 
-    const rps = Math.max(1, Math.min(30, toInt(ratePerSecond, 10)));
+    const rps = clampRps(ratePerSecond);
     const baseDelayMs = Math.floor(1000 / rps);
 
     await setCampaignMeta(id, {
@@ -183,8 +185,9 @@ app.post("/campaign", async (req, res) => {
       total: String(leads.length),
       sent: "0",
       failed: "0",
+      canceledCount: "0",
       createdAt: new Date().toISOString(),
-      ratePerSecond: String(rps),
+      ratePerSecond: String(rps), // ⚠️ usado pelo worker (throttle dinâmico)
     });
 
     const idCol = normalizeKey(chatIdColumn);
@@ -208,6 +211,7 @@ app.post("/campaign", async (req, res) => {
           caption: captionFinal,
         },
         opts: {
+          // Mantemos delay (bom pra fila gigante), mas amanhã o worker vai fazer throttle real.
           delay: idx * baseDelayMs,
           attempts: 6,
           backoff: { type: "exponential", delay: 2000 },
@@ -267,13 +271,10 @@ app.post(
       const tipo = String(req.body.tipo || req.body.type || "text").toLowerCase();
 
       // Rate do painel
-      const limit = toInt(req.body.limit || req.body.rate || 1, 1);
-      const intervalSec = toInt(req.body.intervalSec || req.body.interval || 1, 1);
+      const limit = toInt(req.body.limit || req.body.rate || req.body.limitMax || 1, 1);
+      const intervalSec = toInt(req.body.intervalSec || req.body.interval || req.body.intervalS || 1, 1);
 
-      const ratePerSecond = Math.max(
-        1,
-        Math.min(30, Math.floor(limit / Math.max(1, intervalSec)) || 1)
-      );
+      const ratePerSecond = clampRps(Math.floor(limit / Math.max(1, intervalSec)) || 1);
 
       if (!botToken) {
         return res.status(400).json({
@@ -326,8 +327,9 @@ app.post(
         total: String(leads.length),
         sent: "0",
         failed: "0",
+        canceledCount: "0",
         createdAt: new Date().toISOString(),
-        ratePerSecond: String(ratePerSecond),
+        ratePerSecond: String(ratePerSecond), // ⚠️ usado pelo worker (throttle dinâmico)
       });
 
       const baseDelayMs = Math.floor(1000 / ratePerSecond);
@@ -377,7 +379,7 @@ app.post(
 );
 
 // =====================================================================================
-// Campaign status/pause/resume/cancel
+// Campaign status/pause/resume/cancel + ✅ set rate
 // =====================================================================================
 app.get("/campaign/:id", async (req, res) => {
   try {
@@ -418,6 +420,42 @@ app.post("/campaign/:id/resume", async (req, res) => {
   }
 });
 
+// ✅ NEW: muda velocidade (ratePerSecond) em tempo real (o worker vai usar isso)
+app.post("/campaign/:id/rate", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const meta = await getCampaignMeta(id);
+    if (!meta || Object.keys(meta).length === 0) {
+      return res.status(404).json({ ok: false, error: "Campaign não encontrada." });
+    }
+
+    // se já cancelou, não deixa mexer
+    if (String(meta.canceled || "0") === "1") {
+      return res.status(400).json({ ok: false, error: "Campaign já está cancelada." });
+    }
+
+    const raw =
+      req.body?.ratePerSecond ??
+      req.body?.rate ??
+      req.body?.rps ??
+      req.query?.ratePerSecond ??
+      req.query?.rate ??
+      req.query?.rps;
+
+    const rps = clampRps(raw);
+
+    await redis.hset(campaignKey(id), {
+      ratePerSecond: String(rps),
+      rateUpdatedAt: new Date().toISOString(),
+    });
+
+    return res.json({ ok: true, campaignId: id, ratePerSecond: rps });
+  } catch (e) {
+    console.error("❌ /campaign/:id/rate erro:", e);
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
 // ✅ CANCEL REAL (B): mata tudo e impede envios futuros
 app.post("/campaign/:id/cancel", async (req, res) => {
   try {
@@ -435,7 +473,6 @@ app.post("/campaign/:id/cancel", async (req, res) => {
     let removed = 0;
 
     for (const st of states) {
-      // 100k cobre 30k tranquilo
       const jobs = await queue.getJobs([st], 0, 100000);
       for (const job of jobs) {
         if (job?.data?.campaignId === id) {
