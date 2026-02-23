@@ -210,15 +210,152 @@ app.post("/campaign", async (req, res) => {
 // =====================================================================================
 // ✅ COMPAT COM TEU PAINEL: /disparar (multipart/form-data + CSV upload)
 // =====================================================================================
-app.post("/disparar", upload.single("csv"), async (req, res) => {
-  try {
-    // Token vindo do painel (tem que ser o token real do BotFather)
-    const botToken =
-      req.body.botToken ||
-      req.body.token ||
-      req.body.bot ||
-      req.body.bot_token ||
-      process.env.TELEGRAM_BOT_TOKEN;
+app.post(
+  "/disparar",
+  upload.fields([
+    { name: "csv", maxCount: 1 },
+    { name: "upload", maxCount: 1 }, // arquivo de mídia do painel
+  ]),
+  async (req, res) => {
+    try {
+      const botToken =
+        req.body.botToken ||
+        req.body.token ||
+        req.body.bot ||
+        req.body.bot_token ||
+        process.env.TELEGRAM_BOT_TOKEN;
+
+      const message =
+        req.body.message ||
+        req.body.mensagem ||
+        req.body.msg ||
+        req.body.text ||
+        req.body.texto ||
+        req.body.messageText ||
+        req.body.message_text ||
+        req.body.legenda ||
+        req.body.caption ||
+        "";
+
+      const tipo = String(req.body.tipo || req.body.type || "text").toLowerCase();
+
+      const caption =
+        req.body.caption ||
+        req.body.legenda ||
+        req.body.captionText ||
+        req.body.caption_text ||
+        "";
+
+      const limit = Number(req.body.limit || req.body.rate || 1);
+      const intervalSec = Number(req.body.intervalSec || req.body.interval || 1);
+
+      const ratePerSecond = Math.max(
+        1,
+        Math.min(30, Math.floor(limit / Math.max(1, intervalSec)) || 1)
+      );
+
+      if (!botToken) {
+        return res.status(400).json({
+          ok: false,
+          error: "botToken ausente (env TELEGRAM_BOT_TOKEN ou body botToken/token/bot).",
+        });
+      }
+
+      // pega CSV
+      const csvFile = req.files?.csv?.[0];
+      if (!csvFile?.path) {
+        return res.status(400).json({ ok: false, error: "CSV não enviado (campo 'csv')." });
+      }
+
+      const csvText = fs.readFileSync(csvFile.path, "utf8");
+      try { fs.unlinkSync(csvFile.path); } catch {}
+
+      const leads = parseCsvFirstColumnAsIds(csvText);
+      if (leads.length === 0) {
+        return res.status(400).json({ ok: false, error: "Nenhum ID válido no CSV." });
+      }
+
+      // pega mídia (se tiver)
+      const mediaFile = req.files?.upload?.[0];
+
+      // Se painel mandou arquivo, geramos uma URL interna acessível pro worker
+      // (Importante: o worker precisa conseguir acessar a API por host interno)
+      let fileUrl =
+        req.body.fileUrl || req.body.file_url || req.body.arquivoUrl || "";
+
+      if (!fileUrl && mediaFile?.filename) {
+        const apiHost =
+          process.env.API_INTERNAL_HOST || process.env.API_HOST || "api-disparos";
+        const port = process.env.PORT ? Number(process.env.PORT) : 80;
+
+        // EasyPanel normalmente expõe a app na 80 internamente.
+        // URL interna para o worker baixar o arquivo:
+        fileUrl = `http://${apiHost}:${port}/uploads/${mediaFile.filename}`;
+      }
+
+      // validações
+      if (!fileUrl && tipo !== "text" && tipo !== "none") {
+        return res.status(400).json({
+          ok: false,
+          error: "Tipo de mídia selecionado, mas nenhum arquivo/URL foi enviado.",
+        });
+      }
+
+      if (!fileUrl && !String(message || "").trim()) {
+        return res.status(400).json({
+          ok: false,
+          error: "Mensagem vazia. Preencha 'Mensagem / Legenda' para tipo Texto.",
+        });
+      }
+
+      const campaignId = genId();
+
+      await setCampaignMeta(campaignId, {
+        paused: "0",
+        total: String(leads.length),
+        sent: "0",
+        failed: "0",
+        createdAt: new Date().toISOString(),
+        ratePerSecond: String(ratePerSecond),
+      });
+
+      const baseDelayMs = Math.floor(1000 / ratePerSecond);
+
+      const jobs = leads.map((row, idx) => ({
+        name: "send",
+        data: {
+          campaignId,
+          botToken,
+          chatId: row.id,
+          text: message,
+          fileUrl: fileUrl || undefined,
+          fileType: tipo === "text" ? undefined : tipo,
+          caption: caption || undefined,
+        },
+        opts: {
+          delay: idx * baseDelayMs,
+          attempts: 6,
+          backoff: { type: "exponential", delay: 2000 },
+          removeOnComplete: true,
+          removeOnFail: false,
+        },
+      }));
+
+      await queue.addBulk(jobs);
+
+      return res.json({
+        ok: true,
+        campaignId,
+        total: leads.length,
+        ratePerSecond,
+        usedFileUrl: !!fileUrl,
+      });
+    } catch (e) {
+      console.error("❌ /disparar erro:", e);
+      return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    }
+  }
+);
 
     // ✅ Aqui está o fix do "text ausente": aceita vários nomes que o front pode enviar
     const message =
