@@ -42,21 +42,55 @@ async function isCampaignCanceled(campaignId) {
   return String(v || "0") === "1";
 }
 
-async function incCampaign(campaignId, field) {
+async function incCampaign(campaignId, field, by = 1) {
   if (!campaignId) return;
-  await redis.hincrby(campaignKey(campaignId), field, 1);
+  await redis.hincrby(campaignKey(campaignId), field, by);
 }
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// =====================
+// Error helpers
+// =====================
+function getTelegramStatusCode(err) {
+  return err?.response?.statusCode;
+}
+
+function getTelegramDescription(err) {
+  const body = err?.response?.body;
+  return String(body?.description || err?.message || "");
+}
+
+// Extract retry_after (seconds) from Telegram 429.
+// node-telegram-bot-api normalmente traz:
+// err.response.body.parameters.retry_after
+function getRetryAfterSeconds(err) {
+  const body = err?.response?.body;
+  const p = body?.parameters;
+  const ra1 = Number(p?.retry_after);
+  if (Number.isFinite(ra1) && ra1 > 0) return ra1;
+
+  const desc = getTelegramDescription(err);
+  // Ex: "Too Many Requests: retry after 10"
+  const m = desc.match(/retry after\s+(\d+)/i);
+  if (m) {
+    const ra2 = Number(m[1]);
+    if (Number.isFinite(ra2) && ra2 > 0) return ra2;
+  }
+  return null;
+}
+
+function is429(err) {
+  return getTelegramStatusCode(err) === 429;
+}
+
 // Classifica erro "permanente"
 function isPermanentTelegramError(err) {
   const code = err?.code;
-  const statusCode = err?.response?.statusCode;
-  const body = err?.response?.body;
-  const desc = String(body?.description || err?.message || "").toLowerCase();
+  const statusCode = getTelegramStatusCode(err);
+  const desc = getTelegramDescription(err).toLowerCase();
 
   if (statusCode === 403) return true;
 
@@ -75,19 +109,43 @@ function isPermanentTelegramError(err) {
 
   if (statusCode === 401) return true;
 
+  // rede geralmente NÃO é permanente
   if (code === "ETIMEDOUT" || code === "ECONNRESET") return false;
 
   return false;
 }
 
-// Logs “throttled”
+function isRetryableTransient(err) {
+  const code = err?.code;
+  const sc = getTelegramStatusCode(err);
+
+  if (sc === 429) return true; // rate limit
+  if (sc >= 500 && sc <= 599) return true; // telegram/infra
+  if (code === "ETIMEDOUT" || code === "ECONNRESET") return true;
+
+  return false;
+}
+
+// =====================
+// Throttled logs
+// =====================
 const stats = {
   startedAt: Date.now(),
   processed: 0,
   sent: 0,
   failed: 0,
   canceled: 0,
+
+  // retries
+  retry429: 0,
+  retryOther: 0,
+
   lastLogAt: 0,
+
+  // para log resumido de 429
+  last429LogAt: 0,
+  last429Count: 0,
+  last429Sec: 0,
 };
 
 function maybeLogProgress() {
@@ -99,8 +157,18 @@ function maybeLogProgress() {
     stats.lastLogAt = now;
     const rps = (stats.processed / elapsed).toFixed(2);
     console.log(
-      `📊 progress: processed=${stats.processed} sent=${stats.sent} failed=${stats.failed} canceled=${stats.canceled} avg=${rps}/s`
+      `📊 progress: processed=${stats.processed} sent=${stats.sent} failed=${stats.failed} canceled=${stats.canceled} retry429=${stats.retry429} retryOther=${stats.retryOther} avg=${rps}/s`
     );
+  }
+
+  // log resumido de 429 (no máximo a cada 10s)
+  if (stats.last429Count > 0 && now - stats.last429LogAt > 10000) {
+    stats.last429LogAt = now;
+    console.warn(
+      `⏳ 429 em lote: +${stats.last429Count} (último retry_after=${stats.last429Sec || "?"}s) nos últimos ~10s`
+    );
+    stats.last429Count = 0;
+    stats.last429Sec = 0;
   }
 }
 
@@ -166,7 +234,9 @@ async function sendTelegram(bot, payload) {
   return bot.sendDocument(chatId, input, caption ? { caption } : undefined);
 }
 
+// =====================
 // Worker
+// =====================
 const worker = new Worker(
   QUEUE_NAME,
   async (job) => {
@@ -184,7 +254,9 @@ const worker = new Worker(
 
       await incCampaign(campaignId, "canceled");
 
-      try { job.discard(); } catch {}
+      try {
+        job.discard();
+      } catch {}
       return { ok: true, canceled: true };
     }
 
@@ -199,7 +271,9 @@ const worker = new Worker(
         stats.canceled++;
         maybeLogProgress();
         await incCampaign(campaignId, "canceled");
-        try { job.discard(); } catch {}
+        try {
+          job.discard();
+        } catch {}
         return { ok: true, canceled: true };
       }
 
@@ -210,6 +284,37 @@ const worker = new Worker(
       await incCampaign(campaignId, "sent");
       return { ok: true };
     } catch (err) {
+      // ✅ tratamento especial 429: respeita retry_after e NÃO “flooda” falhas
+      if (is429(err)) {
+        const ra = getRetryAfterSeconds(err) || 3;
+        // jitterzinho pra não sincronizar tudo
+        const jitterMs = Math.floor(Math.random() * 350);
+        await sleep(ra * 1000 + jitterMs);
+
+        stats.processed++;
+        stats.retry429++;
+        stats.last429Count++;
+        stats.last429Sec = ra;
+        maybeLogProgress();
+
+        // opcional: contabiliza retries no Redis (não quebra nada se não existir)
+        await incCampaign(campaignId, "retry429");
+
+        // rethrow pra BullMQ aplicar attempts/backoff
+        throw err;
+      }
+
+      // outros transitórios (rede/5xx): também não contam como "failed" definitivo
+      if (isRetryableTransient(err) && !isPermanentTelegramError(err)) {
+        stats.processed++;
+        stats.retryOther++;
+        maybeLogProgress();
+
+        await incCampaign(campaignId, "retryOther");
+        throw err;
+      }
+
+      // falha “de verdade” (permanente ou não-classificada)
       stats.processed++;
       stats.failed++;
       maybeLogProgress();
@@ -217,7 +322,9 @@ const worker = new Worker(
       await incCampaign(campaignId, "failed");
 
       if (isPermanentTelegramError(err)) {
-        try { job.discard(); } catch {}
+        try {
+          job.discard();
+        } catch {}
       }
 
       throw err;
@@ -233,9 +340,17 @@ const worker = new Worker(
 
 worker.on("ready", () => console.log(`✅ Worker ready | queue=${QUEUE_NAME}`));
 worker.on("error", (err) => console.error("❌ Worker error:", err?.message || err));
+
+// ✅ evita flood de log: não loga 429 por job (a gente já loga resumo a cada ~10s)
 worker.on("failed", (job, err) => {
+  const sc = getTelegramStatusCode(err);
+
+  if (sc === 429) {
+    // ignora aqui (resumo sai no maybeLogProgress)
+    return;
+  }
+
   const id = job?.id;
-  const sc = err?.response?.statusCode;
-  const desc = err?.response?.body?.description;
+  const desc = getTelegramDescription(err);
   console.warn(`💥 failed job=${id} status=${sc || "-"} desc=${desc || err?.message || err}`);
 });
