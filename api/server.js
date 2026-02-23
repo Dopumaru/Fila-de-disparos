@@ -251,30 +251,138 @@ app.post("/campaign", async (req, res) => {
 // =====================================================================================
 // ✅ COMPAT COM TEU PAINEL: /disparar (multipart/form-data + CSV + upload opcional)
 // =====================================================================================
-app.post(
-  "/disparar",
-  upload.fields([
-    { name: "csv", maxCount: 1 },
-    { name: "upload", maxCount: 1 }, // mídia (foto/video/audio/etc) do painel
-  ]),
-  async (req, res) => {
-    try {
-      const botToken = pickBotTokenFromBody(req.body);
-      const message = pickMessageFromBody(req.body);
-      const caption = pickCaptionFromBody(req.body);
+app.post("/disparar", upload.any(), async (req, res) => {
+  try {
+    const botToken = pickBotTokenFromBody(req.body);
+    const message = pickMessageFromBody(req.body);
+    const caption = pickCaptionFromBody(req.body);
 
-      const tipo = String(req.body.tipo || req.body.type || "text").toLowerCase();
+    const tipo = String(req.body.tipo || req.body.type || "text").toLowerCase();
 
-      const ratePerSecond = computeRpsFromPanel(req.body);
-      const baseDelayMs = Math.floor(1000 / ratePerSecond);
+    const ratePerSecond = computeRpsFromPanel(req.body);
+    const baseDelayMs = Math.floor(1000 / ratePerSecond);
 
-      if (!botToken) {
-        return res.status(400).json({
-          ok: false,
-          error: "botToken ausente (env TELEGRAM_BOT_TOKEN ou body botToken/token/bot).",
-        });
-      }
+    if (!botToken) {
+      return res.status(400).json({
+        ok: false,
+        error: "botToken ausente (env TELEGRAM_BOT_TOKEN ou body botToken/token/bot).",
+      });
+    }
 
+    // ✅ Multer any(): arquivos ficam em req.files (array)
+    const files = Array.isArray(req.files) ? req.files : [];
+
+    // acha o CSV (normalmente fieldname "csv")
+    let csvFile = files.find((f) => f.fieldname === "csv");
+
+    // fallback: se não achar por nome, tenta pelo mimetype / ext
+    if (!csvFile) {
+      csvFile = files.find(
+        (f) =>
+          (f.mimetype && f.mimetype.includes("csv")) ||
+          String(f.originalname || "").toLowerCase().endsWith(".csv")
+      );
+    }
+
+    if (!csvFile?.path) {
+      return res.status(400).json({
+        ok: false,
+        error: "CSV não enviado (campo 'csv' ou arquivo .csv).",
+      });
+    }
+
+    const csvText = fs.readFileSync(csvFile.path, "utf8");
+    try { fs.unlinkSync(csvFile.path); } catch {}
+
+    const leads = parseCsvFirstColumnAsIds(csvText);
+    if (leads.length === 0) {
+      return res.status(400).json({ ok: false, error: "Nenhum ID válido no CSV." });
+    }
+
+    // URL direta (se painel mandar)
+    let fileUrl =
+      req.body.fileUrl || req.body.file_url || req.body.arquivoUrl || "";
+
+    // acha a mídia: primeiro arquivo que NÃO seja o CSV
+    let mediaFile = files.find((f) => f !== csvFile);
+
+    // fallback: se tiver mais de um arquivo, pega o primeiro não-csv
+    if (!mediaFile) {
+      mediaFile = files.find((f) => f.fieldname !== (csvFile?.fieldname || "csv"));
+    }
+
+    if (!fileUrl && mediaFile?.filename) {
+      const apiHost =
+        process.env.API_INTERNAL_HOST ||
+        process.env.API_HOST ||
+        "api-disparos";
+
+      const port = Number(process.env.PORT) || 80;
+      fileUrl = `http://${apiHost}:${port}/uploads/${mediaFile.filename}`;
+    }
+
+    // validações
+    if (!fileUrl && tipo !== "text" && tipo !== "none") {
+      return res.status(400).json({
+        ok: false,
+        error: "Tipo de mídia selecionado, mas nenhum arquivo/URL foi enviado.",
+      });
+    }
+
+    if (!fileUrl && !String(message || "").trim()) {
+      return res.status(400).json({
+        ok: false,
+        error: "Mensagem vazia. Preencha 'Mensagem / Legenda' para tipo Texto.",
+      });
+    }
+
+    const campaignId = genId();
+
+    await setCampaignMeta(campaignId, {
+      paused: "0",
+      total: String(leads.length),
+      sent: "0",
+      failed: "0",
+      createdAt: new Date().toISOString(),
+      ratePerSecond: String(ratePerSecond),
+    });
+
+    const jobs = leads.map((row, idx) => ({
+      name: "send",
+      data: {
+        campaignId,
+        botToken,
+        chatId: row.id,
+        text: message,
+        fileUrl: fileUrl || undefined,
+        fileType: tipo === "text" ? undefined : tipo,
+        caption: caption || undefined,
+      },
+      opts: {
+        delay: idx * baseDelayMs,
+        attempts: 6,
+        backoff: { type: "exponential", delay: 2000 },
+        removeOnComplete: true,
+        removeOnFail: false,
+      },
+    }));
+
+    await queue.addBulk(jobs);
+
+    return res.json({
+      ok: true,
+      campaignId,
+      total: leads.length,
+      ratePerSecond,
+      usedFileUrl: Boolean(fileUrl),
+      // debug útil pra ver quais campos o painel está enviando
+      receivedFileFields: files.map((f) => f.fieldname),
+    });
+  } catch (e) {
+    console.error("❌ /disparar erro:", e);
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
       // CSV
       const csvFile = req.files?.csv?.[0];
       if (!csvFile?.path) {
