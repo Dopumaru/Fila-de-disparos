@@ -12,7 +12,7 @@ const { redis, connection } = require("../redis");
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "8mb" })); // configs em JSON
+app.use(express.json({ limit: "8mb" }));
 app.set("trust proxy", 1);
 
 // ===== FRONT (public) =====
@@ -53,7 +53,7 @@ const upload = multer({
   limits: { fileSize: 60 * 1024 * 1024 }, // 60MB
 });
 
-// ✅ expõe arquivos enviados (pra worker conseguir baixar)
+// ✅ Expor uploads para o worker conseguir baixar via HTTP interno
 app.use("/uploads", express.static(UPLOAD_DIR || DEFAULT_UPLOAD_DIR));
 
 // ===== Queue =====
@@ -95,7 +95,7 @@ function genId() {
 async function setCampaignMeta(id, meta) {
   const key = campaignKey(id);
   await redis.hset(key, meta);
-  await redis.expire(key, 60 * 60 * 24 * 7); // 7 dias
+  await redis.expire(key, 60 * 60 * 24 * 7);
 }
 
 async function getCampaignMeta(id) {
@@ -124,6 +124,17 @@ function parseCsvFirstColumnAsIds(csvText) {
   return out;
 }
 
+function pickBotTokenFromBody(body) {
+  return (
+    body.botToken ||
+    body.token ||
+    body.bot ||
+    body.bot_token ||
+    process.env.TELEGRAM_BOT_TOKEN ||
+    ""
+  );
+}
+
 function pickMessageFromBody(body) {
   return (
     body.message ||
@@ -149,17 +160,6 @@ function pickCaptionFromBody(body) {
   );
 }
 
-function pickBotTokenFromBody(body) {
-  return (
-    body.botToken ||
-    body.token ||
-    body.bot ||
-    body.bot_token ||
-    process.env.TELEGRAM_BOT_TOKEN ||
-    ""
-  );
-}
-
 function computeRpsFromPanel(body) {
   const limit = Number(body.limit || body.rate || 1);
   const intervalSec = Number(body.intervalSec || body.interval || 1);
@@ -167,7 +167,7 @@ function computeRpsFromPanel(body) {
 }
 
 // =====================================================================================
-// ✅ ROTA NOVA (JSON): /campaign
+// ✅ ROTA JSON: /campaign
 // =====================================================================================
 app.post("/campaign", async (req, res) => {
   try {
@@ -191,7 +191,6 @@ app.post("/campaign", async (req, res) => {
     }
 
     const id = campaignId || genId();
-
     const rps = Math.max(1, Math.min(30, Number(ratePerSecond) || 10));
     const baseDelayMs = Math.floor(1000 / rps);
 
@@ -249,7 +248,7 @@ app.post("/campaign", async (req, res) => {
 });
 
 // =====================================================================================
-// ✅ COMPAT COM TEU PAINEL: /disparar (multipart/form-data + CSV + upload opcional)
+// ✅ COMPAT COM TEU PAINEL: /disparar (multipart/form-data + CSV + mídia opcional)
 // =====================================================================================
 app.post("/disparar", upload.any(), async (req, res) => {
   try {
@@ -269,13 +268,12 @@ app.post("/disparar", upload.any(), async (req, res) => {
       });
     }
 
-    // ✅ Multer any(): arquivos ficam em req.files (array)
     const files = Array.isArray(req.files) ? req.files : [];
 
-    // acha o CSV (normalmente fieldname "csv")
+    // CSV (normalmente fieldname "csv")
     let csvFile = files.find((f) => f.fieldname === "csv");
 
-    // fallback: se não achar por nome, tenta pelo mimetype / ext
+    // fallback: detecta por extensão/mimetype
     if (!csvFile) {
       csvFile = files.find(
         (f) =>
@@ -303,20 +301,18 @@ app.post("/disparar", upload.any(), async (req, res) => {
     let fileUrl =
       req.body.fileUrl || req.body.file_url || req.body.arquivoUrl || "";
 
-    // acha a mídia: primeiro arquivo que NÃO seja o CSV
-    let mediaFile = files.find((f) => f !== csvFile);
+    // mídia = primeiro arquivo que não seja o CSV
+    const mediaFile = files.find((f) => f !== csvFile);
 
-    // fallback: se tiver mais de um arquivo, pega o primeiro não-csv
-    if (!mediaFile) {
-      mediaFile = files.find((f) => f.fieldname !== (csvFile?.fieldname || "csv"));
-    }
-
+    // se veio arquivo e não veio URL, gera URL interna pro worker baixar
     if (!fileUrl && mediaFile?.filename) {
       const apiHost =
         process.env.API_INTERNAL_HOST ||
         process.env.API_HOST ||
         "api-disparos";
 
+      // em muitos setups o serviço fica acessível internamente na 80
+      // se seu EasyPanel respeita PORT internamente, ele já vai bater
       const port = Number(process.env.PORT) || 80;
       fileUrl = `http://${apiHost}:${port}/uploads/${mediaFile.filename}`;
     }
@@ -375,7 +371,6 @@ app.post("/disparar", upload.any(), async (req, res) => {
       total: leads.length,
       ratePerSecond,
       usedFileUrl: Boolean(fileUrl),
-      // debug útil pra ver quais campos o painel está enviando
       receivedFileFields: files.map((f) => f.fieldname),
     });
   } catch (e) {
@@ -383,99 +378,6 @@ app.post("/disparar", upload.any(), async (req, res) => {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
-      // CSV
-      const csvFile = req.files?.csv?.[0];
-      if (!csvFile?.path) {
-        return res.status(400).json({ ok: false, error: "CSV não enviado (campo 'csv')." });
-      }
-
-      const csvText = fs.readFileSync(csvFile.path, "utf8");
-      try { fs.unlinkSync(csvFile.path); } catch {}
-
-      const leads = parseCsvFirstColumnAsIds(csvText);
-      if (leads.length === 0) {
-        return res.status(400).json({ ok: false, error: "Nenhum ID válido no CSV." });
-      }
-
-      // URL de arquivo (se painel mandar URL direta)
-      let fileUrl =
-        req.body.fileUrl || req.body.file_url || req.body.arquivoUrl || "";
-
-      // Upload de mídia (campo "upload")
-      const mediaFile = req.files?.upload?.[0];
-
-      // Se não veio URL e veio arquivo, gera URL interna da API pro worker acessar
-      if (!fileUrl && mediaFile?.filename) {
-        const apiHost =
-          process.env.API_INTERNAL_HOST ||
-          process.env.API_HOST ||
-          "api-disparos";
-
-        const port = Number(process.env.PORT) || 80;
-        fileUrl = `http://${apiHost}:${port}/uploads/${mediaFile.filename}`;
-      }
-
-      // validações
-      if (!fileUrl && tipo !== "text" && tipo !== "none") {
-        return res.status(400).json({
-          ok: false,
-          error: "Tipo de mídia selecionado, mas nenhum arquivo/URL foi enviado.",
-        });
-      }
-
-      if (!fileUrl && !String(message || "").trim()) {
-        return res.status(400).json({
-          ok: false,
-          error: "Mensagem vazia. Preencha 'Mensagem / Legenda' para tipo Texto.",
-        });
-      }
-
-      const campaignId = genId();
-
-      await setCampaignMeta(campaignId, {
-        paused: "0",
-        total: String(leads.length),
-        sent: "0",
-        failed: "0",
-        createdAt: new Date().toISOString(),
-        ratePerSecond: String(ratePerSecond),
-      });
-
-      const jobs = leads.map((row, idx) => ({
-        name: "send",
-        data: {
-          campaignId,
-          botToken,
-          chatId: row.id,
-          text: message,
-          fileUrl: fileUrl || undefined,
-          fileType: tipo === "text" ? undefined : tipo,
-          caption: caption || undefined,
-        },
-        opts: {
-          delay: idx * baseDelayMs,
-          attempts: 6,
-          backoff: { type: "exponential", delay: 2000 },
-          removeOnComplete: true,
-          removeOnFail: false,
-        },
-      }));
-
-      await queue.addBulk(jobs);
-
-      return res.json({
-        ok: true,
-        campaignId,
-        total: leads.length,
-        ratePerSecond,
-        usedFileUrl: Boolean(fileUrl),
-      });
-    } catch (e) {
-      console.error("❌ /disparar erro:", e);
-      return res.status(500).json({ ok: false, error: e?.message || String(e) });
-    }
-  }
-);
 
 // =====================================================================================
 // Campaign status/pause/resume
