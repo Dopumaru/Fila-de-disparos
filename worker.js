@@ -44,18 +44,15 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// Classifica erro "permanente" (não adianta retry infinito)
-// Telegram: bot foi bloqueado, chat inválido, etc.
+// Classifica erro "permanente"
 function isPermanentTelegramError(err) {
   const code = err?.code;
   const statusCode = err?.response?.statusCode;
   const body = err?.response?.body;
   const desc = String(body?.description || err?.message || "").toLowerCase();
 
-  // 403: Forbidden (blocked by the user / bot kicked)
   if (statusCode === 403) return true;
 
-  // 400: Bad Request (chat not found, wrong file id, etc.) — muitas vezes permanente
   if (statusCode === 400) {
     if (
       desc.includes("chat not found") ||
@@ -63,20 +60,20 @@ function isPermanentTelegramError(err) {
       desc.includes("bot was blocked") ||
       desc.includes("bot is not a member") ||
       desc.includes("wrong file identifier") ||
-      desc.includes("file is too big")
+      desc.includes("wrong remote file identifier") ||
+      desc.includes("file is too big") ||
+      desc.includes("bad request")
     ) return true;
   }
 
-  // 401: Unauthorized (token inválido) — permanente
   if (statusCode === 401) return true;
 
-  // ioredis / network geralmente NÃO é permanente
   if (code === "ETIMEDOUT" || code === "ECONNRESET") return false;
 
   return false;
 }
 
-// Logs “throttled” (não explode em 26k)
+// Logs “throttled”
 const stats = {
   startedAt: Date.now(),
   processed: 0,
@@ -88,7 +85,7 @@ const stats = {
 function maybeLogProgress() {
   const now = Date.now();
   const elapsed = Math.max(1, Math.floor((now - stats.startedAt) / 1000));
-  const everyN = 250; // log a cada 250 jobs
+  const everyN = 250;
 
   if (stats.processed % everyN === 0 || now - stats.lastLogAt > 15000) {
     stats.lastLogAt = now;
@@ -101,37 +98,61 @@ function maybeLogProgress() {
 
 async function waitIfPaused(campaignId) {
   if (!campaignId) return;
-
-  // Se pausar, fica esperando SEM log por job.
-  // Para não travar o lock, usamos lockDuration alto no worker config.
   while (await isCampaignPaused(campaignId)) {
     await sleep(1500);
   }
 }
 
+// ✅ Se for URL (http/https): baixa e manda como Buffer.
+// ✅ Se não for URL: assume que é file_id do Telegram e manda direto.
+async function inputFromUrlOrId(fileUrl) {
+  const s = String(fileUrl || "").trim();
+  if (!s) return null;
+
+  if (!/^https?:\/\//i.test(s)) {
+    // file_id do Telegram (ou path local, mas aqui a gente usa URL/file_id)
+    return s;
+  }
+
+  // download do arquivo (URL interna da API) e manda como Buffer
+  const r = await fetch(s);
+  if (!r.ok) {
+    throw new Error(`Falha ao baixar arquivo (${r.status}) ${s}`);
+  }
+  const buf = Buffer.from(await r.arrayBuffer());
+  return buf;
+}
+
 async function sendTelegram(bot, payload) {
-  const { chatId, text, fileType, fileUrl, caption } = payload;
+  const chatId = payload.chatId;
+  const text = payload.text;
+  const caption = payload.caption;
+  const fileType = String(payload.fileType || "").toLowerCase();
+  const fileUrl = String(payload.fileUrl || "").trim();
 
   if (!chatId) throw new Error("chatId ausente");
 
-  // Se não tem arquivo, manda mensagem
+  // Texto puro
   if (!fileUrl) {
     if (!text) throw new Error("text ausente");
     return bot.sendMessage(chatId, text);
   }
 
-  // Se tiver fileUrl, roteia pelo tipo
-  const type = String(fileType || "").toLowerCase();
+  const input = await inputFromUrlOrId(fileUrl);
 
-  if (type === "photo") return bot.sendPhoto(chatId, fileUrl, caption ? { caption } : undefined);
-  if (type === "video") return bot.sendVideo(chatId, fileUrl, caption ? { caption } : undefined);
-  if (type === "document") return bot.sendDocument(chatId, fileUrl, caption ? { caption } : undefined);
-  if (type === "audio") return bot.sendAudio(chatId, fileUrl, caption ? { caption } : undefined);
-  if (type === "voice") return bot.sendVoice(chatId, fileUrl, caption ? { caption } : undefined);
-  if (type === "video_note") return bot.sendVideoNote(chatId, fileUrl);
+  // Se por algum motivo input vier null
+  if (!input) throw new Error("fileUrl inválida/vazia");
 
-  // fallback (document)
-  return bot.sendDocument(chatId, fileUrl, caption ? { caption } : undefined);
+  // Rotear por tipo
+  if (fileType === "photo") return bot.sendPhoto(chatId, input, caption ? { caption } : undefined);
+  if (fileType === "video") return bot.sendVideo(chatId, input, caption ? { caption } : undefined);
+  if (fileType === "document") return bot.sendDocument(chatId, input, caption ? { caption } : undefined);
+  if (fileType === "audio") return bot.sendAudio(chatId, input, caption ? { caption } : undefined);
+  if (fileType === "voice") return bot.sendVoice(chatId, input, caption ? { caption } : undefined);
+  if (fileType === "video_note") return bot.sendVideoNote(chatId, input);
+
+  // fallback: manda como documento
+  return bot.sendDocument(chatId, input, caption ? { caption } : undefined);
 }
 
 // Worker
@@ -141,7 +162,6 @@ const worker = new Worker(
     const data = job.data || {};
     const campaignId = data.campaignId;
 
-    // ✅ PAUSE REAL (sem flood)
     await waitIfPaused(campaignId);
 
     const bot = getBot(data.botToken);
@@ -162,9 +182,7 @@ const worker = new Worker(
 
       await incCampaign(campaignId, "failed");
 
-      // Se é erro permanente, não faz retry (evita inferno em 26k)
       if (isPermanentTelegramError(err)) {
-        // discard evita novas tentativas dentro do attempts
         try { job.discard(); } catch {}
       }
 
@@ -174,11 +192,7 @@ const worker = new Worker(
   {
     connection,
     concurrency: Number(process.env.WORKER_CONCURRENCY) || 10,
-
-    // Crucial pra pausa por espera: evita lock expirar enquanto aguarda
-    lockDuration: Number(process.env.WORKER_LOCK_MS) || 10 * 60 * 1000, // 10 min
-
-    // Evita “metralhar” reconexão
+    lockDuration: Number(process.env.WORKER_LOCK_MS) || 10 * 60 * 1000,
     autorun: true,
   }
 );
@@ -186,7 +200,6 @@ const worker = new Worker(
 worker.on("ready", () => console.log(`✅ Worker ready | queue=${QUEUE_NAME}`));
 worker.on("error", (err) => console.error("❌ Worker error:", err?.message || err));
 worker.on("failed", (job, err) => {
-  // ⚠️ aqui loga só falhas (não cada sucesso)
   const id = job?.id;
   const sc = err?.response?.statusCode;
   const desc = err?.response?.body?.description;
