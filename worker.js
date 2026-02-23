@@ -14,7 +14,7 @@ if (!DEFAULT_TOKEN) {
 process.on("unhandledRejection", (err) => console.error("❌ unhandledRejection:", err));
 process.on("uncaughtException", (err) => console.error("❌ uncaughtException:", err));
 
-// cache de bots por token (evita criar 26k instâncias)
+// cache de bots por token
 const botCache = new Map();
 function getBot(token) {
   const t = token || DEFAULT_TOKEN;
@@ -25,13 +25,25 @@ function getBot(token) {
   return bot;
 }
 
+// cache de username por token (pra montar START links)
+const botUsernameCache = new Map();
+async function getBotUsername(bot, tokenKey) {
+  if (botUsernameCache.has(tokenKey)) return botUsernameCache.get(tokenKey);
+  try {
+    const me = await bot.getMe();
+    const u = me?.username ? String(me.username) : "";
+    botUsernameCache.set(tokenKey, u);
+    return u;
+  } catch {
+    botUsernameCache.set(tokenKey, "");
+    return "";
+  }
+}
+
 function campaignKey(id) {
   return `campaign:${id}`;
 }
 
-// =====================
-// Campaign meta helpers
-// =====================
 async function isCampaignPaused(campaignId) {
   if (!campaignId) return false;
   const v = await redis.hget(campaignKey(campaignId), "paused");
@@ -42,15 +54,6 @@ async function isCampaignCanceled(campaignId) {
   if (!campaignId) return false;
   const v = await redis.hget(campaignKey(campaignId), "canceled");
   return String(v || "0") === "1";
-}
-
-// ✅ NEW: pega ratePerSecond atual da campanha (pra mudar em runtime)
-async function getCampaignRps(campaignId) {
-  if (!campaignId) return null;
-  const v = await redis.hget(campaignKey(campaignId), "ratePerSecond");
-  const n = Number(v);
-  if (Number.isFinite(n) && n > 0) return n;
-  return null;
 }
 
 async function incCampaign(campaignId, field, by = 1) {
@@ -110,14 +113,12 @@ function isPermanentTelegramError(err) {
       desc.includes("wrong remote file identifier") ||
       desc.includes("file is too big") ||
       desc.includes("bad request")
-    )
-      return true;
+    ) return true;
   }
 
   if (statusCode === 401) return true;
 
   if (code === "ETIMEDOUT" || code === "ECONNRESET") return false;
-
   return false;
 }
 
@@ -141,10 +142,8 @@ const stats = {
   sent: 0,
   failed: 0,
   canceled: 0,
-
   retry429: 0,
   retryOther: 0,
-
   lastLogAt: 0,
   last429LogAt: 0,
   last429Count: 0,
@@ -174,9 +173,6 @@ function maybeLogProgress() {
   }
 }
 
-// =====================
-// Pause / Cancel
-// =====================
 async function waitIfPaused(campaignId) {
   if (!campaignId) return;
   while (await isCampaignPaused(campaignId)) {
@@ -185,76 +181,58 @@ async function waitIfPaused(campaignId) {
   }
 }
 
-// =====================
-// ✅ NEW: Throttle por campanha (ratePerSecond dinâmico)
-// =====================
-// Estratégia:
-// - Cada campanha tem uma "janela" (bucket) local no worker.
-// - Antes de enviar, calculamos o intervalo mínimo entre envios: 1000/rps.
-// - Se estamos adiantados, dorme o delta.
-// - Como cada worker tem seu próprio bucket, isso limita por worker.
-//   (Se você rodar múltiplos workers em paralelo, o total vai somar.)
-const throttle = new Map(); // campaignId -> { nextAt, rpsCached, lastFetchAt }
-const THROTTLE_RPS_TTL_MS = 1500; // refaz fetch do rps a cada ~1.5s
-
-async function throttleByCampaign(campaignId) {
-  if (!campaignId) return;
-
-  // se pausado/cancelado, nem perde tempo aqui
-  if (await isCampaignCanceled(campaignId)) return;
-  if (await isCampaignPaused(campaignId)) return;
-
-  const now = Date.now();
-  let t = throttle.get(campaignId);
-  if (!t) {
-    t = { nextAt: 0, rpsCached: null, lastFetchAt: 0 };
-    throttle.set(campaignId, t);
-  }
-
-  // atualiza rps (dinâmico) com TTL curto
-  if (!t.rpsCached || now - t.lastFetchAt > THROTTLE_RPS_TTL_MS) {
-    const rps = await getCampaignRps(campaignId);
-    t.rpsCached = Number.isFinite(rps) && rps > 0 ? Math.max(1, Math.min(30, rps)) : 1;
-    t.lastFetchAt = now;
-  }
-
-  const intervalMs = Math.floor(1000 / t.rpsCached);
-
-  // se não setou nextAt ainda, começa agora
-  if (!t.nextAt) t.nextAt = now;
-
-  // espera até a vez
-  const waitMs = t.nextAt - now;
-  if (waitMs > 0) {
-    await sleep(waitMs);
-  }
-
-  // agenda próximo
-  t.nextAt = Math.max(t.nextAt + intervalMs, Date.now() + intervalMs);
+// ===== buttons -> reply_markup =====
+function normalizeButtons(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((b) => ({
+      text: String(b?.text || "").trim(),
+      type: String(b?.type || "").trim().toLowerCase(),
+      value: String(b?.value || "").trim(),
+    }))
+    .filter((b) => b.text && b.value && (b.type === "url" || b.type === "start"))
+    .slice(0, 4);
 }
 
-// =====================
-// Media helpers
-// =====================
+async function buildReplyMarkup(bot, tokenKey, buttons) {
+  const btns = normalizeButtons(buttons);
+  if (!btns.length) return null;
+
+  const username = await getBotUsername(bot, tokenKey);
+
+  const row = [];
+  for (const b of btns) {
+    if (b.type === "url") {
+      row.push({ text: b.text, url: b.value });
+      continue;
+    }
+    if (b.type === "start") {
+      if (!username) continue; // sem username não dá pra montar deep-link
+      const u = `https://t.me/${username}?start=${encodeURIComponent(b.value)}`;
+      row.push({ text: b.text, url: u });
+      continue;
+    }
+  }
+
+  if (!row.length) return null;
+
+  return { inline_keyboard: [row] }; // 1 linha com até 4 botões
+}
+
+// ===== mídia =====
 async function inputFromUrlOrId(fileUrl) {
   const s = String(fileUrl || "").trim();
   if (!s) return null;
 
-  if (!/^https?:\/\//i.test(s)) {
-    return s; // file_id
-  }
+  if (!/^https?:\/\//i.test(s)) return s; // file_id
 
   const r = await fetch(s);
-  if (!r.ok) {
-    throw new Error(`Falha ao baixar arquivo (${r.status}) ${s}`);
-  }
-  const buf = Buffer.from(await r.arrayBuffer());
-  return buf;
+  if (!r.ok) throw new Error(`Falha ao baixar arquivo (${r.status}) ${s}`);
+  return Buffer.from(await r.arrayBuffer());
 }
 
-async function sendTelegram(bot, payload) {
+async function sendTelegram(bot, tokenKey, payload) {
   const campaignId = payload.campaignId;
-
   if (campaignId && (await isCampaignCanceled(campaignId))) {
     return { ok: true, canceled: true };
   }
@@ -267,22 +245,30 @@ async function sendTelegram(bot, payload) {
 
   if (!chatId) throw new Error("chatId ausente");
 
+  const reply_markup = await buildReplyMarkup(bot, tokenKey, payload.buttons);
+
+  // Texto puro
   if (!fileUrl) {
     if (!text) throw new Error("text ausente");
-    return bot.sendMessage(chatId, text);
+    const opts = reply_markup ? { reply_markup, disable_web_page_preview: true } : { disable_web_page_preview: true };
+    return bot.sendMessage(chatId, text, opts);
   }
 
   const input = await inputFromUrlOrId(fileUrl);
   if (!input) throw new Error("fileUrl inválida/vazia");
 
-  if (fileType === "photo") return bot.sendPhoto(chatId, input, caption ? { caption } : undefined);
-  if (fileType === "video") return bot.sendVideo(chatId, input, caption ? { caption } : undefined);
-  if (fileType === "document") return bot.sendDocument(chatId, input, caption ? { caption } : undefined);
-  if (fileType === "audio") return bot.sendAudio(chatId, input, caption ? { caption } : undefined);
-  if (fileType === "voice") return bot.sendVoice(chatId, input, caption ? { caption } : undefined);
-  if (fileType === "video_note") return bot.sendVideoNote(chatId, input);
+  const opts = {};
+  if (caption) opts.caption = caption;
+  if (reply_markup) opts.reply_markup = reply_markup;
 
-  return bot.sendDocument(chatId, input, caption ? { caption } : undefined);
+  if (fileType === "photo") return bot.sendPhoto(chatId, input, opts);
+  if (fileType === "video") return bot.sendVideo(chatId, input, opts);
+  if (fileType === "document") return bot.sendDocument(chatId, input, opts);
+  if (fileType === "audio") return bot.sendAudio(chatId, input, opts);
+  if (fileType === "voice") return bot.sendVoice(chatId, input, opts);
+  if (fileType === "video_note") return bot.sendVideoNote(chatId, input, opts);
+
+  return bot.sendDocument(chatId, input, opts);
 }
 
 // =====================
@@ -294,51 +280,32 @@ const worker = new Worker(
     const data = job.data || {};
     const campaignId = data.campaignId;
 
-    // ✅ pausa (mas sai se cancelou)
     await waitIfPaused(campaignId);
 
-    // ✅ cancel real: não processa nem envia
-    if (await isCampaignCanceled(campaignId)) {
-      stats.processed++;
-      stats.canceled++;
-      maybeLogProgress();
-
-      await incCampaign(campaignId, "canceledCount"); // contador (não flag)
-      try {
-        job.discard();
-      } catch {}
-      return { ok: true, canceled: true };
-    }
-
-    // ✅ throttle dinâmico por campanha (permite trocar rate e retomar)
-    await throttleByCampaign(campaignId);
-
-    // recheck cancel depois do throttle (evita enviar após cancel durante wait)
     if (await isCampaignCanceled(campaignId)) {
       stats.processed++;
       stats.canceled++;
       maybeLogProgress();
 
       await incCampaign(campaignId, "canceledCount");
-      try {
-        job.discard();
-      } catch {}
+
+      try { job.discard(); } catch {}
       return { ok: true, canceled: true };
     }
 
+    const tokenKey = data.botToken || DEFAULT_TOKEN || "";
     const bot = getBot(data.botToken);
 
     try {
-      const r = await sendTelegram(bot, data);
+      const r = await sendTelegram(bot, tokenKey, data);
 
       if (r && r.canceled) {
         stats.processed++;
         stats.canceled++;
         maybeLogProgress();
+
         await incCampaign(campaignId, "canceledCount");
-        try {
-          job.discard();
-        } catch {}
+        try { job.discard(); } catch {}
         return { ok: true, canceled: true };
       }
 
@@ -349,7 +316,6 @@ const worker = new Worker(
       await incCampaign(campaignId, "sent");
       return { ok: true };
     } catch (err) {
-      // ✅ 429: respeita retry_after
       if (is429(err)) {
         const ra = getRetryAfterSeconds(err) || 3;
         const jitterMs = Math.floor(Math.random() * 350);
@@ -365,7 +331,6 @@ const worker = new Worker(
         throw err;
       }
 
-      // transient: rede/5xx etc
       if (isRetryableTransient(err) && !isPermanentTelegramError(err)) {
         stats.processed++;
         stats.retryOther++;
@@ -375,7 +340,6 @@ const worker = new Worker(
         throw err;
       }
 
-      // falha definitiva
       stats.processed++;
       stats.failed++;
       maybeLogProgress();
@@ -383,9 +347,7 @@ const worker = new Worker(
       await incCampaign(campaignId, "failed");
 
       if (isPermanentTelegramError(err)) {
-        try {
-          job.discard();
-        } catch {}
+        try { job.discard(); } catch {}
       }
 
       throw err;
@@ -404,7 +366,7 @@ worker.on("error", (err) => console.error("❌ Worker error:", err?.message || e
 
 worker.on("failed", (job, err) => {
   const sc = getTelegramStatusCode(err);
-  if (sc === 429) return;
+  if (sc === 429) return; // resumo sai no maybeLogProgress
 
   const id = job?.id;
   const desc = getTelegramDescription(err);
