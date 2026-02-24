@@ -8,10 +8,14 @@ const QUEUE_NAME = process.env.QUEUE_NAME || "disparos";
 const DEFAULT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
 // ====== LOG CONTROL (menos flood) ======
-const METRICS_INTERVAL_MS = Number(process.env.METRICS_INTERVAL_MS) || 30000; // ✅ 30s (menos flood)
-const IDLE_LOG_INTERVAL_MS = Number(process.env.IDLE_LOG_INTERVAL_MS) || 600000; // ✅ 10min
+const METRICS_INTERVAL_MS = Number(process.env.METRICS_INTERVAL_MS) || 30000; // 30s
+const IDLE_LOG_INTERVAL_MS = Number(process.env.IDLE_LOG_INTERVAL_MS) || 600000; // 10min (se 0 => nunca loga idle)
 const CAMPAIGN_RPS_CACHE_MS = Number(process.env.CAMPAIGN_RPS_CACHE_MS) || 2000; // 2s
 const RATE_GUARD_MAX_SLEEP_MS = Number(process.env.RATE_GUARD_MAX_SLEEP_MS) || 1000; // 1s
+
+// ✅ Modo PRO de logs
+const LOG_ONLY_WHEN_ACTIVE = String(process.env.LOG_ONLY_WHEN_ACTIVE || "1") === "1"; // só loga com campanha/fila
+const LOG_CAMPAIGN_START_END = String(process.env.LOG_CAMPAIGN_START_END || "1") === "1"; // log de início/fim
 
 if (!DEFAULT_TOKEN) {
   console.warn("⚠️ TELEGRAM_BOT_TOKEN não definido (ok se sempre mandar botToken no job).");
@@ -51,6 +55,24 @@ async function getBotUsername(bot, tokenKey) {
 
 function campaignKey(id) {
   return `campaign:${id}`;
+}
+
+async function getCampaignMeta(campaignId) {
+  if (!campaignId) return {};
+  try {
+    return (await redis.hgetall(campaignKey(campaignId))) || {};
+  } catch {
+    return {};
+  }
+}
+
+function toNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function fmtInt(n) {
+  return new Intl.NumberFormat("pt-BR").format(Number(n || 0));
 }
 
 async function isCampaignPaused(campaignId) {
@@ -221,7 +243,7 @@ async function rateGuard(campaignId) {
 }
 
 // =====================
-// Metrics (mais intuitivas + menos flood)
+// Metrics (mais intuitivas + modo PRO)
 // =====================
 const stats = {
   startedAt: Date.now(),
@@ -278,8 +300,57 @@ async function refreshBacklog() {
   } catch {}
 }
 
-function fmtInt(n) {
-  return new Intl.NumberFormat("pt-BR").format(Number(n || 0));
+// ====== tracker de campanhas (log início/fim + para logs quando terminar) ======
+const campaignTracker = new Map();
+// campaignId -> { startedLogged, finishedLogged, firstSeenAt }
+
+function trackCampaign(campaignId) {
+  if (!campaignId) return;
+  if (!campaignTracker.has(campaignId)) {
+    campaignTracker.set(campaignId, { startedLogged: false, finishedLogged: false, firstSeenAt: Date.now() });
+  }
+}
+
+async function logCampaignStartIfNeeded(campaignId) {
+  if (!LOG_CAMPAIGN_START_END || !campaignId) return;
+  const st = campaignTracker.get(campaignId);
+  if (!st || st.startedLogged) return;
+
+  st.startedLogged = true;
+  const meta = await getCampaignMeta(campaignId);
+  const total = toNum(meta.total);
+  const rps = toNum(meta.ratePerSecond) || (await getRpsCached(campaignId));
+
+  console.log(`🎬 Campanha iniciada | id=${campaignId} | 👥 total=${fmtInt(total)} | 🎚️ rps=${rps}`);
+}
+
+async function logCampaignEndIfDone() {
+  if (!LOG_CAMPAIGN_START_END || campaignTracker.size === 0) return;
+
+  for (const [cid, st] of campaignTracker.entries()) {
+    if (st.finishedLogged) continue;
+
+    const meta = await getCampaignMeta(cid);
+    const total = toNum(meta.total);
+    const sent = toNum(meta.sent);
+    const failed = toNum(meta.failed);
+    const canceledCount = toNum(meta.canceledCount);
+
+    const done = total > 0 && (sent + failed + canceledCount) >= total;
+
+    if (done) {
+      st.finishedLogged = true;
+      const durSec = Math.max(1, Math.floor((Date.now() - st.firstSeenAt) / 1000));
+      console.log(
+        `🏁 Campanha finalizada | id=${cid} | ✅${fmtInt(sent)} ❌${fmtInt(failed)} 🛑${fmtInt(
+          canceledCount
+        )} | ⏱️ ${durSec}s`
+      );
+
+      // limpa do tracker pra parar logs “ativos”
+      campaignTracker.delete(cid);
+    }
+  }
 }
 
 async function logMetricsIfNeeded() {
@@ -293,13 +364,28 @@ async function logMetricsIfNeeded() {
   const active = stats.backlog.active || 0;
   const failedQ = stats.backlog.failed || 0;
 
+  const anyTracked = campaignTracker.size > 0;
   const totallyIdle = stats.processed === 0 && pending === 0 && active === 0 && failedQ === 0;
 
-  if (totallyIdle) {
-    if (now - stats.lastIdleLogAt < IDLE_LOG_INTERVAL_MS) return;
-    stats.lastIdleLogAt = now;
-    console.log(`😴 Worker ocioso | fila=0`);
-    return;
+  // ✅ Modo PRO: some com logs quando não tem campanha e fila vazia
+  if (LOG_ONLY_WHEN_ACTIVE) {
+    if (!anyTracked && pending === 0 && active === 0) {
+      if (IDLE_LOG_INTERVAL_MS <= 0) return;
+      if (!totallyIdle) return;
+
+      if (now - stats.lastIdleLogAt < IDLE_LOG_INTERVAL_MS) return;
+      stats.lastIdleLogAt = now;
+      console.log(`😴 Worker ocioso | fila=0`);
+      return;
+    }
+  } else {
+    if (totallyIdle) {
+      if (IDLE_LOG_INTERVAL_MS <= 0) return;
+      if (now - stats.lastIdleLogAt < IDLE_LOG_INTERVAL_MS) return;
+      stats.lastIdleLogAt = now;
+      console.log(`😴 Worker ocioso | fila=0`);
+      return;
+    }
   }
 
   const winSec = METRICS_INTERVAL_MS / 1000;
@@ -309,7 +395,6 @@ async function logMetricsIfNeeded() {
   const r429W = sumWindow(METRICS_INTERVAL_MS, "retry429");
   const r429ps = r429W / winSec;
 
-  // ✅ linha mais "noob friendly"
   console.log(
     `🚀 Envio: ${rpsNow.toFixed(2)}/s (janela ${winSec}s) | 🎚️ cfg=${stats.lastSeenCfgRps ?? "-"} | ⏳429=${r429ps.toFixed(
       2
@@ -317,6 +402,9 @@ async function logMetricsIfNeeded() {
       stats.canceled
     )} | 📦fila pend=${fmtInt(pending)} act=${fmtInt(active)} fail=${fmtInt(failedQ)}`
   );
+
+  // tenta fechar campanhas (sem flood)
+  await logCampaignEndIfDone();
 }
 
 setInterval(() => {
@@ -460,6 +548,10 @@ const worker = new Worker(
   async (job) => {
     const data = job.data || {};
     const campaignId = data.campaignId;
+
+    // ===== logs início campanha (1x por campanha)
+    trackCampaign(campaignId);
+    await logCampaignStartIfNeeded(campaignId);
 
     // rate realtime por campanha (sem delay no job)
     await rateGuard(campaignId);
