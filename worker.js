@@ -1,6 +1,6 @@
 // worker.js
 require("dotenv").config();
-const { Worker } = require("bullmq");
+const { Worker, Queue } = require("bullmq");
 const TelegramBot = require("node-telegram-bot-api");
 const { redis, connection } = require("./redis");
 
@@ -13,6 +13,9 @@ if (!DEFAULT_TOKEN) {
 
 process.on("unhandledRejection", (err) => console.error("❌ unhandledRejection:", err));
 process.on("uncaughtException", (err) => console.error("❌ uncaughtException:", err));
+
+// ===== Queue (pra backlog) =====
+const queue = new Queue(QUEUE_NAME, { connection });
 
 // cache de bots por token
 const botCache = new Map();
@@ -59,6 +62,13 @@ async function isCampaignCanceled(campaignId) {
 async function incCampaign(campaignId, field, by = 1) {
   if (!campaignId) return;
   await redis.hincrby(campaignKey(campaignId), field, by);
+}
+
+async function getCampaignRps(campaignId) {
+  if (!campaignId) return null;
+  const v = await redis.hget(campaignKey(campaignId), "ratePerSecond");
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
 function sleep(ms) {
@@ -113,7 +123,8 @@ function isPermanentTelegramError(err) {
       desc.includes("wrong remote file identifier") ||
       desc.includes("file is too big") ||
       desc.includes("bad request")
-    ) return true;
+    )
+      return true;
   }
 
   if (statusCode === 401) return true;
@@ -134,7 +145,33 @@ function isRetryableTransient(err) {
 }
 
 // =====================
-// Throttled logs
+// FileID cache (vídeo único p/ 50k)
+// =====================
+function assetKeyFromJob(data) {
+  const campaignId = data.campaignId || "global";
+  const t = String(data.fileType || "file").toLowerCase();
+  // você pode mandar assetKey no job; se não mandar, vira 1 cache por campanha+tipo
+  return data.assetKey || `campaign:${campaignId}:asset:${t}`;
+}
+
+function redisAssetKey(assetKey) {
+  return `asset:${assetKey}`; // string => file_id
+}
+
+async function getCachedFileId(assetKey) {
+  if (!assetKey) return null;
+  const v = await redis.get(redisAssetKey(assetKey));
+  return v ? String(v) : null;
+}
+
+async function setCachedFileId(assetKey, fileId) {
+  if (!assetKey || !fileId) return;
+  // TTL opcional (7 dias). Se quiser infinito, remove o EX.
+  await redis.set(redisAssetKey(assetKey), String(fileId), "EX", 60 * 60 * 24 * 7);
+}
+
+// =====================
+// Metrics “SaaS” (avg + janela 5s + backlog)
 // =====================
 const stats = {
   startedAt: Date.now(),
@@ -144,35 +181,100 @@ const stats = {
   canceled: 0,
   retry429: 0,
   retryOther: 0,
-  lastLogAt: 0,
-  last429LogAt: 0,
-  last429Count: 0,
-  last429Sec: 0,
+
+  // janela por segundo (mantém ~8s)
+  win: [], // [{t, processed, retry429}]
+  lastSeenCfgRps: null,
+
+  backlog: { waiting: 0, delayed: 0, paused: 0, active: 0, failed: 0 },
+  lastTickAt: 0,
 };
 
-function maybeLogProgress() {
-  const now = Date.now();
-  const elapsed = Math.max(1, Math.floor((now - stats.startedAt) / 1000));
-  const everyN = 250;
+function bucketNowSecond() {
+  return Math.floor(Date.now() / 1000) * 1000;
+}
 
-  if (stats.processed % everyN === 0 || now - stats.lastLogAt > 15000) {
-    stats.lastLogAt = now;
-    const rps = (stats.processed / elapsed).toFixed(2);
-    console.log(
-      `📊 progress: processed=${stats.processed} sent=${stats.sent} failed=${stats.failed} canceled=${stats.canceled} retry429=${stats.retry429} retryOther=${stats.retryOther} avg=${rps}/s`
-    );
+function winBump(field, by = 1) {
+  const t = bucketNowSecond();
+  let last = stats.win[stats.win.length - 1];
+  if (!last || last.t !== t) {
+    stats.win.push({ t, processed: 0, retry429: 0 });
+    if (stats.win.length > 8) stats.win.shift();
+    last = stats.win[stats.win.length - 1];
   }
+  last[field] = (last[field] || 0) + by;
+}
 
-  if (stats.last429Count > 0 && now - stats.last429LogAt > 10000) {
-    stats.last429LogAt = now;
-    console.warn(
-      `⏳ 429 em lote: +${stats.last429Count} (último retry_after=${stats.last429Sec || "?"}s) nos últimos ~10s`
-    );
-    stats.last429Count = 0;
-    stats.last429Sec = 0;
+function sumWindow(ms, field) {
+  const cutoff = Date.now() - ms;
+  let s = 0;
+  for (const b of stats.win) {
+    if (b.t >= cutoff) s += b[field] || 0;
+  }
+  return s;
+}
+
+async function refreshBacklog() {
+  try {
+    const c = await queue.getJobCounts("waiting", "delayed", "paused", "active", "failed");
+    stats.backlog = {
+      waiting: c.waiting || 0,
+      delayed: c.delayed || 0,
+      paused: c.paused || 0,
+      active: c.active || 0,
+      failed: c.failed || 0,
+    };
+  } catch {
+    // não mata worker por métrica
   }
 }
 
+async function tickLog() {
+  const now = Date.now();
+  if (now - stats.lastTickAt < 5000) return;
+  stats.lastTickAt = now;
+
+  await refreshBacklog();
+
+  const elapsed = Math.max(1, (now - stats.startedAt) / 1000);
+  const rpsAvg = stats.processed / elapsed;
+
+  const p5 = sumWindow(5000, "processed");
+  const rps5 = p5 / 5;
+
+  const r429_5 = sumWindow(5000, "retry429");
+  const r429ps = r429_5 / 5;
+
+  const pending = stats.backlog.waiting + stats.backlog.delayed + stats.backlog.paused;
+
+  console.log(
+    [
+      "METRICS",
+      `avg=${rpsAvg.toFixed(2)}/s`,
+      `rps_5s=${rps5.toFixed(2)}/s`,
+      `cfg_rps=${stats.lastSeenCfgRps ?? "-"}`,
+      `429ps=${r429ps.toFixed(2)}`,
+      `processed=${stats.processed}`,
+      `sent=${stats.sent}`,
+      `failed=${stats.failed}`,
+      `canceled=${stats.canceled}`,
+      `retry429=${stats.retry429}`,
+      `retryOther=${stats.retryOther}`,
+      `backlog(pending=${pending},active=${stats.backlog.active},failed=${stats.backlog.failed})`,
+      `waiting=${stats.backlog.waiting}`,
+      `delayed=${stats.backlog.delayed}`,
+      `paused=${stats.backlog.paused}`,
+    ].join(" | ")
+  );
+}
+
+setInterval(() => {
+  tickLog().catch(() => {});
+}, 1000);
+
+// =====================
+// pause loop
+// =====================
 async function waitIfPaused(campaignId) {
   if (!campaignId) return;
   while (await isCampaignPaused(campaignId)) {
@@ -207,7 +309,7 @@ async function buildReplyMarkup(bot, tokenKey, buttons) {
       continue;
     }
     if (b.type === "start") {
-      if (!username) continue; // sem username não dá pra montar deep-link
+      if (!username) continue;
       const u = `https://t.me/${username}?start=${encodeURIComponent(b.value)}`;
       row.push({ text: b.text, url: u });
       continue;
@@ -215,17 +317,14 @@ async function buildReplyMarkup(bot, tokenKey, buttons) {
   }
 
   if (!row.length) return null;
-
-  return { inline_keyboard: [row] }; // 1 linha com até 4 botões
+  return { inline_keyboard: [row] };
 }
 
 // ===== mídia =====
 async function inputFromUrlOrId(fileUrl) {
   const s = String(fileUrl || "").trim();
   if (!s) return null;
-
   if (!/^https?:\/\//i.test(s)) return s; // file_id
-
   const r = await fetch(s);
   if (!r.ok) throw new Error(`Falha ao baixar arquivo (${r.status}) ${s}`);
   return Buffer.from(await r.arrayBuffer());
@@ -250,19 +349,53 @@ async function sendTelegram(bot, tokenKey, payload) {
   // Texto puro
   if (!fileUrl) {
     if (!text) throw new Error("text ausente");
-    const opts = reply_markup ? { reply_markup, disable_web_page_preview: true } : { disable_web_page_preview: true };
+    const opts = reply_markup
+      ? { reply_markup, disable_web_page_preview: true }
+      : { disable_web_page_preview: true };
     return bot.sendMessage(chatId, text, opts);
   }
-
-  const input = await inputFromUrlOrId(fileUrl);
-  if (!input) throw new Error("fileUrl inválida/vazia");
 
   const opts = {};
   if (caption) opts.caption = caption;
   if (reply_markup) opts.reply_markup = reply_markup;
 
+  // ===== ✅ VIDEO com cache de file_id =====
+  if (fileType === "video") {
+    const aKey = assetKeyFromJob(payload);
+    const cached = await getCachedFileId(aKey);
+
+    if (cached) {
+      try {
+        return await bot.sendVideo(chatId, cached, opts);
+      } catch (e) {
+        const sc = getTelegramStatusCode(e);
+        const desc = getTelegramDescription(e);
+        console.warn(
+          `⚠️ cached file_id falhou (assetKey=${aKey}) status=${sc || "-"} desc=${desc}. Re-uplodando...`
+        );
+        try {
+          await redis.del(redisAssetKey(aKey));
+        } catch {}
+        // cai pro upload abaixo
+      }
+    }
+
+    const input = await inputFromUrlOrId(fileUrl); // URL => baixa 1x; file_id => manda direto
+    if (!input) throw new Error("fileUrl inválida/vazia");
+
+    const res = await bot.sendVideo(chatId, input, opts);
+
+    const fid = res?.video?.file_id;
+    if (fid) await setCachedFileId(aKey, fid);
+
+    return res;
+  }
+
+  // Outros tipos (photo/document/etc)
+  const input = await inputFromUrlOrId(fileUrl);
+  if (!input) throw new Error("fileUrl inválida/vazia");
+
   if (fileType === "photo") return bot.sendPhoto(chatId, input, opts);
-  if (fileType === "video") return bot.sendVideo(chatId, input, opts);
   if (fileType === "document") return bot.sendDocument(chatId, input, opts);
   if (fileType === "audio") return bot.sendAudio(chatId, input, opts);
   if (fileType === "voice") return bot.sendVoice(chatId, input, opts);
@@ -280,16 +413,23 @@ const worker = new Worker(
     const data = job.data || {};
     const campaignId = data.campaignId;
 
+    // rps configurado (pra log)
+    if (campaignId) {
+      const rps = await getCampaignRps(campaignId);
+      if (rps) stats.lastSeenCfgRps = rps;
+    }
+
     await waitIfPaused(campaignId);
 
     if (await isCampaignCanceled(campaignId)) {
       stats.processed++;
       stats.canceled++;
-      maybeLogProgress();
+      winBump("processed", 1);
 
       await incCampaign(campaignId, "canceledCount");
-
-      try { job.discard(); } catch {}
+      try {
+        job.discard();
+      } catch {}
       return { ok: true, canceled: true };
     }
 
@@ -302,16 +442,18 @@ const worker = new Worker(
       if (r && r.canceled) {
         stats.processed++;
         stats.canceled++;
-        maybeLogProgress();
+        winBump("processed", 1);
 
         await incCampaign(campaignId, "canceledCount");
-        try { job.discard(); } catch {}
+        try {
+          job.discard();
+        } catch {}
         return { ok: true, canceled: true };
       }
 
       stats.processed++;
       stats.sent++;
-      maybeLogProgress();
+      winBump("processed", 1);
 
       await incCampaign(campaignId, "sent");
       return { ok: true };
@@ -323,9 +465,8 @@ const worker = new Worker(
 
         stats.processed++;
         stats.retry429++;
-        stats.last429Count++;
-        stats.last429Sec = ra;
-        maybeLogProgress();
+        winBump("processed", 1);
+        winBump("retry429", 1);
 
         await incCampaign(campaignId, "retry429");
         throw err;
@@ -334,7 +475,7 @@ const worker = new Worker(
       if (isRetryableTransient(err) && !isPermanentTelegramError(err)) {
         stats.processed++;
         stats.retryOther++;
-        maybeLogProgress();
+        winBump("processed", 1);
 
         await incCampaign(campaignId, "retryOther");
         throw err;
@@ -342,12 +483,14 @@ const worker = new Worker(
 
       stats.processed++;
       stats.failed++;
-      maybeLogProgress();
+      winBump("processed", 1);
 
       await incCampaign(campaignId, "failed");
 
       if (isPermanentTelegramError(err)) {
-        try { job.discard(); } catch {}
+        try {
+          job.discard();
+        } catch {}
       }
 
       throw err;
@@ -366,7 +509,7 @@ worker.on("error", (err) => console.error("❌ Worker error:", err?.message || e
 
 worker.on("failed", (job, err) => {
   const sc = getTelegramStatusCode(err);
-  if (sc === 429) return; // resumo sai no maybeLogProgress
+  if (sc === 429) return; // 429 já vai pro METRICS
 
   const id = job?.id;
   const desc = getTelegramDescription(err);
