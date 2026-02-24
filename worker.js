@@ -7,6 +7,12 @@ const { redis, connection } = require("./redis");
 const QUEUE_NAME = process.env.QUEUE_NAME || "disparos";
 const DEFAULT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
+// ====== LOG CONTROL (menos flood) ======
+const METRICS_INTERVAL_MS = Number(process.env.METRICS_INTERVAL_MS) || 15000; // 15s
+const IDLE_LOG_INTERVAL_MS = Number(process.env.IDLE_LOG_INTERVAL_MS) || 300000; // 5min
+const CAMPAIGN_RPS_CACHE_MS = Number(process.env.CAMPAIGN_RPS_CACHE_MS) || 2000; // 2s
+const RATE_GUARD_MAX_SLEEP_MS = Number(process.env.RATE_GUARD_MAX_SLEEP_MS) || 1000; // 1s
+
 if (!DEFAULT_TOKEN) {
   console.warn("⚠️ TELEGRAM_BOT_TOKEN não definido (ok se sempre mandar botToken no job).");
 }
@@ -150,7 +156,6 @@ function isRetryableTransient(err) {
 function assetKeyFromJob(data) {
   const campaignId = data.campaignId || "global";
   const t = String(data.fileType || "file").toLowerCase();
-  // você pode mandar assetKey no job; se não mandar, vira 1 cache por campanha+tipo
   return data.assetKey || `campaign:${campaignId}:asset:${t}`;
 }
 
@@ -166,12 +171,58 @@ async function getCachedFileId(assetKey) {
 
 async function setCachedFileId(assetKey, fileId) {
   if (!assetKey || !fileId) return;
-  // TTL opcional (7 dias). Se quiser infinito, remove o EX.
   await redis.set(redisAssetKey(assetKey), String(fileId), "EX", 60 * 60 * 24 * 7);
 }
 
 // =====================
-// Metrics “SaaS” (avg + janela 5s + backlog)
+// Rate realtime por campanha (token bucket simples)
+// =====================
+
+// cache de ratePerSecond (pra não HGET em todo job)
+const rpsCache = new Map(); // campaignId -> { rps, at }
+async function getRpsCached(campaignId) {
+  if (!campaignId) return 10;
+  const now = Date.now();
+  const cur = rpsCache.get(campaignId);
+  if (cur && now - cur.at < CAMPAIGN_RPS_CACHE_MS) return cur.rps;
+
+  const rps = (await getCampaignRps(campaignId)) || 10;
+  rpsCache.set(campaignId, { rps, at: now });
+  return rps;
+}
+
+// espaçamento mínimo entre envios por campanha (ms)
+const nextSendAt = new Map(); // campaignId -> epoch_ms
+
+async function rateGuard(campaignId) {
+  if (!campaignId) return;
+
+  // se cancelada, não perde tempo aqui
+  if (await isCampaignCanceled(campaignId)) return;
+
+  while (true) {
+    await waitIfPaused(campaignId);
+    if (await isCampaignCanceled(campaignId)) return;
+
+    const rps = await getRpsCached(campaignId);
+    const spacing = Math.max(1, Math.floor(1000 / Math.max(1, rps)));
+
+    const now = Date.now();
+    const next = nextSendAt.get(campaignId) || now;
+
+    if (now >= next) {
+      nextSendAt.set(campaignId, now + spacing);
+      stats.lastSeenCfgRps = rps; // pro log
+      return;
+    }
+
+    const sleepMs = Math.min(RATE_GUARD_MAX_SLEEP_MS, next - now);
+    if (sleepMs > 0) await sleep(sleepMs);
+  }
+}
+
+// =====================
+// Metrics (simplificadas)
 // =====================
 const stats = {
   startedAt: Date.now(),
@@ -181,14 +232,14 @@ const stats = {
   canceled: 0,
   retry429: 0,
   retryOther: 0,
-  lastIdleLogAt: 0,
 
-  // janela por segundo (mantém ~8s)
+  // janela 15s (pra rps atual e 429ps)
   win: [], // [{t, processed, retry429}]
   lastSeenCfgRps: null,
 
   backlog: { waiting: 0, delayed: 0, paused: 0, active: 0, failed: 0 },
-  lastTickAt: 0,
+  lastLogAt: 0,
+  lastIdleLogAt: 0,
 };
 
 function bucketNowSecond() {
@@ -200,7 +251,7 @@ function winBump(field, by = 1) {
   let last = stats.win[stats.win.length - 1];
   if (!last || last.t !== t) {
     stats.win.push({ t, processed: 0, retry429: 0 });
-    if (stats.win.length > 8) stats.win.shift();
+    if (stats.win.length > 20) stats.win.shift(); // ~20s
     last = stats.win[stats.win.length - 1];
   }
   last[field] = (last[field] || 0) + by;
@@ -225,66 +276,49 @@ async function refreshBacklog() {
       active: c.active || 0,
       failed: c.failed || 0,
     };
-  } catch {
-    // não mata worker por métrica
-  }
+  } catch {}
 }
 
-async function tickLog() {
+async function logMetricsIfNeeded() {
   const now = Date.now();
-  if (now - stats.lastTickAt < 5000) return;
-  stats.lastTickAt = now;
+  if (now - stats.lastLogAt < METRICS_INTERVAL_MS) return;
+  stats.lastLogAt = now;
 
   await refreshBacklog();
 
   const pending = stats.backlog.waiting + stats.backlog.delayed + stats.backlog.paused;
   const active = stats.backlog.active || 0;
-  const failed = stats.backlog.failed || 0;
+  const failedQ = stats.backlog.failed || 0;
 
-  // ✅ Se estiver totalmente idle, não flooda.
-  // Loga "idle" no máximo 1x a cada 3 minutos (pra provar que tá vivo).
-  const totallyIdle = stats.processed === 0 && pending === 0 && active === 0 && failed === 0;
+  const totallyIdle = stats.processed === 0 && pending === 0 && active === 0 && failedQ === 0;
 
   if (totallyIdle) {
-    stats.lastIdleLogAt = stats.lastIdleLogAt || 0;
-    if (now - stats.lastIdleLogAt < 180000) return; // 3 min
+    if (now - stats.lastIdleLogAt < IDLE_LOG_INTERVAL_MS) return;
     stats.lastIdleLogAt = now;
-    console.log(`METRICS | idle=1 | backlog(pending=0,active=0,failed=0)`);
+    console.log(`WKR idle | pending=0 active=0 failed=0`);
     return;
   }
 
   const elapsed = Math.max(1, (now - stats.startedAt) / 1000);
   const rpsAvg = stats.processed / elapsed;
 
-  const p5 = sumWindow(5000, "processed");
-  const rps5 = p5 / 5;
+  const pW = sumWindow(METRICS_INTERVAL_MS, "processed");
+  const rpsNow = pW / (METRICS_INTERVAL_MS / 1000);
 
-  const r429_5 = sumWindow(5000, "retry429");
-  const r429ps = r429_5 / 5;
+  const r429W = sumWindow(METRICS_INTERVAL_MS, "retry429");
+  const r429ps = r429W / (METRICS_INTERVAL_MS / 1000);
 
+  // ✅ linha única enxuta
   console.log(
-    [
-      "METRICS",
-      `avg=${rpsAvg.toFixed(2)}/s`,
-      `rps_5s=${rps5.toFixed(2)}/s`,
-      `cfg_rps=${stats.lastSeenCfgRps ?? "-"}`,
-      `429ps=${r429ps.toFixed(2)}`,
-      `processed=${stats.processed}`,
-      `sent=${stats.sent}`,
-      `failed=${stats.failed}`,
-      `canceled=${stats.canceled}`,
-      `retry429=${stats.retry429}`,
-      `retryOther=${stats.retryOther}`,
-      `backlog(pending=${pending},active=${active},failed=${failed})`,
-      `waiting=${stats.backlog.waiting}`,
-      `delayed=${stats.backlog.delayed}`,
-      `paused=${stats.backlog.paused}`,
-    ].join(" | ")
+    `WKR | avg=${rpsAvg.toFixed(2)}/s now=${rpsNow.toFixed(2)}/s cfg=${stats.lastSeenCfgRps ?? "-"} 429ps=${r429ps.toFixed(
+      2
+    )} | sent=${stats.sent} fail=${stats.failed} can=${stats.canceled} r429=${stats.retry429} ro=${stats.retryOther} | pending=${pending} act=${active} qfail=${failedQ}`
   );
 }
 
+// roda 1x por segundo, mas só loga no intervalo configurado
 setInterval(() => {
-  tickLog().catch(() => {});
+  logMetricsIfNeeded().catch(() => {});
 }, 1000);
 
 // =====================
@@ -385,17 +419,14 @@ async function sendTelegram(bot, tokenKey, payload) {
       } catch (e) {
         const sc = getTelegramStatusCode(e);
         const desc = getTelegramDescription(e);
-        console.warn(
-          `⚠️ cached file_id falhou (assetKey=${aKey}) status=${sc || "-"} desc=${desc}. Re-uplodando...`
-        );
+        console.warn(`⚠️ file_id cache falhou (assetKey=${aKey}) status=${sc || "-"} desc=${desc}. Re-uplodando...`);
         try {
           await redis.del(redisAssetKey(aKey));
         } catch {}
-        // cai pro upload abaixo
       }
     }
 
-    const input = await inputFromUrlOrId(fileUrl); // URL => baixa 1x; file_id => manda direto
+    const input = await inputFromUrlOrId(fileUrl);
     if (!input) throw new Error("fileUrl inválida/vazia");
 
     const res = await bot.sendVideo(chatId, input, opts);
@@ -428,12 +459,10 @@ const worker = new Worker(
     const data = job.data || {};
     const campaignId = data.campaignId;
 
-    // rps configurado (pra log)
-    if (campaignId) {
-      const rps = await getCampaignRps(campaignId);
-      if (rps) stats.lastSeenCfgRps = rps;
-    }
+    // rate realtime por campanha (sem delay no job)
+    await rateGuard(campaignId);
 
+    // pausa/cancel (já checados no rateGuard, mas mantém aqui por segurança)
     await waitIfPaused(campaignId);
 
     if (await isCampaignCanceled(campaignId)) {
@@ -524,7 +553,7 @@ worker.on("error", (err) => console.error("❌ Worker error:", err?.message || e
 
 worker.on("failed", (job, err) => {
   const sc = getTelegramStatusCode(err);
-  if (sc === 429) return; // 429 já vai pro METRICS
+  if (sc === 429) return; // entra no contador + log agregado
 
   const id = job?.id;
   const desc = getTelegramDescription(err);
