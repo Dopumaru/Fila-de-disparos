@@ -164,6 +164,91 @@ function parseButtons(raw) {
   }
 }
 
+// ===== ✅ Rate realtime (sem delay no job) =====
+// A ideia: enfileira tudo SEM delay e o worker aplica o ritmo lendo ratePerSecond em tempo real.
+// Pra isso funcionar, o worker precisa respeitar ratePerSecond do Redis (você já está com logs; se ainda não tiver gating, eu te mando o patch).
+//
+// Aqui no server, a gente só guarda o rate na meta e NÃO calcula delay por idx.
+
+// ===== upload url validator (opcional) =====
+async function validatePublicUrl(url) {
+  // leve e sem lib extra: só valida forma básica e deixa o worker lidar com falhas reais.
+  const s = String(url || "").trim();
+  if (!s) return false;
+  return /^https?:\/\//i.test(s);
+}
+
+function buildAssetKey(campaignId, fileType) {
+  const t = String(fileType || "file").toLowerCase();
+  return `campaign:${campaignId}:asset:${t}:v1`;
+}
+
+// ===== Enqueue central (usado por /campaign e /disparar) =====
+async function enqueueCampaign({
+  req,
+  campaignId,
+  leads,
+  botToken,
+  chatIdColumn = "id",
+  ratePerSecond = 10,
+  message,
+  fileUrl,
+  fileType,
+  caption,
+  buttons,
+}) {
+  const id = campaignId || genId();
+  const rps = clampRps(ratePerSecond);
+
+  await setCampaignMeta(id, {
+    paused: "0",
+    canceled: "0",
+    total: String(leads.length),
+    sent: "0",
+    failed: "0",
+    canceledCount: "0",
+    createdAt: new Date().toISOString(),
+    ratePerSecond: String(rps),
+  });
+
+  const idCol = normalizeKey(chatIdColumn);
+  const btns = parseButtons(buttons);
+
+  // ✅ assetKey para cache de file_id no worker (principalmente vídeo)
+  const assetKey = fileUrl ? buildAssetKey(id, fileType) : undefined;
+
+  const jobs = leads.map((row) => {
+    const chatId = row?.[idCol] ?? row?.[chatIdColumn] ?? row?.id ?? row?.chat_id;
+
+    const textFinal = applyTemplate(message, row);
+    const captionFinal = applyTemplate(caption, row);
+
+    return {
+      name: "send",
+      data: {
+        campaignId: id,
+        botToken,
+        chatId,
+        text: textFinal,
+        fileUrl,
+        fileType,
+        caption: captionFinal,
+        buttons: btns,
+        assetKey,
+      },
+      opts: {
+        // ✅ SEM delay: rate realtime fica no worker
+        attempts: 6,
+        backoff: { type: "exponential", delay: 2000 },
+      },
+    };
+  });
+
+  await queue.addBulk(jobs);
+
+  return { campaignId: id, total: leads.length, ratePerSecond: rps, buttons: btns.length, assetKey: !!assetKey };
+}
+
 // =====================================================================================
 // JSON: /campaign
 // =====================================================================================
@@ -189,60 +274,26 @@ app.post("/campaign", async (req, res) => {
       return res.status(400).json({ ok: false, error: "botToken ausente." });
     }
 
-    const id = campaignId || genId();
+    if (fileUrl) {
+      const ok = await validatePublicUrl(fileUrl);
+      if (!ok) return res.status(400).json({ ok: false, error: "fileUrl inválida (precisa ser http/https público)." });
+    }
 
-    const rps = clampRps(ratePerSecond);
-    const baseDelayMs = Math.floor(1000 / rps);
-
-    await setCampaignMeta(id, {
-      paused: "0",
-      canceled: "0",
-      total: String(leads.length),
-      sent: "0",
-      failed: "0",
-      canceledCount: "0",
-      createdAt: new Date().toISOString(),
-      ratePerSecond: String(rps),
+    const r = await enqueueCampaign({
+      req,
+      campaignId,
+      leads,
+      botToken,
+      chatIdColumn,
+      ratePerSecond,
+      message,
+      fileUrl,
+      fileType,
+      caption,
+      buttons,
     });
 
-    const idCol = normalizeKey(chatIdColumn);
-    const btns = parseButtons(buttons);
-
-    const jobs = leads.map((row, idx) => {
-      const chatId = row?.[idCol] ?? row?.[chatIdColumn] ?? row?.id ?? row?.chat_id;
-
-      const textFinal = applyTemplate(message, row);
-      const captionFinal = applyTemplate(caption, row);
-
-      return {
-        name: "send",
-        data: {
-          campaignId: id,
-          botToken,
-          chatId,
-          text: textFinal,
-          fileUrl,
-          fileType,
-          caption: captionFinal,
-          buttons: btns,
-        },
-        opts: {
-          delay: idx * baseDelayMs,
-          attempts: 6,
-          backoff: { type: "exponential", delay: 2000 },
-          // removeOnComplete/removeOnFail já estão no defaultJobOptions
-        },
-      };
-    });
-
-    await queue.addBulk(jobs);
-
-    return res.json({
-      ok: true,
-      campaignId: id,
-      total: leads.length,
-      ratePerSecond: rps,
-    });
+    return res.json({ ok: true, ...r });
   } catch (e) {
     console.error("❌ /campaign erro:", e);
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
@@ -282,10 +333,7 @@ app.post(
       const tipo = String(req.body.tipo || req.body.type || "text").toLowerCase();
 
       const limit = toInt(req.body.limit || req.body.rate || req.body.limitMax || 1, 1);
-      const intervalSec = toInt(
-        req.body.intervalSec || req.body.interval || req.body.intervalS || 1,
-        1
-      );
+      const intervalSec = toInt(req.body.intervalSec || req.body.interval || req.body.intervalS || 1, 1);
       const ratePerSecond = clampRps(Math.floor(limit / Math.max(1, intervalSec)) || 1);
 
       if (!botToken) {
@@ -329,19 +377,6 @@ app.post(
 
       const campaignId = genId();
 
-      await setCampaignMeta(campaignId, {
-        paused: "0",
-        canceled: "0",
-        total: String(leads.length),
-        sent: "0",
-        failed: "0",
-        canceledCount: "0",
-        createdAt: new Date().toISOString(),
-        ratePerSecond: String(ratePerSecond),
-      });
-
-      const baseDelayMs = Math.floor(1000 / ratePerSecond);
-
       let fileUrl;
       if (mediaFile?.filename) {
         const base = getPublicBaseUrl(req);
@@ -350,36 +385,25 @@ app.post(
 
       const btns = parseButtons(req.body.buttons);
 
-      const jobs = leads.map((row, idx) => ({
-        name: "send",
-        data: {
-          campaignId,
-          botToken,
-          chatId: row.id,
-          text: message,
-          fileUrl: fileUrl || undefined,
-          fileType: tipo === "text" ? undefined : tipo,
-          caption: caption || undefined,
-          buttons: btns,
-        },
-        opts: {
-          delay: idx * baseDelayMs,
-          attempts: 6,
-          backoff: { type: "exponential", delay: 2000 },
-          // removeOnComplete/removeOnFail já estão no defaultJobOptions
-        },
-      }));
-
-      await queue.addBulk(jobs);
+      const r = await enqueueCampaign({
+        req,
+        campaignId,
+        leads,
+        botToken,
+        chatIdColumn: "id",
+        ratePerSecond,
+        message,
+        fileUrl: fileUrl || undefined,
+        fileType: tipo === "text" ? undefined : tipo,
+        caption: caption || undefined,
+        buttons: btns,
+      });
 
       return res.json({
         ok: true,
-        campaignId,
-        total: leads.length,
-        ratePerSecond,
+        ...r,
         usedFileUrl: !!fileUrl,
         receivedFileFields: Object.keys(req.files || {}),
-        buttons: btns.length,
       });
     } catch (e) {
       console.error("❌ /disparar erro:", e);
@@ -560,7 +584,6 @@ function cleanupUploads() {
   }
 }
 
-// roda ao iniciar e depois periodicamente
 setTimeout(cleanupUploads, 10_000);
 setInterval(cleanupUploads, UPLOAD_CLEAN_INTERVAL_MIN * 60 * 1000);
 
