@@ -75,30 +75,6 @@ function fmtInt(n) {
   return new Intl.NumberFormat("pt-BR").format(Number(n || 0));
 }
 
-async function isCampaignPaused(campaignId) {
-  if (!campaignId) return false;
-  const v = await redis.hget(campaignKey(campaignId), "paused");
-  return String(v || "0") === "1";
-}
-
-async function isCampaignCanceled(campaignId) {
-  if (!campaignId) return false;
-  const v = await redis.hget(campaignKey(campaignId), "canceled");
-  return String(v || "0") === "1";
-}
-
-async function incCampaign(campaignId, field, by = 1) {
-  if (!campaignId) return;
-  await redis.hincrby(campaignKey(campaignId), field, by);
-}
-
-async function getCampaignRps(campaignId) {
-  if (!campaignId) return null;
-  const v = await redis.hget(campaignKey(campaignId), "ratePerSecond");
-  const n = Number(v);
-  return Number.isFinite(n) && n > 0 ? n : null;
-}
-
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -173,6 +149,33 @@ function isRetryableTransient(err) {
 }
 
 // =====================
+// Campaign controls
+// =====================
+async function isCampaignPaused(campaignId) {
+  if (!campaignId) return false;
+  const v = await redis.hget(campaignKey(campaignId), "paused");
+  return String(v || "0") === "1";
+}
+
+async function isCampaignCanceled(campaignId) {
+  if (!campaignId) return false;
+  const v = await redis.hget(campaignKey(campaignId), "canceled");
+  return String(v || "0") === "1";
+}
+
+async function incCampaign(campaignId, field, by = 1) {
+  if (!campaignId) return;
+  await redis.hincrby(campaignKey(campaignId), field, by);
+}
+
+async function getCampaignRps(campaignId) {
+  if (!campaignId) return null;
+  const v = await redis.hget(campaignKey(campaignId), "ratePerSecond");
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+// =====================
 // FileID cache (vídeo único p/ 50k)
 // =====================
 function assetKeyFromJob(data) {
@@ -216,6 +219,14 @@ async function getRpsCached(campaignId) {
 // espaçamento mínimo entre envios por campanha (ms)
 const nextSendAt = new Map(); // campaignId -> epoch_ms
 
+async function waitIfPaused(campaignId) {
+  if (!campaignId) return;
+  while (await isCampaignPaused(campaignId)) {
+    if (await isCampaignCanceled(campaignId)) return;
+    await sleep(1500);
+  }
+}
+
 async function rateGuard(campaignId) {
   if (!campaignId) return;
 
@@ -243,7 +254,7 @@ async function rateGuard(campaignId) {
 }
 
 // =====================
-// Metrics (mais intuitivas + modo PRO)
+// Metrics + modo PRO (tabela alinhada)
 // =====================
 const stats = {
   startedAt: Date.now(),
@@ -311,6 +322,28 @@ function trackCampaign(campaignId) {
   }
 }
 
+function padRight(s, width) {
+  const str = String(s ?? "");
+  if (str.length >= width) return str.slice(0, width);
+  return str + " ".repeat(width - str.length);
+}
+
+function padLeft(s, width) {
+  const str = String(s ?? "");
+  if (str.length >= width) return str.slice(0, width);
+  return " ".repeat(width - str.length) + str;
+}
+
+function padNum(n, width) {
+  return padLeft(fmtInt(n), width);
+}
+
+function fmtFixed(n, digits = 2) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return "0.00";
+  return x.toFixed(digits);
+}
+
 async function logCampaignStartIfNeeded(campaignId) {
   if (!LOG_CAMPAIGN_START_END || !campaignId) return;
   const st = campaignTracker.get(campaignId);
@@ -321,7 +354,7 @@ async function logCampaignStartIfNeeded(campaignId) {
   const total = toNum(meta.total);
   const rps = toNum(meta.ratePerSecond) || (await getRpsCached(campaignId));
 
-  console.log(`🎬 Campanha iniciada | id=${campaignId} | 👥 total=${fmtInt(total)} | 🎚️ rps=${rps}`);
+  console.log(`🎬 CAMPANHA INICIADA | id=${campaignId} | total=${fmtInt(total)} | rps=${rps}`);
 }
 
 async function logCampaignEndIfDone() {
@@ -342,15 +375,50 @@ async function logCampaignEndIfDone() {
       st.finishedLogged = true;
       const durSec = Math.max(1, Math.floor((Date.now() - st.firstSeenAt) / 1000));
       console.log(
-        `🏁 Campanha finalizada | id=${cid} | ✅${fmtInt(sent)} ❌${fmtInt(failed)} 🛑${fmtInt(
+        `🏁 CAMPANHA FINALIZADA | id=${cid} | ok=${fmtInt(sent)} | fail=${fmtInt(failed)} | cancel=${fmtInt(
           canceledCount
-        )} | ⏱️ ${durSec}s`
+        )} | tempo=${durSec}s`
       );
 
-      // limpa do tracker pra parar logs “ativos”
       campaignTracker.delete(cid);
     }
   }
+}
+
+// Header (1x) quando começa a ter atividade
+let printedHeader = false;
+function printHeaderIfNeeded() {
+  if (printedHeader) return;
+  printedHeader = true;
+  console.log(
+    "📊 METRICS\n" +
+      [
+        padRight("tipo", 7),
+        padRight("rps", 8),
+        padRight("cfg", 5),
+        padRight("429/s", 7),
+        padRight("ok", 8),
+        padRight("fail", 8),
+        padRight("cancel", 8),
+        padRight("pend", 7),
+        padRight("act", 5),
+        padRight("qfail", 6),
+      ].join("  ")
+  );
+  console.log(
+    [
+      padRight("------", 7),
+      padRight("--------", 8),
+      padRight("-----", 5),
+      padRight("-------", 7),
+      padRight("--------", 8),
+      padRight("--------", 8),
+      padRight("--------", 8),
+      padRight("-------", 7),
+      padRight("-----", 5),
+      padRight("------", 6),
+    ].join("  ")
+  );
 }
 
 async function logMetricsIfNeeded() {
@@ -367,7 +435,6 @@ async function logMetricsIfNeeded() {
   const anyTracked = campaignTracker.size > 0;
   const totallyIdle = stats.processed === 0 && pending === 0 && active === 0 && failedQ === 0;
 
-  // ✅ Modo PRO: some com logs quando não tem campanha e fila vazia
   if (LOG_ONLY_WHEN_ACTIVE) {
     if (!anyTracked && pending === 0 && active === 0) {
       if (IDLE_LOG_INTERVAL_MS <= 0) return;
@@ -375,7 +442,7 @@ async function logMetricsIfNeeded() {
 
       if (now - stats.lastIdleLogAt < IDLE_LOG_INTERVAL_MS) return;
       stats.lastIdleLogAt = now;
-      console.log(`😴 Worker ocioso | fila=0`);
+      console.log(`😴 WORKER OCIOSO | fila=0`);
       return;
     }
   } else {
@@ -383,10 +450,12 @@ async function logMetricsIfNeeded() {
       if (IDLE_LOG_INTERVAL_MS <= 0) return;
       if (now - stats.lastIdleLogAt < IDLE_LOG_INTERVAL_MS) return;
       stats.lastIdleLogAt = now;
-      console.log(`😴 Worker ocioso | fila=0`);
+      console.log(`😴 WORKER OCIOSO | fila=0`);
       return;
     }
   }
+
+  printHeaderIfNeeded();
 
   const winSec = METRICS_INTERVAL_MS / 1000;
   const pW = sumWindow(METRICS_INTERVAL_MS, "processed");
@@ -395,15 +464,22 @@ async function logMetricsIfNeeded() {
   const r429W = sumWindow(METRICS_INTERVAL_MS, "retry429");
   const r429ps = r429W / winSec;
 
-  console.log(
-    `🚀 Envio: ${rpsNow.toFixed(2)}/s (janela ${winSec}s) | 🎚️ cfg=${stats.lastSeenCfgRps ?? "-"} | ⏳429=${r429ps.toFixed(
-      2
-    )}/s | ✅ok=${fmtInt(stats.sent)} ❌fail=${fmtInt(stats.failed)} 🛑cancel=${fmtInt(
-      stats.canceled
-    )} | 📦fila pend=${fmtInt(pending)} act=${fmtInt(active)} fail=${fmtInt(failedQ)}`
-  );
+  // Linha tipo “tabela”, alinhada (emoji só no começo)
+  const line = [
+    padRight("🚀ENVIO", 7),
+    padLeft(fmtFixed(rpsNow, 2), 8),
+    padLeft(String(stats.lastSeenCfgRps ?? "-"), 5),
+    padLeft(fmtFixed(r429ps, 2), 7),
+    padNum(stats.sent, 8),
+    padNum(stats.failed, 8),
+    padNum(stats.canceled, 8),
+    padNum(pending, 7),
+    padNum(active, 5),
+    padNum(failedQ, 6),
+  ].join("  ");
 
-  // tenta fechar campanhas (sem flood)
+  console.log(line);
+
   await logCampaignEndIfDone();
 }
 
@@ -412,17 +488,8 @@ setInterval(() => {
 }, 1000);
 
 // =====================
-// pause loop
+// buttons -> reply_markup
 // =====================
-async function waitIfPaused(campaignId) {
-  if (!campaignId) return;
-  while (await isCampaignPaused(campaignId)) {
-    if (await isCampaignCanceled(campaignId)) return;
-    await sleep(1500);
-  }
-}
-
-// ===== buttons -> reply_markup =====
 function normalizeButtons(raw) {
   if (!Array.isArray(raw)) return [];
   return raw
