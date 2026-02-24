@@ -17,6 +17,9 @@ const RATE_GUARD_MAX_SLEEP_MS = Number(process.env.RATE_GUARD_MAX_SLEEP_MS) || 1
 const LOG_ONLY_WHEN_ACTIVE = String(process.env.LOG_ONLY_WHEN_ACTIVE || "1") === "1"; // só loga com campanha/fila
 const LOG_CAMPAIGN_START_END = String(process.env.LOG_CAMPAIGN_START_END || "1") === "1"; // log de início/fim
 
+// ✅ Debug do file_id (0 = off / 1 = on)
+const LOG_FILEID = String(process.env.LOG_FILEID || "0") === "1";
+
 if (!DEFAULT_TOKEN) {
   console.warn("⚠️ TELEGRAM_BOT_TOKEN não definido (ok se sempre mandar botToken no job).");
 }
@@ -254,7 +257,7 @@ async function rateGuard(campaignId) {
 }
 
 // =====================
-// Metrics + modo PRO (tabela alinhada)
+// Metrics + modo PRO (linha única simples + emoji só no começo)
 // =====================
 const stats = {
   startedAt: Date.now(),
@@ -265,7 +268,6 @@ const stats = {
   retry429: 0,
   retryOther: 0,
 
-  // janela (pra rps atual e 429ps)
   win: [], // [{t, processed, retry429}]
   lastSeenCfgRps: null,
 
@@ -283,7 +285,7 @@ function winBump(field, by = 1) {
   let last = stats.win[stats.win.length - 1];
   if (!last || last.t !== t) {
     stats.win.push({ t, processed: 0, retry429: 0 });
-    if (stats.win.length > 40) stats.win.shift(); // guarda ~40s
+    if (stats.win.length > 40) stats.win.shift(); // ~40s
     last = stats.win[stats.win.length - 1];
   }
   last[field] = (last[field] || 0) + by;
@@ -311,7 +313,7 @@ async function refreshBacklog() {
   } catch {}
 }
 
-// ====== tracker de campanhas (log início/fim + para logs quando terminar) ======
+// ====== tracker de campanhas (log início/fim + parar logs quando terminar) ======
 const campaignTracker = new Map();
 // campaignId -> { startedLogged, finishedLogged, firstSeenAt }
 
@@ -320,28 +322,6 @@ function trackCampaign(campaignId) {
   if (!campaignTracker.has(campaignId)) {
     campaignTracker.set(campaignId, { startedLogged: false, finishedLogged: false, firstSeenAt: Date.now() });
   }
-}
-
-function padRight(s, width) {
-  const str = String(s ?? "");
-  if (str.length >= width) return str.slice(0, width);
-  return str + " ".repeat(width - str.length);
-}
-
-function padLeft(s, width) {
-  const str = String(s ?? "");
-  if (str.length >= width) return str.slice(0, width);
-  return " ".repeat(width - str.length) + str;
-}
-
-function padNum(n, width) {
-  return padLeft(fmtInt(n), width);
-}
-
-function fmtFixed(n, digits = 2) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return "0.00";
-  return x.toFixed(digits);
 }
 
 async function logCampaignStartIfNeeded(campaignId) {
@@ -357,68 +337,39 @@ async function logCampaignStartIfNeeded(campaignId) {
   console.log(`🎬 CAMPANHA INICIADA | id=${campaignId} | total=${fmtInt(total)} | rps=${rps}`);
 }
 
-async function logCampaignEndIfDone() {
-  if (!LOG_CAMPAIGN_START_END || campaignTracker.size === 0) return;
+// ✅ log de fim IMEDIATO (não depende do METRICS_INTERVAL)
+async function checkAndLogCampaignEndNow(campaignId) {
+  if (!LOG_CAMPAIGN_START_END || !campaignId) return;
 
-  for (const [cid, st] of campaignTracker.entries()) {
-    if (st.finishedLogged) continue;
+  const st = campaignTracker.get(campaignId);
+  if (!st || st.finishedLogged) return;
 
-    const meta = await getCampaignMeta(cid);
-    const total = toNum(meta.total);
-    const sent = toNum(meta.sent);
-    const failed = toNum(meta.failed);
-    const canceledCount = toNum(meta.canceledCount);
+  const meta = await getCampaignMeta(campaignId);
+  const total = toNum(meta.total);
+  const sent = toNum(meta.sent);
+  const failed = toNum(meta.failed);
+  const canceledCount = toNum(meta.canceledCount);
 
-    const done = total > 0 && (sent + failed + canceledCount) >= total;
+  const done = total > 0 && (sent + failed + canceledCount) >= total;
+  if (!done) return;
 
-    if (done) {
-      st.finishedLogged = true;
-      const durSec = Math.max(1, Math.floor((Date.now() - st.firstSeenAt) / 1000));
-      console.log(
-        `🏁 CAMPANHA FINALIZADA | id=${cid} | ok=${fmtInt(sent)} | fail=${fmtInt(failed)} | cancel=${fmtInt(
-          canceledCount
-        )} | tempo=${durSec}s`
-      );
+  st.finishedLogged = true;
+  const durSec = Math.max(1, Math.floor((Date.now() - st.firstSeenAt) / 1000));
+  console.log(
+    `🏁 CAMPANHA FINALIZADA | id=${campaignId} | ok=${fmtInt(sent)} | fail=${fmtInt(failed)} | cancel=${fmtInt(
+      canceledCount
+    )} | tempo=${durSec}s`
+  );
 
-      campaignTracker.delete(cid);
-    }
-  }
+  campaignTracker.delete(campaignId);
 }
 
-// Header (1x) quando começa a ter atividade
-let printedHeader = false;
-function printHeaderIfNeeded() {
-  if (printedHeader) return;
-  printedHeader = true;
-  console.log(
-    "📊 METRICS\n" +
-      [
-        padRight("tipo", 7),
-        padRight("rps", 8),
-        padRight("cfg", 5),
-        padRight("429/s", 7),
-        padRight("ok", 8),
-        padRight("fail", 8),
-        padRight("cancel", 8),
-        padRight("pend", 7),
-        padRight("act", 5),
-        padRight("qfail", 6),
-      ].join("  ")
-  );
-  console.log(
-    [
-      padRight("------", 7),
-      padRight("--------", 8),
-      padRight("-----", 5),
-      padRight("-------", 7),
-      padRight("--------", 8),
-      padRight("--------", 8),
-      padRight("--------", 8),
-      padRight("-------", 7),
-      padRight("-----", 5),
-      padRight("------", 6),
-    ].join("  ")
-  );
+// fallback (caso não passe por incs por algum motivo)
+async function logCampaignEndIfDone() {
+  if (!LOG_CAMPAIGN_START_END || campaignTracker.size === 0) return;
+  for (const cid of campaignTracker.keys()) {
+    await checkAndLogCampaignEndNow(cid);
+  }
 }
 
 async function logMetricsIfNeeded() {
@@ -455,8 +406,6 @@ async function logMetricsIfNeeded() {
     }
   }
 
-  printHeaderIfNeeded();
-
   const winSec = METRICS_INTERVAL_MS / 1000;
   const pW = sumWindow(METRICS_INTERVAL_MS, "processed");
   const rpsNow = pW / winSec;
@@ -464,21 +413,14 @@ async function logMetricsIfNeeded() {
   const r429W = sumWindow(METRICS_INTERVAL_MS, "retry429");
   const r429ps = r429W / winSec;
 
-  // Linha tipo “tabela”, alinhada (emoji só no começo)
-  const line = [
-    padRight("🚀ENVIO", 7),
-    padLeft(fmtFixed(rpsNow, 2), 8),
-    padLeft(String(stats.lastSeenCfgRps ?? "-"), 5),
-    padLeft(fmtFixed(r429ps, 2), 7),
-    padNum(stats.sent, 8),
-    padNum(stats.failed, 8),
-    padNum(stats.canceled, 8),
-    padNum(pending, 7),
-    padNum(active, 5),
-    padNum(failedQ, 6),
-  ].join("  ");
-
-  console.log(line);
+  // ✅ formato antigo (linha única) + emoji só no início
+  console.log(
+    `🚀 ENVIO | rps=${rpsNow.toFixed(2)}/s (janela ${winSec}s) | cfg=${stats.lastSeenCfgRps ?? "-"} | 429=${r429ps.toFixed(
+      2
+    )}/s | ok=${fmtInt(stats.sent)} | fail=${fmtInt(stats.failed)} | cancel=${fmtInt(
+      stats.canceled
+    )} | fila pend=${fmtInt(pending)} act=${fmtInt(active)} fail=${fmtInt(failedQ)}`
+  );
 
   await logCampaignEndIfDone();
 }
@@ -571,17 +513,18 @@ async function sendTelegram(bot, tokenKey, payload) {
     const cached = await getCachedFileId(aKey);
 
     if (cached) {
+      if (LOG_FILEID) console.log(`🎞️ VIDEO | usando file_id cache | assetKey=${aKey}`);
       try {
         return await bot.sendVideo(chatId, cached, opts);
       } catch (e) {
-        const sc = getTelegramStatusCode(e);
-        const desc = getTelegramDescription(e);
-        console.warn(`⚠️ file_id cache falhou (assetKey=${aKey}) status=${sc || "-"} desc=${desc}. Re-uplodando...`);
+        if (LOG_FILEID) console.warn(`⚠️ VIDEO | file_id cache falhou, vai reupload | assetKey=${aKey}`);
         try {
           await redis.del(redisAssetKey(aKey));
         } catch {}
       }
     }
+
+    if (LOG_FILEID) console.log(`⬆️ VIDEO | reupload (sem cache) | assetKey=${aKey}`);
 
     const input = await inputFromUrlOrId(fileUrl);
     if (!input) throw new Error("fileUrl inválida/vazia");
@@ -589,7 +532,10 @@ async function sendTelegram(bot, tokenKey, payload) {
     const res = await bot.sendVideo(chatId, input, opts);
 
     const fid = res?.video?.file_id;
-    if (fid) await setCachedFileId(aKey, fid);
+    if (fid) {
+      await setCachedFileId(aKey, fid);
+      if (LOG_FILEID) console.log(`💾 VIDEO | cache salvo | assetKey=${aKey}`);
+    }
 
     return res;
   }
@@ -616,7 +562,7 @@ const worker = new Worker(
     const data = job.data || {};
     const campaignId = data.campaignId;
 
-    // ===== logs início campanha (1x por campanha)
+    // logs início campanha (1x)
     trackCampaign(campaignId);
     await logCampaignStartIfNeeded(campaignId);
 
@@ -631,6 +577,8 @@ const worker = new Worker(
       winBump("processed", 1);
 
       await incCampaign(campaignId, "canceledCount");
+      await checkAndLogCampaignEndNow(campaignId);
+
       try {
         job.discard();
       } catch {}
@@ -649,6 +597,8 @@ const worker = new Worker(
         winBump("processed", 1);
 
         await incCampaign(campaignId, "canceledCount");
+        await checkAndLogCampaignEndNow(campaignId);
+
         try {
           job.discard();
         } catch {}
@@ -660,6 +610,8 @@ const worker = new Worker(
       winBump("processed", 1);
 
       await incCampaign(campaignId, "sent");
+      await checkAndLogCampaignEndNow(campaignId);
+
       return { ok: true };
     } catch (err) {
       if (is429(err)) {
@@ -690,6 +642,7 @@ const worker = new Worker(
       winBump("processed", 1);
 
       await incCampaign(campaignId, "failed");
+      await checkAndLogCampaignEndNow(campaignId);
 
       if (isPermanentTelegramError(err)) {
         try {
