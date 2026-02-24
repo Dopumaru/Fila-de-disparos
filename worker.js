@@ -16,9 +16,12 @@ const RATE_GUARD_MAX_SLEEP_MS = Number(process.env.RATE_GUARD_MAX_SLEEP_MS) || 1
 // ✅ Modo PRO de logs
 const LOG_ONLY_WHEN_ACTIVE = String(process.env.LOG_ONLY_WHEN_ACTIVE || "1") === "1"; // só loga com campanha/fila
 const LOG_CAMPAIGN_START_END = String(process.env.LOG_CAMPAIGN_START_END || "1") === "1"; // log de início/fim
+const LOG_FILEID = String(process.env.LOG_FILEID || "0") === "1"; // loga uso de file_id / upload lock
 
-// ✅ Debug do file_id (0 = off / 1 = on)
-const LOG_FILEID = String(process.env.LOG_FILEID || "0") === "1";
+// ====== ASSET LOCK (evita reupload simultâneo do mesmo vídeo) ======
+const ASSET_LOCK_TTL_MS = Number(process.env.ASSET_LOCK_TTL_MS) || 120000; // 2min (tempo pra upload + resposta)
+const ASSET_LOCK_WAIT_MS = Number(process.env.ASSET_LOCK_WAIT_MS) || 120000; // 2min esperando cache aparecer
+const ASSET_LOCK_POLL_MS = Number(process.env.ASSET_LOCK_POLL_MS) || 250; // 250ms polling
 
 if (!DEFAULT_TOKEN) {
   console.warn("⚠️ TELEGRAM_BOT_TOKEN não definido (ok se sempre mandar botToken no job).");
@@ -184,7 +187,7 @@ async function getCampaignRps(campaignId) {
 function assetKeyFromJob(data) {
   const campaignId = data.campaignId || "global";
   const t = String(data.fileType || "file").toLowerCase();
-  return data.assetKey || `campaign:${campaignId}:asset:${t}`;
+  return data.assetKey || `campaign:${campaignId}:asset:${t}:v1`;
 }
 
 function redisAssetKey(assetKey) {
@@ -203,10 +206,60 @@ async function setCachedFileId(assetKey, fileId) {
 }
 
 // =====================
-// Rate realtime por campanha (token bucket simples)
+// ASSET LOCK (Redis) - impede reupload simultâneo
 // =====================
+function redisLockKey(assetKey) {
+  return `lock:${redisAssetKey(assetKey)}`; // lock:asset:...
+}
 
-// cache de ratePerSecond (pra não HGET em todo job)
+function randToken() {
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function acquireAssetLock(assetKey) {
+  const key = redisLockKey(assetKey);
+  const token = randToken();
+
+  // SET key token NX PX ttl
+  const ok = await redis.set(key, token, "NX", "PX", ASSET_LOCK_TTL_MS);
+  if (ok === "OK") return { ok: true, key, token };
+
+  return { ok: false, key, token: null };
+}
+
+async function releaseAssetLock(assetKey, token) {
+  if (!assetKey || !token) return;
+  const key = redisLockKey(assetKey);
+
+  // release safe (check-and-del)
+  const lua = `
+    if redis.call("GET", KEYS[1]) == ARGV[1] then
+      return redis.call("DEL", KEYS[1])
+    else
+      return 0
+    end
+  `;
+  try {
+    await redis.eval(lua, 1, key, token);
+  } catch {
+    // se falhar não mata o worker
+  }
+}
+
+async function waitForFileId(assetKey, campaignId) {
+  const until = Date.now() + ASSET_LOCK_WAIT_MS;
+  while (Date.now() < until) {
+    if (campaignId && (await isCampaignCanceled(campaignId))) return null;
+    const fid = await getCachedFileId(assetKey);
+    if (fid) return fid;
+    await sleep(ASSET_LOCK_POLL_MS);
+  }
+  return null;
+}
+
+// =====================
+// Rate realtime por campanha
+// =====================
 const rpsCache = new Map(); // campaignId -> { rps, at }
 async function getRpsCached(campaignId) {
   if (!campaignId) return 10;
@@ -219,7 +272,6 @@ async function getRpsCached(campaignId) {
   return rps;
 }
 
-// espaçamento mínimo entre envios por campanha (ms)
 const nextSendAt = new Map(); // campaignId -> epoch_ms
 
 async function waitIfPaused(campaignId) {
@@ -232,7 +284,6 @@ async function waitIfPaused(campaignId) {
 
 async function rateGuard(campaignId) {
   if (!campaignId) return;
-
   if (await isCampaignCanceled(campaignId)) return;
 
   while (true) {
@@ -257,7 +308,7 @@ async function rateGuard(campaignId) {
 }
 
 // =====================
-// Metrics + modo PRO (linha única simples + emoji só no começo)
+// Metrics + modo PRO (linha simples)
 // =====================
 const stats = {
   startedAt: Date.now(),
@@ -285,7 +336,7 @@ function winBump(field, by = 1) {
   let last = stats.win[stats.win.length - 1];
   if (!last || last.t !== t) {
     stats.win.push({ t, processed: 0, retry429: 0 });
-    if (stats.win.length > 40) stats.win.shift(); // ~40s
+    if (stats.win.length > 40) stats.win.shift();
     last = stats.win[stats.win.length - 1];
   }
   last[field] = (last[field] || 0) + by;
@@ -313,9 +364,8 @@ async function refreshBacklog() {
   } catch {}
 }
 
-// ====== tracker de campanhas (log início/fim + parar logs quando terminar) ======
-const campaignTracker = new Map();
-// campaignId -> { startedLogged, finishedLogged, firstSeenAt }
+// ===== campaign tracker (start/end 1x por campanha)
+const campaignTracker = new Map(); // cid -> { startedLogged, finishedLogged, firstSeenAt }
 
 function trackCampaign(campaignId) {
   if (!campaignId) return;
@@ -333,42 +383,28 @@ async function logCampaignStartIfNeeded(campaignId) {
   const meta = await getCampaignMeta(campaignId);
   const total = toNum(meta.total);
   const rps = toNum(meta.ratePerSecond) || (await getRpsCached(campaignId));
-
   console.log(`🎬 CAMPANHA INICIADA | id=${campaignId} | total=${fmtInt(total)} | rps=${rps}`);
 }
 
-// ✅ log de fim IMEDIATO (não depende do METRICS_INTERVAL)
-async function checkAndLogCampaignEndNow(campaignId) {
-  if (!LOG_CAMPAIGN_START_END || !campaignId) return;
-
-  const st = campaignTracker.get(campaignId);
-  if (!st || st.finishedLogged) return;
-
-  const meta = await getCampaignMeta(campaignId);
-  const total = toNum(meta.total);
-  const sent = toNum(meta.sent);
-  const failed = toNum(meta.failed);
-  const canceledCount = toNum(meta.canceledCount);
-
-  const done = total > 0 && (sent + failed + canceledCount) >= total;
-  if (!done) return;
-
-  st.finishedLogged = true;
-  const durSec = Math.max(1, Math.floor((Date.now() - st.firstSeenAt) / 1000));
-  console.log(
-    `🏁 CAMPANHA FINALIZADA | id=${campaignId} | ok=${fmtInt(sent)} | fail=${fmtInt(failed)} | cancel=${fmtInt(
-      canceledCount
-    )} | tempo=${durSec}s`
-  );
-
-  campaignTracker.delete(campaignId);
-}
-
-// fallback (caso não passe por incs por algum motivo)
 async function logCampaignEndIfDone() {
   if (!LOG_CAMPAIGN_START_END || campaignTracker.size === 0) return;
-  for (const cid of campaignTracker.keys()) {
-    await checkAndLogCampaignEndNow(cid);
+
+  for (const [cid, st] of campaignTracker.entries()) {
+    if (st.finishedLogged) continue;
+
+    const meta = await getCampaignMeta(cid);
+    const total = toNum(meta.total);
+    const sent = toNum(meta.sent);
+    const failed = toNum(meta.failed);
+    const canceledCount = toNum(meta.canceledCount);
+
+    const done = total > 0 && (sent + failed + canceledCount) >= total;
+    if (done) {
+      st.finishedLogged = true;
+      const durSec = Math.max(1, Math.floor((Date.now() - st.firstSeenAt) / 1000));
+      console.log(`🏁 CAMPANHA FINALIZADA | id=${cid} | ok=${fmtInt(sent)} | fail=${fmtInt(failed)} | cancel=${fmtInt(canceledCount)} | tempo=${durSec}s`);
+      campaignTracker.delete(cid);
+    }
   }
 }
 
@@ -413,13 +449,8 @@ async function logMetricsIfNeeded() {
   const r429W = sumWindow(METRICS_INTERVAL_MS, "retry429");
   const r429ps = r429W / winSec;
 
-  // ✅ formato antigo (linha única) + emoji só no início
   console.log(
-    `🚀 ENVIO | rps=${rpsNow.toFixed(2)}/s (janela ${winSec}s) | cfg=${stats.lastSeenCfgRps ?? "-"} | 429=${r429ps.toFixed(
-      2
-    )}/s | ok=${fmtInt(stats.sent)} | fail=${fmtInt(stats.failed)} | cancel=${fmtInt(
-      stats.canceled
-    )} | fila pend=${fmtInt(pending)} act=${fmtInt(active)} fail=${fmtInt(failedQ)}`
+    `🚀 ENVIO | rps=${rpsNow.toFixed(2)}/s (janela ${winSec}s) | cfg=${stats.lastSeenCfgRps ?? "-"} | 429/s=${r429ps.toFixed(2)} | ok=${fmtInt(stats.sent)} | fail=${fmtInt(stats.failed)} | cancel=${fmtInt(stats.canceled)} | fila(pend=${fmtInt(pending)} act=${fmtInt(active)} qfail=${fmtInt(failedQ)})`
   );
 
   await logCampaignEndIfDone();
@@ -507,37 +538,79 @@ async function sendTelegram(bot, tokenKey, payload) {
   if (caption) opts.caption = caption;
   if (reply_markup) opts.reply_markup = reply_markup;
 
-  // ===== ✅ VIDEO com cache de file_id =====
+  // ===== ✅ VIDEO com cache de file_id + LOCK anti-reupload =====
   if (fileType === "video") {
     const aKey = assetKeyFromJob(payload);
-    const cached = await getCachedFileId(aKey);
 
-    if (cached) {
+    // 1) tenta cache primeiro
+    const cached0 = await getCachedFileId(aKey);
+    if (cached0) {
       if (LOG_FILEID) console.log(`🎞️ VIDEO | usando file_id cache | assetKey=${aKey}`);
       try {
-        return await bot.sendVideo(chatId, cached, opts);
+        return await bot.sendVideo(chatId, cached0, opts);
       } catch (e) {
-        if (LOG_FILEID) console.warn(`⚠️ VIDEO | file_id cache falhou, vai reupload | assetKey=${aKey}`);
+        // se falhou com file_id, apaga cache e tenta re-uplod com lock
+        const sc = getTelegramStatusCode(e);
+        const desc = getTelegramDescription(e);
+        console.warn(`⚠️ VIDEO | file_id inválido, limpando cache | status=${sc || "-"} desc=${desc}`);
         try {
           await redis.del(redisAssetKey(aKey));
         } catch {}
       }
     }
 
-    if (LOG_FILEID) console.log(`⬆️ VIDEO | reupload (sem cache) | assetKey=${aKey}`);
+    // 2) não tem cache => tenta adquirir lock
+    const lock = await acquireAssetLock(aKey);
 
-    const input = await inputFromUrlOrId(fileUrl);
-    if (!input) throw new Error("fileUrl inválida/vazia");
+    if (!lock.ok) {
+      // alguém está uploadando agora -> espera o cache aparecer
+      if (LOG_FILEID) console.log(`⏳ VIDEO | aguardando cache (lock ocupado) | assetKey=${aKey}`);
+      const fid = await waitForFileId(aKey, campaignId);
+      if (fid) {
+        if (LOG_FILEID) console.log(`🎞️ VIDEO | usando file_id cache (pós-wait) | assetKey=${aKey}`);
+        return bot.sendVideo(chatId, fid, opts);
+      }
 
-    const res = await bot.sendVideo(chatId, input, opts);
+      // fallback: timeout esperando cache (raríssimo)
+      if (LOG_FILEID) console.log(`⬆️ VIDEO | timeout esperando cache, fazendo upload | assetKey=${aKey}`);
+      const input = await inputFromUrlOrId(fileUrl);
+      if (!input) throw new Error("fileUrl inválida/vazia");
 
-    const fid = res?.video?.file_id;
-    if (fid) {
-      await setCachedFileId(aKey, fid);
-      if (LOG_FILEID) console.log(`💾 VIDEO | cache salvo | assetKey=${aKey}`);
+      const res = await bot.sendVideo(chatId, input, opts);
+      const fid2 = res?.video?.file_id;
+      if (fid2) {
+        await setCachedFileId(aKey, fid2);
+        if (LOG_FILEID) console.log(`💾 VIDEO | cache salvo | assetKey=${aKey}`);
+      }
+      return res;
     }
 
-    return res;
+    // 3) lock adquirido -> faz upload e salva cache
+    try {
+      if (LOG_FILEID) console.log(`⬆️ VIDEO | reupload (sem cache) | assetKey=${aKey}`);
+
+      // checa cache de novo (pode ter sido salvo entre a checagem e lock)
+      const cached1 = await getCachedFileId(aKey);
+      if (cached1) {
+        if (LOG_FILEID) console.log(`🎞️ VIDEO | cache apareceu antes do upload | assetKey=${aKey}`);
+        return bot.sendVideo(chatId, cached1, opts);
+      }
+
+      const input = await inputFromUrlOrId(fileUrl);
+      if (!input) throw new Error("fileUrl inválida/vazia");
+
+      const res = await bot.sendVideo(chatId, input, opts);
+
+      const fid = res?.video?.file_id;
+      if (fid) {
+        await setCachedFileId(aKey, fid);
+        if (LOG_FILEID) console.log(`💾 VIDEO | cache salvo | assetKey=${aKey}`);
+      }
+
+      return res;
+    } finally {
+      await releaseAssetLock(aKey, lock.token);
+    }
   }
 
   // Outros tipos (photo/document/etc)
@@ -562,11 +635,11 @@ const worker = new Worker(
     const data = job.data || {};
     const campaignId = data.campaignId;
 
-    // logs início campanha (1x)
+    // track campanha (pra start/end)
     trackCampaign(campaignId);
     await logCampaignStartIfNeeded(campaignId);
 
-    // rate realtime por campanha (sem delay no job)
+    // rate realtime por campanha
     await rateGuard(campaignId);
 
     await waitIfPaused(campaignId);
@@ -577,8 +650,6 @@ const worker = new Worker(
       winBump("processed", 1);
 
       await incCampaign(campaignId, "canceledCount");
-      await checkAndLogCampaignEndNow(campaignId);
-
       try {
         job.discard();
       } catch {}
@@ -597,8 +668,6 @@ const worker = new Worker(
         winBump("processed", 1);
 
         await incCampaign(campaignId, "canceledCount");
-        await checkAndLogCampaignEndNow(campaignId);
-
         try {
           job.discard();
         } catch {}
@@ -610,8 +679,6 @@ const worker = new Worker(
       winBump("processed", 1);
 
       await incCampaign(campaignId, "sent");
-      await checkAndLogCampaignEndNow(campaignId);
-
       return { ok: true };
     } catch (err) {
       if (is429(err)) {
@@ -642,7 +709,6 @@ const worker = new Worker(
       winBump("processed", 1);
 
       await incCampaign(campaignId, "failed");
-      await checkAndLogCampaignEndNow(campaignId);
 
       if (isPermanentTelegramError(err)) {
         try {
