@@ -19,9 +19,17 @@ const LOG_CAMPAIGN_START_END = String(process.env.LOG_CAMPAIGN_START_END || "1")
 const LOG_FILEID = String(process.env.LOG_FILEID || "0") === "1"; // loga uso de file_id / upload lock
 
 // ====== ASSET LOCK (evita reupload simultâneo do mesmo vídeo) ======
-const ASSET_LOCK_TTL_MS = Number(process.env.ASSET_LOCK_TTL_MS) || 120000; // 2min (tempo pra upload + resposta)
+const ASSET_LOCK_TTL_MS = Number(process.env.ASSET_LOCK_TTL_MS) || 120000; // 2min
 const ASSET_LOCK_WAIT_MS = Number(process.env.ASSET_LOCK_WAIT_MS) || 120000; // 2min esperando cache aparecer
 const ASSET_LOCK_POLL_MS = Number(process.env.ASSET_LOCK_POLL_MS) || 250; // 250ms polling
+
+// ====== AUTO-THROTTLE (anti-429) ======
+const AUTO_THROTTLE = String(process.env.AUTO_THROTTLE || "1") === "1"; // liga/desliga
+const THROTTLE_MIN_RPS = Number(process.env.THROTTLE_MIN_RPS) || 1; // mínimo
+const THROTTLE_MAX_RPS = Number(process.env.THROTTLE_MAX_RPS) || 10; // teto do throttle (não passa disso)
+const THROTTLE_COOLDOWN_MS = Number(process.env.THROTTLE_COOLDOWN_MS) || 90000; // 90s segurando após 429
+const THROTTLE_RECOVER_EVERY_MS = Number(process.env.THROTTLE_RECOVER_EVERY_MS) || 30000; // a cada 30s sem 429 sobe 1
+const THROTTLE_429_STEP_FACTOR = Number(process.env.THROTTLE_429_STEP_FACTOR) || 0.5; // 429 => rps * 0.5
 
 if (!DEFAULT_TOKEN) {
   console.warn("⚠️ TELEGRAM_BOT_TOKEN não definido (ok se sempre mandar botToken no job).");
@@ -209,7 +217,7 @@ async function setCachedFileId(assetKey, fileId) {
 // ASSET LOCK (Redis) - impede reupload simultâneo
 // =====================
 function redisLockKey(assetKey) {
-  return `lock:${redisAssetKey(assetKey)}`; // lock:asset:...
+  return `lock:${redisAssetKey(assetKey)}`;
 }
 
 function randToken() {
@@ -219,19 +227,14 @@ function randToken() {
 async function acquireAssetLock(assetKey) {
   const key = redisLockKey(assetKey);
   const token = randToken();
-
-  // SET key token NX PX ttl
   const ok = await redis.set(key, token, "NX", "PX", ASSET_LOCK_TTL_MS);
   if (ok === "OK") return { ok: true, key, token };
-
   return { ok: false, key, token: null };
 }
 
 async function releaseAssetLock(assetKey, token) {
   if (!assetKey || !token) return;
   const key = redisLockKey(assetKey);
-
-  // release safe (check-and-del)
   const lua = `
     if redis.call("GET", KEYS[1]) == ARGV[1] then
       return redis.call("DEL", KEYS[1])
@@ -241,9 +244,7 @@ async function releaseAssetLock(assetKey, token) {
   `;
   try {
     await redis.eval(lua, 1, key, token);
-  } catch {
-    // se falhar não mata o worker
-  }
+  } catch {}
 }
 
 async function waitForFileId(assetKey, campaignId) {
@@ -255,6 +256,75 @@ async function waitForFileId(assetKey, campaignId) {
     await sleep(ASSET_LOCK_POLL_MS);
   }
   return null;
+}
+
+// =====================
+// AUTO-THROTTLE state (por campanha)
+// =====================
+const throttleState = new Map(); // campaignId -> { rps, cooldownUntil, last429At, lastRecoverAt }
+
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function getThrottleObj(campaignId) {
+  if (!campaignId) return null;
+  let st = throttleState.get(campaignId);
+  if (!st) {
+    st = { rps: null, cooldownUntil: 0, last429At: 0, lastRecoverAt: 0 };
+    throttleState.set(campaignId, st);
+  }
+  return st;
+}
+
+// baseRps = o "cfg" vindo do Redis (ratePerSecond)
+async function getEffectiveRps(campaignId, baseRps) {
+  const cfg = clamp(Number(baseRps || 10), 1, THROTTLE_MAX_RPS);
+  if (!AUTO_THROTTLE || !campaignId) return cfg;
+
+  const st = getThrottleObj(campaignId);
+  if (!st.rps) st.rps = cfg;
+
+  // se o cfg mudou, não deixa st.rps acima do novo teto
+  if (st.rps > cfg) st.rps = cfg;
+
+  const now = Date.now();
+
+  // durante cooldown não sobe
+  if (now < st.cooldownUntil) return clamp(st.rps, THROTTLE_MIN_RPS, cfg);
+
+  // recover: sobe 1 a cada THROTTLE_RECOVER_EVERY_MS sem 429
+  const canRecover = now - st.last429At >= THROTTLE_RECOVER_EVERY_MS;
+  if (canRecover && now - st.lastRecoverAt >= THROTTLE_RECOVER_EVERY_MS) {
+    const before = st.rps;
+    st.rps = clamp(st.rps + 1, THROTTLE_MIN_RPS, cfg);
+    st.lastRecoverAt = now;
+    if (st.rps !== before) console.log(`📈 THROTTLE | campanha=${campaignId} | ${before} -> ${st.rps}`);
+  }
+
+  return clamp(st.rps, THROTTLE_MIN_RPS, cfg);
+}
+
+function on429Throttle(campaignId, cfgRps, retryAfterSec) {
+  if (!AUTO_THROTTLE || !campaignId) return;
+  const st = getThrottleObj(campaignId);
+  const cfg = clamp(Number(cfgRps || 10), 1, THROTTLE_MAX_RPS);
+
+  if (!st.rps) st.rps = cfg;
+
+  const before = st.rps;
+  const reduced = Math.ceil(st.rps * THROTTLE_429_STEP_FACTOR);
+  st.rps = clamp(reduced, THROTTLE_MIN_RPS, cfg);
+
+  const now = Date.now();
+  st.last429At = now;
+
+  // segura pelo maior entre cooldown fixo e retry_after do Telegram
+  const raMs = Math.max(0, Number(retryAfterSec || 0) * 1000);
+  const hold = Math.max(THROTTLE_COOLDOWN_MS, raMs);
+  st.cooldownUntil = Math.max(st.cooldownUntil || 0, now + hold);
+
+  console.log(`📉 THROTTLE | campanha=${campaignId} | 429 => ${before} -> ${st.rps} | hold=${Math.ceil(hold / 1000)}s`);
 }
 
 // =====================
@@ -290,15 +360,17 @@ async function rateGuard(campaignId) {
     await waitIfPaused(campaignId);
     if (await isCampaignCanceled(campaignId)) return;
 
-    const rps = await getRpsCached(campaignId);
-    const spacing = Math.max(1, Math.floor(1000 / Math.max(1, rps)));
+    const cfgRps = await getRpsCached(campaignId);
+    const effRps = await getEffectiveRps(campaignId, cfgRps);
+
+    const spacing = Math.max(1, Math.floor(1000 / Math.max(1, effRps)));
 
     const now = Date.now();
     const next = nextSendAt.get(campaignId) || now;
 
     if (now >= next) {
       nextSendAt.set(campaignId, now + spacing);
-      stats.lastSeenCfgRps = rps;
+      stats.lastSeenCfgRps = effRps; // aqui vira "cfg efetivo" (o que realmente está saindo)
       return;
     }
 
@@ -402,7 +474,11 @@ async function logCampaignEndIfDone() {
     if (done) {
       st.finishedLogged = true;
       const durSec = Math.max(1, Math.floor((Date.now() - st.firstSeenAt) / 1000));
-      console.log(`🏁 CAMPANHA FINALIZADA | id=${cid} | ok=${fmtInt(sent)} | fail=${fmtInt(failed)} | cancel=${fmtInt(canceledCount)} | tempo=${durSec}s`);
+      console.log(
+        `🏁 CAMPANHA FINALIZADA | id=${cid} | ok=${fmtInt(sent)} | fail=${fmtInt(failed)} | cancel=${fmtInt(
+          canceledCount
+        )} | tempo=${durSec}s`
+      );
       campaignTracker.delete(cid);
     }
   }
@@ -450,7 +526,11 @@ async function logMetricsIfNeeded() {
   const r429ps = r429W / winSec;
 
   console.log(
-    `🚀 ENVIO | rps=${rpsNow.toFixed(2)}/s (janela ${winSec}s) | cfg=${stats.lastSeenCfgRps ?? "-"} | 429/s=${r429ps.toFixed(2)} | ok=${fmtInt(stats.sent)} | fail=${fmtInt(stats.failed)} | cancel=${fmtInt(stats.canceled)} | fila(pend=${fmtInt(pending)} act=${fmtInt(active)} qfail=${fmtInt(failedQ)})`
+    `🚀 ENVIO | rps=${rpsNow.toFixed(2)}/s (janela ${winSec}s) | cfg=${stats.lastSeenCfgRps ?? "-"} | 429/s=${r429ps.toFixed(
+      2
+    )} | ok=${fmtInt(stats.sent)} | fail=${fmtInt(stats.failed)} | cancel=${fmtInt(
+      stats.canceled
+    )} | fila(pend=${fmtInt(pending)} act=${fmtInt(active)} qfail=${fmtInt(failedQ)})`
   );
 
   await logCampaignEndIfDone();
@@ -528,9 +608,7 @@ async function sendTelegram(bot, tokenKey, payload) {
   // Texto puro
   if (!fileUrl) {
     if (!text) throw new Error("text ausente");
-    const opts = reply_markup
-      ? { reply_markup, disable_web_page_preview: true }
-      : { disable_web_page_preview: true };
+    const opts = reply_markup ? { reply_markup, disable_web_page_preview: true } : { disable_web_page_preview: true };
     return bot.sendMessage(chatId, text, opts);
   }
 
@@ -549,7 +627,6 @@ async function sendTelegram(bot, tokenKey, payload) {
       try {
         return await bot.sendVideo(chatId, cached0, opts);
       } catch (e) {
-        // se falhou com file_id, apaga cache e tenta re-uplod com lock
         const sc = getTelegramStatusCode(e);
         const desc = getTelegramDescription(e);
         console.warn(`⚠️ VIDEO | file_id inválido, limpando cache | status=${sc || "-"} desc=${desc}`);
@@ -563,7 +640,6 @@ async function sendTelegram(bot, tokenKey, payload) {
     const lock = await acquireAssetLock(aKey);
 
     if (!lock.ok) {
-      // alguém está uploadando agora -> espera o cache aparecer
       if (LOG_FILEID) console.log(`⏳ VIDEO | aguardando cache (lock ocupado) | assetKey=${aKey}`);
       const fid = await waitForFileId(aKey, campaignId);
       if (fid) {
@@ -571,7 +647,6 @@ async function sendTelegram(bot, tokenKey, payload) {
         return bot.sendVideo(chatId, fid, opts);
       }
 
-      // fallback: timeout esperando cache (raríssimo)
       if (LOG_FILEID) console.log(`⬆️ VIDEO | timeout esperando cache, fazendo upload | assetKey=${aKey}`);
       const input = await inputFromUrlOrId(fileUrl);
       if (!input) throw new Error("fileUrl inválida/vazia");
@@ -589,7 +664,6 @@ async function sendTelegram(bot, tokenKey, payload) {
     try {
       if (LOG_FILEID) console.log(`⬆️ VIDEO | reupload (sem cache) | assetKey=${aKey}`);
 
-      // checa cache de novo (pode ter sido salvo entre a checagem e lock)
       const cached1 = await getCachedFileId(aKey);
       if (cached1) {
         if (LOG_FILEID) console.log(`🎞️ VIDEO | cache apareceu antes do upload | assetKey=${aKey}`);
@@ -639,7 +713,7 @@ const worker = new Worker(
     trackCampaign(campaignId);
     await logCampaignStartIfNeeded(campaignId);
 
-    // rate realtime por campanha
+    // rate realtime por campanha (com auto-throttle embutido)
     await rateGuard(campaignId);
 
     await waitIfPaused(campaignId);
@@ -683,6 +757,11 @@ const worker = new Worker(
     } catch (err) {
       if (is429(err)) {
         const ra = getRetryAfterSeconds(err) || 3;
+
+        // ✅ auto-throttle reage ao 429
+        const cfgRps = await getRpsCached(campaignId);
+        on429Throttle(campaignId, cfgRps, ra);
+
         const jitterMs = Math.floor(Math.random() * 350);
         await sleep(ra * 1000 + jitterMs);
 
