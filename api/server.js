@@ -166,8 +166,7 @@ function parseButtons(raw) {
 
 // ===== ✅ Rate realtime (sem delay no job) =====
 // A ideia: enfileira tudo SEM delay e o worker aplica o ritmo lendo ratePerSecond em tempo real.
-// Pra isso funcionar, o worker precisa respeitar ratePerSecond do Redis (você já está com logs; se ainda não tiver gating, eu te mando o patch).
-//
+
 // Aqui no server, a gente só guarda o rate na meta e NÃO calcula delay por idx.
 
 // ===== upload url validator (opcional) =====
