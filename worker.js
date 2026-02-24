@@ -181,6 +181,7 @@ const stats = {
   canceled: 0,
   retry429: 0,
   retryOther: 0,
+  lastIdleLogAt: 0,
 
   // janela por segundo (mantém ~8s)
   win: [], // [{t, processed, retry429}]
@@ -236,6 +237,22 @@ async function tickLog() {
 
   await refreshBacklog();
 
+  const pending = stats.backlog.waiting + stats.backlog.delayed + stats.backlog.paused;
+  const active = stats.backlog.active || 0;
+  const failed = stats.backlog.failed || 0;
+
+  // ✅ Se estiver totalmente idle, não flooda.
+  // Loga "idle" no máximo 1x a cada 3 minutos (pra provar que tá vivo).
+  const totallyIdle = stats.processed === 0 && pending === 0 && active === 0 && failed === 0;
+
+  if (totallyIdle) {
+    stats.lastIdleLogAt = stats.lastIdleLogAt || 0;
+    if (now - stats.lastIdleLogAt < 180000) return; // 3 min
+    stats.lastIdleLogAt = now;
+    console.log(`METRICS | idle=1 | backlog(pending=0,active=0,failed=0)`);
+    return;
+  }
+
   const elapsed = Math.max(1, (now - stats.startedAt) / 1000);
   const rpsAvg = stats.processed / elapsed;
 
@@ -244,8 +261,6 @@ async function tickLog() {
 
   const r429_5 = sumWindow(5000, "retry429");
   const r429ps = r429_5 / 5;
-
-  const pending = stats.backlog.waiting + stats.backlog.delayed + stats.backlog.paused;
 
   console.log(
     [
@@ -260,7 +275,7 @@ async function tickLog() {
       `canceled=${stats.canceled}`,
       `retry429=${stats.retry429}`,
       `retryOther=${stats.retryOther}`,
-      `backlog(pending=${pending},active=${stats.backlog.active},failed=${stats.backlog.failed})`,
+      `backlog(pending=${pending},active=${active},failed=${failed})`,
       `waiting=${stats.backlog.waiting}`,
       `delayed=${stats.backlog.delayed}`,
       `paused=${stats.backlog.paused}`,
