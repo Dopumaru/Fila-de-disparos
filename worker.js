@@ -14,93 +14,6 @@ if (!DEFAULT_TOKEN) {
 process.on("unhandledRejection", (err) => console.error("❌ unhandledRejection:", err));
 process.on("uncaughtException", (err) => console.error("❌ uncaughtException:", err));
 
-// =====================
-// file_id capture (sem polling)
-// =====================
-const FILE_ID_CAPTURE = String(process.env.FILE_ID_CAPTURE || "0") === "1";
-const FILE_ID_CAPTURE_CHAT = String(process.env.FILE_ID_CAPTURE_CHAT || "").trim();
-
-function shouldCaptureFileId(chatId) {
-  if (!FILE_ID_CAPTURE) return false;
-  if (!FILE_ID_CAPTURE_CHAT) return false;
-  return String(chatId) === String(FILE_ID_CAPTURE_CHAT);
-}
-
-function extractFileIdFromMessage(msg, fileType) {
-  if (!msg) return null;
-
-  const ft = String(fileType || "").toLowerCase();
-
-  if (ft === "photo" && Array.isArray(msg.photo) && msg.photo.length) {
-    const largest = msg.photo[msg.photo.length - 1];
-    return {
-      kind: "photo",
-      file_id: largest?.file_id,
-      file_unique_id: largest?.file_unique_id,
-    };
-  }
-
-  if (ft === "video" && msg.video?.file_id) {
-    return {
-      kind: "video",
-      file_id: msg.video.file_id,
-      file_unique_id: msg.video.file_unique_id,
-    };
-  }
-
-  if ((ft === "video_note" || ft === "videonote") && msg.video_note?.file_id) {
-    return {
-      kind: "video_note",
-      file_id: msg.video_note.file_id,
-      file_unique_id: msg.video_note.file_unique_id,
-    };
-  }
-
-  if (ft === "audio" && msg.audio?.file_id) {
-    return {
-      kind: "audio",
-      file_id: msg.audio.file_id,
-      file_unique_id: msg.audio.file_unique_id,
-    };
-  }
-
-  if (ft === "voice" && msg.voice?.file_id) {
-    return {
-      kind: "voice",
-      file_id: msg.voice.file_id,
-      file_unique_id: msg.voice.file_unique_id,
-    };
-  }
-
-  if (msg.document?.file_id) {
-    return {
-      kind: "document",
-      file_id: msg.document.file_id,
-      file_unique_id: msg.document.file_unique_id,
-    };
-  }
-
-  // fallback se o fileType veio estranho
-  if (msg.video?.file_id) return { kind: "video", file_id: msg.video.file_id, file_unique_id: msg.video.file_unique_id };
-  if (msg.audio?.file_id) return { kind: "audio", file_id: msg.audio.file_id, file_unique_id: msg.audio.file_unique_id };
-  if (msg.voice?.file_id) return { kind: "voice", file_id: msg.voice.file_id, file_unique_id: msg.voice.file_unique_id };
-  if (msg.video_note?.file_id) return { kind: "video_note", file_id: msg.video_note.file_id, file_unique_id: msg.video_note.file_unique_id };
-
-  return null;
-}
-
-function logCapturedFileId({ tokenKey, campaignId, chatId, fileType, fileUrl }, capture) {
-  const tokenHint = tokenKey ? `${String(tokenKey).slice(0, 10)}...` : "(no-token)";
-  const source = fileUrl && /^https?:\/\//i.test(String(fileUrl)) ? "url" : "id";
-
-  console.log(
-    `🧷 CAPTURE file_id | kind=${capture.kind} fileType=${fileType} chatId=${chatId} campaign=${campaignId || "-"} token=${tokenHint}\n` +
-      `   file_id=${capture.file_id}\n` +
-      `   unique_id=${capture.file_unique_id || "-"}\n` +
-      `   source=${source}`
-  );
-}
-
 // cache de bots por token
 const botCache = new Map();
 function getBot(token) {
@@ -200,8 +113,7 @@ function isPermanentTelegramError(err) {
       desc.includes("wrong remote file identifier") ||
       desc.includes("file is too big") ||
       desc.includes("bad request")
-    )
-      return true;
+    ) return true;
   }
 
   if (statusCode === 401) return true;
@@ -314,10 +226,6 @@ async function inputFromUrlOrId(fileUrl) {
 
   if (!/^https?:\/\//i.test(s)) return s; // file_id
 
-  if (typeof fetch !== "function") {
-    throw new Error("fetch não disponível no Node. Use Node 18+ ou implemente fetch (undici).");
-  }
-
   const r = await fetch(s);
   if (!r.ok) throw new Error(`Falha ao baixar arquivo (${r.status}) ${s}`);
   return Buffer.from(await r.arrayBuffer());
@@ -342,9 +250,7 @@ async function sendTelegram(bot, tokenKey, payload) {
   // Texto puro
   if (!fileUrl) {
     if (!text) throw new Error("text ausente");
-    const opts = reply_markup
-      ? { reply_markup, disable_web_page_preview: true }
-      : { disable_web_page_preview: true };
+    const opts = reply_markup ? { reply_markup, disable_web_page_preview: true } : { disable_web_page_preview: true };
     return bot.sendMessage(chatId, text, opts);
   }
 
@@ -355,33 +261,14 @@ async function sendTelegram(bot, tokenKey, payload) {
   if (caption) opts.caption = caption;
   if (reply_markup) opts.reply_markup = reply_markup;
 
-  let msg;
-  if (fileType === "photo") msg = await bot.sendPhoto(chatId, input, opts);
-  else if (fileType === "video") msg = await bot.sendVideo(chatId, input, opts);
-  else if (fileType === "document") msg = await bot.sendDocument(chatId, input, opts);
-  else if (fileType === "audio") msg = await bot.sendAudio(chatId, input, opts);
-  else if (fileType === "voice") msg = await bot.sendVoice(chatId, input, opts);
-  else if (fileType === "video_note") msg = await bot.sendVideoNote(chatId, input, opts);
-  else msg = await bot.sendDocument(chatId, input, opts);
+  if (fileType === "photo") return bot.sendPhoto(chatId, input, opts);
+  if (fileType === "video") return bot.sendVideo(chatId, input, opts);
+  if (fileType === "document") return bot.sendDocument(chatId, input, opts);
+  if (fileType === "audio") return bot.sendAudio(chatId, input, opts);
+  if (fileType === "voice") return bot.sendVoice(chatId, input, opts);
+  if (fileType === "video_note") return bot.sendVideoNote(chatId, input, opts);
 
-  // ✅ Captura file_id SOMENTE para um chat específico (sem polling)
-  if (shouldCaptureFileId(chatId)) {
-    try {
-      const capture = extractFileIdFromMessage(msg, fileType);
-      if (capture?.file_id) {
-        logCapturedFileId(
-          { tokenKey, campaignId, chatId, fileType, fileUrl },
-          capture
-        );
-      } else {
-        console.warn("🧷 CAPTURE: mensagem enviada mas não encontrei file_id no retorno.");
-      }
-    } catch (e) {
-      console.warn("🧷 CAPTURE: falha ao extrair/logar file_id:", e?.message || e);
-    }
-  }
-
-  return msg;
+  return bot.sendDocument(chatId, input, opts);
 }
 
 // =====================
