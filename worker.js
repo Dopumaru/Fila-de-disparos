@@ -3,6 +3,7 @@ require("dotenv").config();
 const { Worker } = require("bullmq");
 const TelegramBot = require("node-telegram-bot-api");
 const { redis, connection } = require("./redis");
+const crypto = require("crypto");
 
 const QUEUE_NAME = process.env.QUEUE_NAME || "disparos";
 const DEFAULT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -14,7 +15,10 @@ if (!DEFAULT_TOKEN) {
 process.on("unhandledRejection", (err) => console.error("❌ unhandledRejection:", err));
 process.on("uncaughtException", (err) => console.error("❌ uncaughtException:", err));
 
-// cache de bots por token
+/* =========================
+   BOT CACHE
+========================= */
+
 const botCache = new Map();
 function getBot(token) {
   const t = token || DEFAULT_TOKEN;
@@ -25,7 +29,6 @@ function getBot(token) {
   return bot;
 }
 
-// cache de username por token (pra montar START links)
 const botUsernameCache = new Map();
 async function getBotUsername(bot, tokenKey) {
   if (botUsernameCache.has(tokenKey)) return botUsernameCache.get(tokenKey);
@@ -39,6 +42,10 @@ async function getBotUsername(bot, tokenKey) {
     return "";
   }
 }
+
+/* =========================
+   CAMPAIGN HELPERS
+========================= */
 
 function campaignKey(id) {
   return `campaign:${id}`;
@@ -65,297 +72,148 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// =====================
-// Error helpers
-// =====================
-function getTelegramStatusCode(err) {
-  return err?.response?.statusCode;
+/* =========================
+   FILE_ID CACHE
+========================= */
+
+function mediaCacheKey(botToken, fileType, fileUrl) {
+  const h = crypto
+    .createHash("sha1")
+    .update(`${botToken}|${fileType}|${fileUrl}`)
+    .digest("hex");
+  return `media:fileid:${h}`;
 }
 
-function getTelegramDescription(err) {
-  const body = err?.response?.body;
-  return String(body?.description || err?.message || "");
-}
+function extractFileId(fileType, msg) {
+  if (!msg) return null;
 
-function getRetryAfterSeconds(err) {
-  const body = err?.response?.body;
-  const p = body?.parameters;
-  const ra1 = Number(p?.retry_after);
-  if (Number.isFinite(ra1) && ra1 > 0) return ra1;
+  if (fileType === "video") return msg?.video?.file_id;
+  if (fileType === "document") return msg?.document?.file_id;
+  if (fileType === "audio") return msg?.audio?.file_id;
+  if (fileType === "voice") return msg?.voice?.file_id;
+  if (fileType === "video_note") return msg?.video_note?.file_id;
 
-  const desc = getTelegramDescription(err);
-  const m = desc.match(/retry after\s+(\d+)/i);
-  if (m) {
-    const ra2 = Number(m[1]);
-    if (Number.isFinite(ra2) && ra2 > 0) return ra2;
+  if (fileType === "photo") {
+    const arr = msg?.photo;
+    if (Array.isArray(arr) && arr.length) {
+      return arr[arr.length - 1]?.file_id;
+    }
   }
+
   return null;
 }
 
-function is429(err) {
-  return getTelegramStatusCode(err) === 429;
+function normalizeFileType(ft, fileUrl) {
+  const t = String(ft || "").toLowerCase().trim();
+
+  if (["img","image","imagem","foto","photo","jpg","jpeg","png","webp"].includes(t)) return "photo";
+  if (["vid","video","mp4","mov","mkv"].includes(t)) return "video";
+  if (["voice","ogg","opus"].includes(t)) return "voice";
+  if (["audio","mp3","wav","m4a"].includes(t)) return "audio";
+  if (["video_note","videonote","round"].includes(t)) return "video_note";
+  if (["doc","document","pdf","zip"].includes(t)) return "document";
+
+  if (fileUrl) return "document";
+  return "";
 }
 
-function isPermanentTelegramError(err) {
-  const code = err?.code;
-  const statusCode = getTelegramStatusCode(err);
-  const desc = getTelegramDescription(err).toLowerCase();
-
-  if (statusCode === 403) return true;
-
-  if (statusCode === 400) {
-    if (
-      desc.includes("chat not found") ||
-      desc.includes("user is deactivated") ||
-      desc.includes("bot was blocked") ||
-      desc.includes("bot is not a member") ||
-      desc.includes("wrong file identifier") ||
-      desc.includes("wrong remote file identifier") ||
-      desc.includes("file is too big") ||
-      desc.includes("bad request")
-    ) return true;
-  }
-
-  if (statusCode === 401) return true;
-
-  if (code === "ETIMEDOUT" || code === "ECONNRESET") return false;
-  return false;
+function isHttpUrl(s) {
+  return /^https?:\/\//i.test(String(s || "").trim());
 }
 
-function isRetryableTransient(err) {
-  const code = err?.code;
-  const sc = getTelegramStatusCode(err);
-
-  if (sc === 429) return true;
-  if (sc >= 500 && sc <= 599) return true;
-  if (code === "ETIMEDOUT" || code === "ECONNRESET") return true;
-
-  return false;
-}
-
-// =====================
-// Throttled logs
-// =====================
-const stats = {
-  startedAt: Date.now(),
-  processed: 0,
-  sent: 0,
-  failed: 0,
-  canceled: 0,
-  retry429: 0,
-  retryOther: 0,
-  lastLogAt: 0,
-  last429LogAt: 0,
-  last429Count: 0,
-  last429Sec: 0,
-};
-
-function maybeLogProgress() {
-  const now = Date.now();
-  const elapsed = Math.max(1, Math.floor((now - stats.startedAt) / 1000));
-  const everyN = 250;
-
-  if (stats.processed % everyN === 0 || now - stats.lastLogAt > 15000) {
-    stats.lastLogAt = now;
-    const rps = (stats.processed / elapsed).toFixed(2);
-    console.log(
-      `📊 progress: processed=${stats.processed} sent=${stats.sent} failed=${stats.failed} canceled=${stats.canceled} retry429=${stats.retry429} retryOther=${stats.retryOther} avg=${rps}/s`
-    );
-  }
-
-  if (stats.last429Count > 0 && now - stats.last429LogAt > 10000) {
-    stats.last429LogAt = now;
-    console.warn(
-      `⏳ 429 em lote: +${stats.last429Count} (último retry_after=${stats.last429Sec || "?"}s) nos últimos ~10s`
-    );
-    stats.last429Count = 0;
-    stats.last429Sec = 0;
-  }
-}
-
-async function waitIfPaused(campaignId) {
-  if (!campaignId) return;
-  while (await isCampaignPaused(campaignId)) {
-    if (await isCampaignCanceled(campaignId)) return;
-    await sleep(1500);
-  }
-}
-
-// ===== buttons -> reply_markup =====
-function normalizeButtons(raw) {
-  if (!Array.isArray(raw)) return [];
-  return raw
-    .map((b) => ({
-      text: String(b?.text || "").trim(),
-      type: String(b?.type || "").trim().toLowerCase(),
-      value: String(b?.value || "").trim(),
-    }))
-    .filter((b) => b.text && b.value && (b.type === "url" || b.type === "start"))
-    .slice(0, 4);
-}
-
-async function buildReplyMarkup(bot, tokenKey, buttons) {
-  const btns = normalizeButtons(buttons);
-  if (!btns.length) return null;
-
-  const username = await getBotUsername(bot, tokenKey);
-
-  const row = [];
-  for (const b of btns) {
-    if (b.type === "url") {
-      row.push({ text: b.text, url: b.value });
-      continue;
-    }
-    if (b.type === "start") {
-      if (!username) continue; // sem username não dá pra montar deep-link
-      const u = `https://t.me/${username}?start=${encodeURIComponent(b.value)}`;
-      row.push({ text: b.text, url: u });
-      continue;
-    }
-  }
-
-  if (!row.length) return null;
-
-  return { inline_keyboard: [row] }; // 1 linha com até 4 botões
-}
-
-// ===== mídia =====
-async function inputFromUrlOrId(fileUrl) {
-  const s = String(fileUrl || "").trim();
-  if (!s) return null;
-
-  if (!/^https?:\/\//i.test(s)) return s; // file_id
-
-  const r = await fetch(s);
-  if (!r.ok) throw new Error(`Falha ao baixar arquivo (${r.status}) ${s}`);
-  return Buffer.from(await r.arrayBuffer());
-}
+/* =========================
+   TELEGRAM SEND
+========================= */
 
 async function sendTelegram(bot, tokenKey, payload) {
-  const campaignId = payload.campaignId;
-  if (campaignId && (await isCampaignCanceled(campaignId))) {
-    return { ok: true, canceled: true };
-  }
-
   const chatId = payload.chatId;
-  const text = payload.text;
-  const caption = payload.caption;
-  const fileType = String(payload.fileType || "").toLowerCase();
-  const fileUrl = String(payload.fileUrl || "").trim();
+  const campaignId = payload.campaignId;
 
   if (!chatId) throw new Error("chatId ausente");
 
-  const reply_markup = await buildReplyMarkup(bot, tokenKey, payload.buttons);
-
-  // Texto puro
-  if (!fileUrl) {
-    if (!text) throw new Error("text ausente");
-    const opts = reply_markup ? { reply_markup, disable_web_page_preview: true } : { disable_web_page_preview: true };
-    return bot.sendMessage(chatId, text, opts);
+  if (campaignId && (await isCampaignCanceled(campaignId))) {
+    return { canceled: true };
   }
 
-  const input = await inputFromUrlOrId(fileUrl);
-  if (!input) throw new Error("fileUrl inválida/vazia");
+  const text = payload.text;
+  const caption = payload.caption;
+  const fileUrl = String(payload.fileUrl || "").trim();
+  const fileType = normalizeFileType(payload.fileType, fileUrl);
 
-  const opts = {};
-  if (caption) opts.caption = caption;
-  if (reply_markup) opts.reply_markup = reply_markup;
+  if (!fileUrl) {
+    if (!text) throw new Error("text ausente");
+    return bot.sendMessage(chatId, text, { disable_web_page_preview: true });
+  }
 
-  if (fileType === "photo") return bot.sendPhoto(chatId, input, opts);
-  if (fileType === "video") return bot.sendVideo(chatId, input, opts);
-  if (fileType === "document") return bot.sendDocument(chatId, input, opts);
-  if (fileType === "audio") return bot.sendAudio(chatId, input, opts);
-  if (fileType === "voice") return bot.sendVoice(chatId, input, opts);
-  if (fileType === "video_note") return bot.sendVideoNote(chatId, input, opts);
+  let input = fileUrl;
+  let cacheKey = null;
 
-  return bot.sendDocument(chatId, input, opts);
+  if (isHttpUrl(fileUrl)) {
+    cacheKey = mediaCacheKey(tokenKey, fileType, fileUrl);
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      input = cached;
+    }
+  }
+
+  let msg;
+
+  if (fileType === "photo") msg = await bot.sendPhoto(chatId, input, { caption });
+  else if (fileType === "video") msg = await bot.sendVideo(chatId, input, { caption });
+  else if (fileType === "document") msg = await bot.sendDocument(chatId, input, { caption });
+  else if (fileType === "audio") msg = await bot.sendAudio(chatId, input, { caption });
+  else if (fileType === "voice") msg = await bot.sendVoice(chatId, input, { caption });
+  else if (fileType === "video_note") msg = await bot.sendVideoNote(chatId, input);
+  else msg = await bot.sendDocument(chatId, input, { caption });
+
+  if (cacheKey && isHttpUrl(fileUrl)) {
+    const fid = extractFileId(fileType, msg);
+    if (fid) {
+      await redis.set(cacheKey, fid, "EX", 60 * 60 * 24 * 30);
+    }
+  }
+
+  return msg;
 }
 
-// =====================
-// Worker
-// =====================
+/* =========================
+   WORKER
+========================= */
+
 const worker = new Worker(
   QUEUE_NAME,
   async (job) => {
     const data = job.data || {};
     const campaignId = data.campaignId;
 
-    await waitIfPaused(campaignId);
-
     if (await isCampaignCanceled(campaignId)) {
-      stats.processed++;
-      stats.canceled++;
-      maybeLogProgress();
-
       await incCampaign(campaignId, "canceledCount");
-
-      try { job.discard(); } catch {}
       return { ok: true, canceled: true };
     }
 
-    const tokenKey = data.botToken || DEFAULT_TOKEN || "";
     const bot = getBot(data.botToken);
+    const tokenKey = data.botToken || DEFAULT_TOKEN || "";
 
     try {
-      const r = await sendTelegram(bot, tokenKey, data);
-
-      if (r && r.canceled) {
-        stats.processed++;
-        stats.canceled++;
-        maybeLogProgress();
-
-        await incCampaign(campaignId, "canceledCount");
-        try { job.discard(); } catch {}
-        return { ok: true, canceled: true };
-      }
-
-      stats.processed++;
-      stats.sent++;
-      maybeLogProgress();
-
+      await sendTelegram(bot, tokenKey, data);
       await incCampaign(campaignId, "sent");
       return { ok: true };
     } catch (err) {
-      if (is429(err)) {
-        const ra = getRetryAfterSeconds(err) || 3;
-        const jitterMs = Math.floor(Math.random() * 350);
-        await sleep(ra * 1000 + jitterMs);
+      const sc = err?.response?.statusCode;
 
-        stats.processed++;
-        stats.retry429++;
-        stats.last429Count++;
-        stats.last429Sec = ra;
-        maybeLogProgress();
-
-        await incCampaign(campaignId, "retry429");
+      if (sc === 429) {
+        const ra = Number(err?.response?.body?.parameters?.retry_after) || 3;
+        await sleep(ra * 1000);
         throw err;
       }
-
-      if (isRetryableTransient(err) && !isPermanentTelegramError(err)) {
-        stats.processed++;
-        stats.retryOther++;
-        maybeLogProgress();
-
-        await incCampaign(campaignId, "retryOther");
-        throw err;
-      }
-
-      stats.processed++;
-      stats.failed++;
-      maybeLogProgress();
 
       await incCampaign(campaignId, "failed");
-
-      if (isPermanentTelegramError(err)) {
-        try { job.discard(); } catch {}
-      }
-
       throw err;
     }
   },
   {
     connection,
-    concurrency: Number(process.env.WORKER_CONCURRENCY) || 10,
+    concurrency: Number(process.env.WORKER_CONCURRENCY) || 2,
     lockDuration: Number(process.env.WORKER_LOCK_MS) || 10 * 60 * 1000,
     autorun: true,
   }
@@ -363,12 +221,3 @@ const worker = new Worker(
 
 worker.on("ready", () => console.log(`✅ Worker ready | queue=${QUEUE_NAME}`));
 worker.on("error", (err) => console.error("❌ Worker error:", err?.message || err));
-
-worker.on("failed", (job, err) => {
-  const sc = getTelegramStatusCode(err);
-  if (sc === 429) return; // resumo sai no maybeLogProgress
-
-  const id = job?.id;
-  const desc = getTelegramDescription(err);
-  console.warn(`💥 failed job=${id} status=${sc || "-"} desc=${desc || err?.message || err}`);
-});
