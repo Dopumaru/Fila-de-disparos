@@ -230,7 +230,8 @@ app.post("/campaign", async (req, res) => {
           delay: idx * baseDelayMs,
           attempts: 6,
           backoff: { type: "exponential", delay: 2000 },
-          // removeOnComplete/removeOnFail já estão no defaultJobOptions
+          removeOnComplete: { count: REMOVE_COMPLETE_COUNT },
+          removeOnFail: { count: REMOVE_FAIL_COUNT },
         },
       };
     });
@@ -267,7 +268,6 @@ app.post(
         req.body.bot_token ||
         process.env.TELEGRAM_BOT_TOKEN;
 
-      // "message" é o texto do tipo TEXT (ou pode ficar vazio se for mídia)
       const message =
         req.body.message ||
         req.body.mensagem ||
@@ -276,15 +276,14 @@ app.post(
         req.body.texto ||
         req.body.messageText ||
         req.body.message_text ||
+        req.body.legenda ||
+        req.body.caption ||
         "";
 
       const tipo = String(req.body.tipo || req.body.type || "text").toLowerCase();
 
       const limit = toInt(req.body.limit || req.body.rate || req.body.limitMax || 1, 1);
-      const intervalSec = toInt(
-        req.body.intervalSec || req.body.interval || req.body.intervalS || 1,
-        1
-      );
+      const intervalSec = toInt(req.body.intervalSec || req.body.interval || req.body.intervalS || 1, 1);
       const ratePerSecond = clampRps(Math.floor(limit / Math.max(1, intervalSec)) || 1);
 
       if (!botToken) {
@@ -300,9 +299,7 @@ app.post(
       }
 
       const csvText = fs.readFileSync(csvFile.path, "utf8");
-      try {
-        fs.unlinkSync(csvFile.path);
-      } catch {}
+      try { fs.unlinkSync(csvFile.path); } catch {}
 
       const leads = parseCsvFirstColumnAsIds(csvText);
       if (leads.length === 0) {
@@ -311,7 +308,6 @@ app.post(
 
       const mediaFile = req.files?.file?.[0];
 
-      // caption/legenda: usada SOMENTE para mídia
       const caption =
         req.body.caption ||
         req.body.legenda ||
@@ -319,39 +315,12 @@ app.post(
         req.body.caption_text ||
         "";
 
-      // ✅ aceita upload OU fileUrl/file_id do body (URL http(s) OU file_id)
-      const rawFileUrl = String(
-        req.body.fileUrl || req.body.file_id || req.body.fileId || req.body.fileID || ""
-      ).trim();
-
-      // Resolve "fileUrl" final:
-      // - se tiver upload, vira /uploads/...
-      // - senão, usa o que veio no body (pode ser https://... OU file_id)
-      let resolvedFileUrl = "";
-      if (mediaFile?.filename) {
-        const base = getPublicBaseUrl(req);
-        resolvedFileUrl = `${base}/uploads/${mediaFile.filename}`;
-      } else if (rawFileUrl) {
-        resolvedFileUrl = rawFileUrl;
-      }
-
-      const hasMedia = !!resolvedFileUrl;
-
-      // ✅ validação CORRETA: texto exige message; mídia exige fileUrl/upload
-      if (tipo === "text") {
-        if (!String(message || "").trim()) {
-          return res.status(400).json({
-            ok: false,
-            error: "Mensagem vazia. Preencha 'Mensagem / Legenda' para tipo Texto.",
-          });
-        }
-      } else {
-        if (!hasMedia) {
-          return res.status(400).json({
-            ok: false,
-            error: "Para mídia/documento: envie Upload (file) OU preencha 'fileUrl' (URL ou file_id).",
-          });
-        }
+      const hasMedia = !!mediaFile;
+      if (!hasMedia && !String(message || "").trim()) {
+        return res.status(400).json({
+          ok: false,
+          error: "Mensagem vazia. Preencha 'Mensagem / Legenda' para tipo Texto.",
+        });
       }
 
       const campaignId = genId();
@@ -369,6 +338,12 @@ app.post(
 
       const baseDelayMs = Math.floor(1000 / ratePerSecond);
 
+      let fileUrl;
+      if (mediaFile?.filename) {
+        const base = getPublicBaseUrl(req);
+        fileUrl = `${base}/uploads/${mediaFile.filename}`;
+      }
+
       const btns = parseButtons(req.body.buttons);
 
       const jobs = leads.map((row, idx) => ({
@@ -377,24 +352,18 @@ app.post(
           campaignId,
           botToken,
           chatId: row.id,
-
-          // ✅ texto só é usado quando NÃO tem mídia (worker já faz essa lógica)
           text: message,
-
-          // ✅ mídia: URL OU file_id
-          fileUrl: hasMedia ? resolvedFileUrl : undefined,
+          fileUrl: fileUrl || undefined,
           fileType: tipo === "text" ? undefined : tipo,
-
-          // ✅ legenda (caption) só faz sentido em mídia
-          caption: tipo === "text" ? undefined : (caption || undefined),
-
+          caption: caption || undefined,
           buttons: btns,
         },
         opts: {
           delay: idx * baseDelayMs,
           attempts: 6,
           backoff: { type: "exponential", delay: 2000 },
-          // removeOnComplete/removeOnFail já estão no defaultJobOptions
+          removeOnComplete: { count: REMOVE_COMPLETE_COUNT },
+          removeOnFail: { count: REMOVE_FAIL_COUNT },
         },
       }));
 
@@ -405,8 +374,7 @@ app.post(
         campaignId,
         total: leads.length,
         ratePerSecond,
-        usedFileUrl: hasMedia,
-        fileUrlKind: hasMedia ? (/^https?:\/\//i.test(resolvedFileUrl) ? "url" : "file_id") : "none",
+        usedFileUrl: !!fileUrl,
         receivedFileFields: Object.keys(req.files || {}),
         buttons: btns.length,
       });
@@ -465,19 +433,12 @@ app.post("/campaign/:id/rate", async (req, res) => {
     }
 
     const raw =
-      req.body?.ratePerSecond ??
-      req.body?.rate ??
-      req.body?.rps ??
-      req.query?.ratePerSecond ??
-      req.query?.rate ??
-      req.query?.rps;
+      req.body?.ratePerSecond ?? req.body?.rate ?? req.body?.rps ??
+      req.query?.ratePerSecond ?? req.query?.rate ?? req.query?.rps;
 
     const rps = clampRps(raw);
 
-    await redis.hset(campaignKey(id), {
-      ratePerSecond: String(rps),
-      rateUpdatedAt: new Date().toISOString(),
-    });
+    await redis.hset(campaignKey(id), { ratePerSecond: String(rps), rateUpdatedAt: new Date().toISOString() });
     return res.json({ ok: true, campaignId: id, ratePerSecond: rps });
   } catch (e) {
     console.error("❌ /campaign/:id/rate erro:", e);
@@ -495,43 +456,19 @@ app.post("/campaign/:id/cancel", async (req, res) => {
       paused: "0",
     });
 
-    // Varredura paginada pra não travar em filas grandes
-    const CANCEL_SCAN_MAX = Number(process.env.CANCEL_SCAN_MAX) || 20000;
-    const PAGE_SIZE = Number(process.env.CANCEL_SCAN_PAGE_SIZE) || 500;
-
     const states = ["waiting", "delayed", "paused"];
     let removed = 0;
 
     for (const st of states) {
-      let start = 0;
-
-      while (start < CANCEL_SCAN_MAX) {
-        const end = Math.min(start + PAGE_SIZE - 1, CANCEL_SCAN_MAX - 1);
-        const jobs = await queue.getJobs([st], start, end);
-        if (!jobs || jobs.length === 0) break;
-
-        for (const job of jobs) {
-          if (job?.data?.campaignId === id) {
-            try {
-              await job.remove();
-              removed++;
-            } catch {}
-          }
+      const jobs = await queue.getJobs([st], 0, 100000);
+      for (const job of jobs) {
+        if (job?.data?.campaignId === id) {
+          try { await job.remove(); removed++; } catch {}
         }
-
-        if (jobs.length < PAGE_SIZE) break;
-        start += PAGE_SIZE;
       }
     }
 
-    return res.json({
-      ok: true,
-      campaignId: id,
-      canceled: true,
-      removedPendingJobs: removed,
-      scanMax: CANCEL_SCAN_MAX,
-      pageSize: PAGE_SIZE,
-    });
+    return res.json({ ok: true, campaignId: id, canceled: true, removedPendingJobs: removed });
   } catch (e) {
     console.error("❌ /campaign/:id/cancel erro:", e);
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
@@ -548,50 +485,6 @@ app.use((err, req, res, next) => {
   }
   return next(err);
 });
-
-// =====================================================================================
-// Uploads Cleanup (TTL)
-// =====================================================================================
-const UPLOAD_TTL_HOURS = Number(process.env.UPLOAD_TTL_HOURS) || 24; // padrão: 24h
-const UPLOAD_CLEAN_INTERVAL_MIN = Number(process.env.UPLOAD_CLEAN_INTERVAL_MIN) || 60; // roda 1x/h
-
-function cleanupUploads() {
-  try {
-    const dir = uploadsDirToServe;
-    if (!dir || !fs.existsSync(dir)) return;
-
-    const files = fs.readdirSync(dir);
-    const now = Date.now();
-    const ttlMs = UPLOAD_TTL_HOURS * 60 * 60 * 1000;
-
-    let removed = 0;
-
-    for (const file of files) {
-      const fullPath = path.join(dir, file);
-
-      try {
-        const stat = fs.statSync(fullPath);
-        if (!stat.isFile()) continue;
-
-        const age = now - stat.mtimeMs;
-        if (age > ttlMs) {
-          fs.unlinkSync(fullPath);
-          removed++;
-        }
-      } catch {}
-    }
-
-    if (removed > 0) {
-      console.log(`🧹 Upload cleanup: ${removed} arquivo(s) removido(s) | TTL=${UPLOAD_TTL_HOURS}h`);
-    }
-  } catch (e) {
-    console.error("❌ Erro no cleanup de uploads:", e?.message || String(e));
-  }
-}
-
-// roda ao iniciar e depois periodicamente
-setTimeout(cleanupUploads, 10_000);
-setInterval(cleanupUploads, UPLOAD_CLEAN_INTERVAL_MIN * 60 * 1000);
 
 // ===== Start =====
 const PORT = Number(process.env.PORT) || 3000;
