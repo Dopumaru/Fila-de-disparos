@@ -267,6 +267,7 @@ app.post(
         req.body.bot_token ||
         process.env.TELEGRAM_BOT_TOKEN;
 
+      // "message" é o texto do tipo TEXT (ou pode ficar vazio se for mídia)
       const message =
         req.body.message ||
         req.body.mensagem ||
@@ -275,8 +276,6 @@ app.post(
         req.body.texto ||
         req.body.messageText ||
         req.body.message_text ||
-        req.body.legenda ||
-        req.body.caption ||
         "";
 
       const tipo = String(req.body.tipo || req.body.type || "text").toLowerCase();
@@ -312,6 +311,7 @@ app.post(
 
       const mediaFile = req.files?.file?.[0];
 
+      // caption/legenda: usada SOMENTE para mídia
       const caption =
         req.body.caption ||
         req.body.legenda ||
@@ -320,9 +320,39 @@ app.post(
         "";
 
       // ✅ aceita upload OU fileUrl/file_id do body (URL http(s) OU file_id)
-       const rawFileUrl = String(req.body.fileUrl || req.body.file_id || "").trim();
+      const rawFileUrl = String(
+        req.body.fileUrl || req.body.file_id || req.body.fileId || req.body.fileID || ""
+      ).trim();
 
- 
+      // Resolve "fileUrl" final:
+      // - se tiver upload, vira /uploads/...
+      // - senão, usa o que veio no body (pode ser https://... OU file_id)
+      let resolvedFileUrl = "";
+      if (mediaFile?.filename) {
+        const base = getPublicBaseUrl(req);
+        resolvedFileUrl = `${base}/uploads/${mediaFile.filename}`;
+      } else if (rawFileUrl) {
+        resolvedFileUrl = rawFileUrl;
+      }
+
+      const hasMedia = !!resolvedFileUrl;
+
+      // ✅ validação CORRETA: texto exige message; mídia exige fileUrl/upload
+      if (tipo === "text") {
+        if (!String(message || "").trim()) {
+          return res.status(400).json({
+            ok: false,
+            error: "Mensagem vazia. Preencha 'Mensagem / Legenda' para tipo Texto.",
+          });
+        }
+      } else {
+        if (!hasMedia) {
+          return res.status(400).json({
+            ok: false,
+            error: "Para mídia/documento: envie Upload (file) OU preencha 'fileUrl' (URL ou file_id).",
+          });
+        }
+      }
 
       const campaignId = genId();
 
@@ -339,12 +369,6 @@ app.post(
 
       const baseDelayMs = Math.floor(1000 / ratePerSecond);
 
-      let fileUrl;
-      if (mediaFile?.filename) {
-        const base = getPublicBaseUrl(req);
-        fileUrl = `${base}/uploads/${mediaFile.filename}`;
-      }
-
       const btns = parseButtons(req.body.buttons);
 
       const jobs = leads.map((row, idx) => ({
@@ -353,10 +377,17 @@ app.post(
           campaignId,
           botToken,
           chatId: row.id,
+
+          // ✅ texto só é usado quando NÃO tem mídia (worker já faz essa lógica)
           text: message,
-          fileUrl: fileUrl || undefined,
+
+          // ✅ mídia: URL OU file_id
+          fileUrl: hasMedia ? resolvedFileUrl : undefined,
           fileType: tipo === "text" ? undefined : tipo,
-          caption: caption || undefined,
+
+          // ✅ legenda (caption) só faz sentido em mídia
+          caption: tipo === "text" ? undefined : (caption || undefined),
+
           buttons: btns,
         },
         opts: {
@@ -374,7 +405,8 @@ app.post(
         campaignId,
         total: leads.length,
         ratePerSecond,
-        usedFileUrl: !!fileUrl,
+        usedFileUrl: hasMedia,
+        fileUrlKind: hasMedia ? (/^https?:\/\//i.test(resolvedFileUrl) ? "url" : "file_id") : "none",
         receivedFileFields: Object.keys(req.files || {}),
         buttons: btns.length,
       });
