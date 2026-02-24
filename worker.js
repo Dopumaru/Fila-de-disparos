@@ -8,8 +8,8 @@ const QUEUE_NAME = process.env.QUEUE_NAME || "disparos";
 const DEFAULT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
 // ====== LOG CONTROL (menos flood) ======
-const METRICS_INTERVAL_MS = Number(process.env.METRICS_INTERVAL_MS) || 15000; // 15s
-const IDLE_LOG_INTERVAL_MS = Number(process.env.IDLE_LOG_INTERVAL_MS) || 300000; // 5min
+const METRICS_INTERVAL_MS = Number(process.env.METRICS_INTERVAL_MS) || 30000; // ✅ 30s (menos flood)
+const IDLE_LOG_INTERVAL_MS = Number(process.env.IDLE_LOG_INTERVAL_MS) || 600000; // ✅ 10min
 const CAMPAIGN_RPS_CACHE_MS = Number(process.env.CAMPAIGN_RPS_CACHE_MS) || 2000; // 2s
 const RATE_GUARD_MAX_SLEEP_MS = Number(process.env.RATE_GUARD_MAX_SLEEP_MS) || 1000; // 1s
 
@@ -197,7 +197,6 @@ const nextSendAt = new Map(); // campaignId -> epoch_ms
 async function rateGuard(campaignId) {
   if (!campaignId) return;
 
-  // se cancelada, não perde tempo aqui
   if (await isCampaignCanceled(campaignId)) return;
 
   while (true) {
@@ -212,7 +211,7 @@ async function rateGuard(campaignId) {
 
     if (now >= next) {
       nextSendAt.set(campaignId, now + spacing);
-      stats.lastSeenCfgRps = rps; // pro log
+      stats.lastSeenCfgRps = rps;
       return;
     }
 
@@ -222,7 +221,7 @@ async function rateGuard(campaignId) {
 }
 
 // =====================
-// Metrics (simplificadas)
+// Metrics (mais intuitivas + menos flood)
 // =====================
 const stats = {
   startedAt: Date.now(),
@@ -233,7 +232,7 @@ const stats = {
   retry429: 0,
   retryOther: 0,
 
-  // janela 15s (pra rps atual e 429ps)
+  // janela (pra rps atual e 429ps)
   win: [], // [{t, processed, retry429}]
   lastSeenCfgRps: null,
 
@@ -251,7 +250,7 @@ function winBump(field, by = 1) {
   let last = stats.win[stats.win.length - 1];
   if (!last || last.t !== t) {
     stats.win.push({ t, processed: 0, retry429: 0 });
-    if (stats.win.length > 20) stats.win.shift(); // ~20s
+    if (stats.win.length > 40) stats.win.shift(); // guarda ~40s
     last = stats.win[stats.win.length - 1];
   }
   last[field] = (last[field] || 0) + by;
@@ -279,6 +278,10 @@ async function refreshBacklog() {
   } catch {}
 }
 
+function fmtInt(n) {
+  return new Intl.NumberFormat("pt-BR").format(Number(n || 0));
+}
+
 async function logMetricsIfNeeded() {
   const now = Date.now();
   if (now - stats.lastLogAt < METRICS_INTERVAL_MS) return;
@@ -295,28 +298,27 @@ async function logMetricsIfNeeded() {
   if (totallyIdle) {
     if (now - stats.lastIdleLogAt < IDLE_LOG_INTERVAL_MS) return;
     stats.lastIdleLogAt = now;
-    console.log(`WKR idle | pending=0 active=0 failed=0`);
+    console.log(`😴 Worker ocioso | fila=0`);
     return;
   }
 
-  const elapsed = Math.max(1, (now - stats.startedAt) / 1000);
-  const rpsAvg = stats.processed / elapsed;
-
+  const winSec = METRICS_INTERVAL_MS / 1000;
   const pW = sumWindow(METRICS_INTERVAL_MS, "processed");
-  const rpsNow = pW / (METRICS_INTERVAL_MS / 1000);
+  const rpsNow = pW / winSec;
 
   const r429W = sumWindow(METRICS_INTERVAL_MS, "retry429");
-  const r429ps = r429W / (METRICS_INTERVAL_MS / 1000);
+  const r429ps = r429W / winSec;
 
-  // ✅ linha única enxuta
+  // ✅ linha mais "noob friendly"
   console.log(
-    `WKR | avg=${rpsAvg.toFixed(2)}/s now=${rpsNow.toFixed(2)}/s cfg=${stats.lastSeenCfgRps ?? "-"} 429ps=${r429ps.toFixed(
+    `🚀 Envio: ${rpsNow.toFixed(2)}/s (janela ${winSec}s) | 🎚️ cfg=${stats.lastSeenCfgRps ?? "-"} | ⏳429=${r429ps.toFixed(
       2
-    )} | sent=${stats.sent} fail=${stats.failed} can=${stats.canceled} r429=${stats.retry429} ro=${stats.retryOther} | pending=${pending} act=${active} qfail=${failedQ}`
+    )}/s | ✅ok=${fmtInt(stats.sent)} ❌fail=${fmtInt(stats.failed)} 🛑cancel=${fmtInt(
+      stats.canceled
+    )} | 📦fila pend=${fmtInt(pending)} act=${fmtInt(active)} fail=${fmtInt(failedQ)}`
   );
 }
 
-// roda 1x por segundo, mas só loga no intervalo configurado
 setInterval(() => {
   logMetricsIfNeeded().catch(() => {});
 }, 1000);
@@ -462,7 +464,6 @@ const worker = new Worker(
     // rate realtime por campanha (sem delay no job)
     await rateGuard(campaignId);
 
-    // pausa/cancel (já checados no rateGuard, mas mantém aqui por segurança)
     await waitIfPaused(campaignId);
 
     if (await isCampaignCanceled(campaignId)) {
@@ -548,14 +549,14 @@ const worker = new Worker(
   }
 );
 
-worker.on("ready", () => console.log(`✅ Worker ready | queue=${QUEUE_NAME}`));
+worker.on("ready", () => console.log(`✅ Worker pronto | fila=${QUEUE_NAME}`));
 worker.on("error", (err) => console.error("❌ Worker error:", err?.message || err));
 
 worker.on("failed", (job, err) => {
   const sc = getTelegramStatusCode(err);
-  if (sc === 429) return; // entra no contador + log agregado
+  if (sc === 429) return;
 
   const id = job?.id;
   const desc = getTelegramDescription(err);
-  console.warn(`💥 failed job=${id} status=${sc || "-"} desc=${desc || err?.message || err}`);
+  console.warn(`💥 Falhou job=${id} status=${sc || "-"} desc=${desc || err?.message || err}`);
 });
