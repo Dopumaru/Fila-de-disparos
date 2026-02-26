@@ -477,11 +477,7 @@ async function logCampaignEndIfDone() {
     if (done) {
       st.finishedLogged = true;
       const durSec = Math.max(1, Math.floor((Date.now() - st.firstSeenAt) / 1000));
-      console.log(
-        `🏁 CAMPANHA FINALIZADA | id=${cid} | ok=${fmtInt(sent)} | fail=${fmtInt(failed)} | cancel=${fmtInt(
-          canceledCount
-        )} | tempo=${durSec}s`
-      );
+      console.log(`🏁 CAMPANHA FINALIZADA | id=${cid} | ok=${fmtInt(sent)} | fail=${fmtInt(failed)} | cancel=${fmtInt(canceledCount)} | tempo=${durSec}s`);
       campaignTracker.delete(cid);
     }
   }
@@ -529,11 +525,7 @@ async function logMetricsIfNeeded() {
   const r429ps = r429W / winSec;
 
   console.log(
-    `🚀 ENVIO | rps=${rpsNow.toFixed(2)}/s (janela ${winSec}s) | cfg=${stats.lastSeenCfgRps ?? "-"} | 429/s=${r429ps.toFixed(
-      2
-    )} | ok=${fmtInt(stats.sent)} | fail=${fmtInt(stats.failed)} | cancel=${fmtInt(
-      stats.canceled
-    )} | fila(pend=${fmtInt(pending)} act=${fmtInt(active)} qfail=${fmtInt(failedQ)})`
+    `🚀 ENVIO | rps=${rpsNow.toFixed(2)}/s (janela ${winSec}s) | cfg=${stats.lastSeenCfgRps ?? "-"} | 429/s=${r429ps.toFixed(2)} | ok=${fmtInt(stats.sent)} | fail=${fmtInt(stats.failed)} | cancel=${fmtInt(stats.canceled)} | fila(pend=${fmtInt(pending)} act=${fmtInt(active)} qfail=${fmtInt(failedQ)})`
   );
 
   await logCampaignEndIfDone();
@@ -583,37 +575,13 @@ async function buildReplyMarkup(bot, tokenKey, buttons) {
 }
 
 // ===== mídia =====
-// ✅ FIX: para Buffer funcionar no node-telegram-bot-api, devolve {value, filename}
-// (resolve "EFATAL: Unsupported Buffer file-type", especialmente em video_note)
-async function inputFromUrlOrId(fileUrl, fileType) {
+async function inputFromUrlOrId(fileUrl) {
   const s = String(fileUrl || "").trim();
   if (!s) return null;
-
-  // file_id
-  if (!/^https?:\/\//i.test(s)) return s;
-
+  if (!/^https?:\/\//i.test(s)) return s; // file_id
   const r = await fetch(s);
   if (!r.ok) throw new Error(`Falha ao baixar arquivo (${r.status}) ${s}`);
-
-  const buf = Buffer.from(await r.arrayBuffer());
-
-  const t = String(fileType || "").toLowerCase();
-  const filename =
-    t === "video_note"
-      ? "note.mp4"
-      : t === "video"
-      ? "video.mp4"
-      : t === "photo"
-      ? "photo.jpg"
-      : t === "voice"
-      ? "voice.ogg"
-      : t === "audio"
-      ? "audio.mp3"
-      : t === "document"
-      ? "file.bin"
-      : "file.bin";
-
-  return { value: buf, filename };
+  return Buffer.from(await r.arrayBuffer());
 }
 
 async function sendTelegram(bot, tokenKey, payload) {
@@ -663,6 +631,7 @@ async function sendTelegram(bot, tokenKey, payload) {
             await redis.del(redisAssetKey(aKey));
           } catch {}
         } else {
+          // 403 (blocked/deactivated) etc => NÃO tem nada a ver com file_id
           throw e;
         }
       }
@@ -680,7 +649,7 @@ async function sendTelegram(bot, tokenKey, payload) {
       }
 
       if (LOG_FILEID) console.log(`⬆️ VIDEO | timeout esperando cache, fazendo upload | assetKey=${aKey}`);
-      const input = await inputFromUrlOrId(fileUrl, fileType);
+      const input = await inputFromUrlOrId(fileUrl);
       if (!input) throw new Error("fileUrl inválida/vazia");
 
       const res = await bot.sendVideo(chatId, input, opts);
@@ -702,7 +671,7 @@ async function sendTelegram(bot, tokenKey, payload) {
         return bot.sendVideo(chatId, cached1, opts);
       }
 
-      const input = await inputFromUrlOrId(fileUrl, fileType);
+      const input = await inputFromUrlOrId(fileUrl);
       if (!input) throw new Error("fileUrl inválida/vazia");
 
       const res = await bot.sendVideo(chatId, input, opts);
@@ -720,7 +689,7 @@ async function sendTelegram(bot, tokenKey, payload) {
   }
 
   // Outros tipos (photo/document/etc)
-  const input = await inputFromUrlOrId(fileUrl, fileType);
+  const input = await inputFromUrlOrId(fileUrl);
   if (!input) throw new Error("fileUrl inválida/vazia");
 
   if (fileType === "photo") return bot.sendPhoto(chatId, input, opts);
@@ -753,9 +722,7 @@ const worker = new Worker(
       winBump("processed", 1);
 
       await incCampaign(campaignId, "canceledCount");
-      try {
-        job.discard();
-      } catch {}
+      try { job.discard(); } catch {}
       return { ok: true, canceled: true };
     }
 
@@ -771,9 +738,7 @@ const worker = new Worker(
         winBump("processed", 1);
 
         await incCampaign(campaignId, "canceledCount");
-        try {
-          job.discard();
-        } catch {}
+        try { job.discard(); } catch {}
         return { ok: true, canceled: true };
       }
 
@@ -818,9 +783,7 @@ const worker = new Worker(
       await incCampaign(campaignId, "failed");
 
       if (isPermanentTelegramError(err)) {
-        try {
-          job.discard();
-        } catch {}
+        try { job.discard(); } catch {}
       }
 
       throw err;
